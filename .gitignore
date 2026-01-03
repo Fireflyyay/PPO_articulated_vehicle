@@ -1,0 +1,10 @@
+/src/__pycache__/
+/src/*.pyc
+/.vscode/
+/.idea/
+/src/.DS_Store
+/src/log/exp/*
+/src/img/*
+/src/env/__pycache__/
+/src/model/__pycache__/
+/src/model/agent/__pycache__/
