@@ -19,14 +19,11 @@ class ReplayMemory(object):
         batches = {}
         for item in self.items:
             batches[item] = []
-        batches["next_state"] = []
+        
         for idx in idx_list:
             for item in self.items:
                 batches[item].append(self.memory[item][idx])
-            if idx == self.__len__()-1 or self.memory["done"][idx]:
-                batches["next_state"].append(None)
-            else:
-                batches["next_state"].append(self.memory["state"][idx+1])
+                
         for idx in batches.keys():
             if isinstance(batches[idx][0], np.ndarray):
                 batches[idx] = np.array(batches[idx])

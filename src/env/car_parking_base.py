@@ -110,20 +110,19 @@ class CarParking(gym.Env):
             # the target representation is (relative_distance, cos(theta), sin(theta), cos(phi), sin(phi))
             # where the theta indicates the relative angle of parking lot, and phi means the heading of 
             # parking lot in the polar coordinate of the ego car's view
-            low_bound, high_bound = np.zeros((LIDAR_NUM)), np.ones((LIDAR_NUM))*LIDAR_RANGE
-            self.observation_space['lidar'] = spaces.Box(
-                low=low_bound, high=high_bound, shape=(LIDAR_NUM,), dtype=np.float64
+            
+            # Widen input state: Flatten everything into a single vector
+            # Lidar (120) + Target (7) + Velocity (2) = 129
+            self.obs_dim = LIDAR_NUM + self.tgt_repr_size + 2
+            
+            low_bound = -np.inf * np.ones(self.obs_dim)
+            high_bound = np.inf * np.ones(self.obs_dim)
+            
+            self.observation_space = spaces.Box(
+                low=low_bound, high=high_bound, shape=(self.obs_dim,), dtype=np.float64
             )
-        low_bound = np.array([0,-1,-1,-1,-1,-1,-1])
-        high_bound = np.array([MAX_DIST_TO_DEST,1,1,1,1,1,1])
-        self.observation_space['target'] = spaces.Box(
-            low=low_bound, high=high_bound, shape=(self.tgt_repr_size,), dtype=np.float64
-        )
-        
-        self.observation_shape = {
-            'lidar': (LIDAR_NUM,),
-            'target': (self.tgt_repr_size,),
-        }
+            
+        self.observation_shape = (self.obs_dim,)
     
     def set_level(self, level:str=None):
         if level is None:
@@ -157,6 +156,9 @@ class CarParking(gym.Env):
         self.vehicle.reset(initial_state)
         self.matrix = self.coord_transform_matrix()
         
+        # Calculate initial distance
+        self.initial_dist = self.vehicle.state.loc.distance(Point(self.map.dest.loc)) + 1e-6
+        
         obs, _, _, _, info = self.step(None)
         return obs, info
 
@@ -178,13 +180,23 @@ class CarParking(gym.Env):
 
     def step(self, action: np.ndarray = None):
         if action is not None:
-            self.vehicle.step(action)
+            # Scale action from [-1, 1] to [min, max]
+            steer_min, steer_max = VALID_STEER
+            speed_min, speed_max = VALID_SPEED
+            
+            scaled_action = np.zeros_like(action)
+            scaled_action[0] = 0.5 * (action[0] + 1.0) * (steer_max - steer_min) + steer_min
+            scaled_action[1] = 0.5 * (action[1] + 1.0) * (speed_max - speed_min) + speed_min
+            
+            self.vehicle.step(scaled_action)
             self.t += 1
         
         # get observation
-        obs = {}
+        lidar_obs = np.zeros(LIDAR_NUM)
         if self.use_lidar_observation:
-            obs['lidar'] = self.lidar.get_observation(self.vehicle.state, self.map.obstacles)
+            lidar_obs = self.lidar.get_observation(self.vehicle.state, self.map.obstacles)
+            # Normalize lidar
+            lidar_obs = lidar_obs / LIDAR_RANGE
         
         # target representation
         # relative_distance, cos(theta), sin(theta), cos(phi), sin(phi)
@@ -211,7 +223,7 @@ class CarParking(gym.Env):
         # Articulation angle
         articulation_angle = ego_pos[2] - self.vehicle.state.rear_heading
         
-        obs['target'] = np.array([
+        target_obs = np.array([
             dist/MAX_DIST_TO_DEST,
             math.cos(relative_angle),
             math.sin(relative_angle),
@@ -220,6 +232,16 @@ class CarParking(gym.Env):
             math.cos(articulation_angle),
             math.sin(articulation_angle)
         ])
+        
+        # Velocity info (normalized roughly)
+        # Speed range [-2.5, 2.5], Steer range [-0.6, 0.6]
+        vel_obs = np.array([
+            self.vehicle.state.speed / 2.5,
+            self.vehicle.state.steering / 0.6
+        ])
+        
+        # Concatenate all
+        obs = np.concatenate([lidar_obs, target_obs, vel_obs])
         
         # calculate reward
         reward, done, info = self.get_reward(action)
@@ -249,7 +271,8 @@ class CarParking(gym.Env):
         if self.prev_reward == 0.0:
             self.prev_reward = dist
         
-        dist_reward_val = (self.prev_reward - dist) * REWARD_WEIGHT['dist_reward']
+        # Normalized distance reward (Progress based)
+        dist_reward_val = (self.prev_reward - dist) / self.initial_dist * REWARD_WEIGHT['dist_reward']
         reward += dist_reward_val
         self.prev_reward = dist
         
@@ -257,7 +280,7 @@ class CarParking(gym.Env):
         heading_diff = self.vehicle.state.heading - self.map.dest.heading
         # Normalize to [-pi, pi]
         heading_diff = (heading_diff + math.pi) % (2 * math.pi) - math.pi
-        angle_reward = math.cos(heading_diff) * REWARD_WEIGHT['angle_reward'] * 0.01
+        angle_reward = 0.0 # Cancelled
         reward += angle_reward
         
         # 3. Collision
@@ -297,7 +320,7 @@ class CarParking(gym.Env):
         intersection_area = front_box_ego.intersection(front_box_dest).area
         overlap_ratio = intersection_area / front_box_dest.area
         
-        if heading_diff_abs < np.radians(10) and overlap_ratio > 0.8:
+        if heading_diff_abs < np.radians(15) and overlap_ratio > 0.7:
             reward += REWARD_WEIGHT['box_union_reward']
             done = True
             info['status'] = Status.ARRIVED

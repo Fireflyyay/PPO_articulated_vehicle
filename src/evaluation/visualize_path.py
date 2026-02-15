@@ -51,14 +51,14 @@ def visualize():
     agent = PPO(configs, load_params=True)
     
     # Load checkpoint - using the latest one provided in the context
-    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../log/exp/ppo_20260102_235422/PPO_best.pt'))
+    checkpoint_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../ckpt/PPO_best.pt'))
     if os.path.exists(checkpoint_path):
         agent.load(checkpoint_path)
         print(f"Loaded checkpoint from {checkpoint_path}")
     else:
         # Try to find any PPO_best.pt if the specific one doesn't exist
         print(f"Checkpoint not found at {checkpoint_path}, searching for alternatives...")
-        exp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../log/exp'))
+        exp_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '../ckpt'))
         found = False
         if os.path.exists(exp_dir):
             for root, dirs, files in os.walk(exp_dir):

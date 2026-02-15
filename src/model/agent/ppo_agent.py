@@ -29,10 +29,22 @@ class PPOConfig(ConfigBase):
         self.clip_epsilon = 0.2
         self.lambda_ = 0.95
         self.var_max = 1
+        
+        # Decaying variance settings
+        self.action_std_init = 1.0
+        self.action_std_decay_rate = 0.015
+        self.min_action_std = 0.1
 
         # tricks
         self.adv_norm = True
-        self.state_norm = True
+        self.state_norm = True # Keep state norm? DRL uses fixed scaling. 
+        # User said "refer to DRL input state design", but didn't explicitly say remove state norm.
+        # However, DRL uses fixed scaling in prepare_state.
+        # PPO_AV uses StateNorm.
+        # I will keep StateNorm for now as it's safer if I don't know the exact scales of everything.
+        # But wait, I manually normalized inputs in CarParking.step.
+        # So I should probably disable state_norm or set it to False.
+        self.state_norm = False 
         self.reward_norm = False
         self.use_gae = True
         self.reward_scaling = False
@@ -56,6 +68,9 @@ class PPOAgent(AgentBase):
         # debug
         self.actor_loss_list = []
         self.critic_loss_list = []
+        
+        # Action std
+        self.action_std = self.configs.action_std_init
 
         # the networks
         self._init_network()
@@ -76,14 +91,10 @@ class PPOAgent(AgentBase):
         self.actor_net = \
             MultiObsEmbedding(self.configs.actor_layers).to(self.device)
         if self.configs.dist_type == "gaussian":
-            self.log_std = \
-                nn.Parameter(
-                    torch.zeros(1, self.configs.action_dim), requires_grad=False
-                ).to(self.device)
-            self.log_std.requires_grad = True
+            # Removed learnable log_std
             self.actor_optimizer = \
                 torch.optim.Adam(
-                    [{'params':self.actor_net.parameters()}, {'params': self.log_std}], 
+                    self.actor_net.parameters(), 
                     self.configs.lr_actor, 
                     # eps=self.configs.lr_actor
                 )
@@ -113,8 +124,17 @@ class PPOAgent(AgentBase):
             ("critic_optimizer", self.critic_optimizer, 1),
             ("critic_target", self.critic_target, 1)
         ]
-        if self.configs.dist_type == "gaussian":
-            self.check_list.append(("log_std", self.log_std, 0))
+        # Removed log_std from checklist
+
+    def set_action_std(self, new_action_std):
+        self.action_std = new_action_std
+
+    def decay_action_std(self, decay_rate, min_std):
+        self.action_std = self.action_std - decay_rate
+        self.action_std = round(self.action_std, 4)
+        if self.action_std <= min_std:
+            self.action_std = min_std
+        print(f"Action std decayed to: {self.action_std}")
 
     def _actor_forward(self, obs) -> torch.distributions.Distribution: # to be replaced
         observation = deepcopy(obs)
@@ -125,7 +145,8 @@ class PPOAgent(AgentBase):
         with torch.no_grad():
             policy_dist = self.actor_net(observation)
             if len(policy_dist.shape) > 1 and policy_dist.shape[0] > 1:
-                raise NotImplementedError
+                # raise NotImplementedError # Why was this here?
+                pass
             if self.discrete:
                 dist = Categorical(F.softmax(policy_dist, dim=1))
             elif self.configs.dist_type == "beta":
@@ -135,8 +156,8 @@ class PPOAgent(AgentBase):
                 dist = Beta(alpha, beta)
             elif self.configs.dist_type == "gaussian":
                 mean =  torch.clamp(policy_dist,-1,1)  
-                log_std = self.log_std.expand_as(mean)  # To make 'log_std' have the same dimension as 'mean'
-                std = torch.exp(log_std)
+                # Use decaying action_std
+                std = torch.full_like(mean, self.action_std)
                 dist = Normal(mean, std)
             else:
                 raise NotImplementedError
@@ -219,22 +240,16 @@ class PPOAgent(AgentBase):
 
     def obs2tensor(self, obs):
         if isinstance(obs, list):
-            merged_obs = {}
-            for obs_type in self.configs.observation_shape.keys():
-                merged_obs[obs_type] = []
-                for o in obs:
-                    merged_obs[obs_type].append(o[obs_type])
-                merged_obs[obs_type] = torch.FloatTensor(np.array(merged_obs[obs_type])).to(self.device)
-            obs = merged_obs 
-        elif isinstance(obs, dict):
-            for obs_type in self.configs.observation_shape.keys():
-                obs[obs_type] = torch.FloatTensor(obs[obs_type]).to(self.device).unsqueeze(0)
-        else:
-            raise NotImplementedError()
+            obs = torch.FloatTensor(np.array(obs)).to(self.device)
+        elif isinstance(obs, np.ndarray):
+            obs = torch.FloatTensor(obs).to(self.device)
+            if len(obs.shape) == 1:
+                obs = obs.unsqueeze(0)
+        # Removed dict handling as we flattened the observation
         return obs
     
     def get_obs(self, obs, ids):
-        return {k:obs[k][ids] for k in obs }
+        return obs[ids]
 
     def update(self): # to be replaced
         # convert batches to tensors
@@ -273,7 +288,7 @@ class PPOAgent(AgentBase):
                 adv = torch.FloatTensor(adv).view(-1, 1).to(self.device)
             else:
                 adv = deltas
-            v_target = adv + self.critic_target(state_batch)
+            v_target = adv + value
             if self.configs.adv_norm: # advantage normalization
                 adv = (adv - adv.mean()) / (adv.std() + 1e-5)
         
@@ -310,8 +325,8 @@ class PPOAgent(AgentBase):
                 elif self.configs.dist_type == "gaussian":
                     policy_dist = self.actor_net(state)
                     mean = torch.clamp(policy_dist, -1, 1)
-                    log_std = self.log_std.expand_as(mean)
-                    std = torch.exp(log_std)
+                    # Use fixed/decaying std
+                    std = torch.full_like(mean, self.action_std)
                     dist = Normal(mean, std)
                     dist_entropy = dist.entropy().sum(1, keepdim=True)
                     log_prob = dist.log_prob(action_batch[ri])
@@ -361,9 +376,10 @@ class PPOAgent(AgentBase):
             for name, item, save_state_dict in self.check_list:
                 checkpoint[name] = item.state_dict() if save_state_dict else item
             # for PPO extra save
-            if self.configs.dist_type == "gaussian":
-                checkpoint['log'] = self.log_std
-            checkpoint['state_norm'] = self.state_normalize # (self.state_mean, self.state_std, self.S, self.n_state)
+            # if self.configs.dist_type == "gaussian":
+            #     checkpoint['log'] = self.log_std
+            if hasattr(self, 'state_normalize'):
+                checkpoint['state_norm'] = self.state_normalize # (self.state_mean, self.state_std, self.S, self.n_state)
             if hasattr(self, 'actor_optimizer') and hasattr(self, 'critic_optimizer'):
                 checkpoint['optimizer'] = (self.actor_optimizer, self.critic_optimizer)
             torch.save(checkpoint, path)
@@ -394,8 +410,8 @@ class PPOAgent(AgentBase):
                             # but for state_normalize it's handled below
                             pass
 
-            if 'log' in checkpoint:
-                self.log_std.data.copy_(checkpoint['log'].data if isinstance(checkpoint['log'], torch.nn.Parameter) else checkpoint['log']) 
+            # if 'log' in checkpoint:
+            #     self.log_std.data.copy_(checkpoint['log'].data if isinstance(checkpoint['log'], torch.nn.Parameter) else checkpoint['log']) 
             
             if 'state_norm' in checkpoint:
                 self.state_normalize = checkpoint['state_norm'] 
@@ -418,6 +434,7 @@ class PPOAgent(AgentBase):
                 else:
                     item = checkpoint[name]
 
-            self.log_std.data.copy_(checkpoint['log']) 
+            # self.log_std.data.copy_(checkpoint['log']) 
             # self.actor_target_net = deepcopy(self.actor_net).to(self.device)
-            self.state_normalize = checkpoint['state_norm']
+            if 'state_norm' in checkpoint:
+                self.state_normalize = checkpoint['state_norm']

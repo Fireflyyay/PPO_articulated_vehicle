@@ -10,12 +10,12 @@ SEED = 42
 
 #########################
 # vehicle
-WHEEL_BASE = 4.0  # wheelbase (HITCH_OFFSET + TRAILER_LENGTH)
-FRONT_HANG = 2.5  # front hang length
-REAR_HANG = 3.0  # rear hang length
-WIDTH = 3.0  # width
-TRAILER_LENGTH = 2.0
-HITCH_OFFSET = 2.0
+WHEEL_BASE = 3.0  # wheelbase (HITCH_OFFSET + TRAILER_LENGTH)
+FRONT_HANG = 1.0  # front hang length
+REAR_HANG = 1.0  # rear hang length
+WIDTH = 2.0  # width
+TRAILER_LENGTH = 1.5
+HITCH_OFFSET = 1.5
 LENGTH = FRONT_HANG + WHEEL_BASE + REAR_HANG  # total length
 
 from shapely.geometry import LinearRing
@@ -49,7 +49,7 @@ VALID_STEER = [-np.radians(36), np.radians(36)]
 VALID_ACCEL = [-1.0, 1.0]
 VALID_ANGULAR_SPEED = [-0.5, 0.5]
 
-NUM_STEP = 10
+NUM_STEP = 20
 STEP_LENGTH = 5e-2
 
 ########################
@@ -81,9 +81,9 @@ BAY_PARK_WALL_DIST_DICT = {
     'Normal':25.0,
 }
 N_OBSTACLE_DICT = {
-    'Extrem':8,
-    'Complex':5,
-    'Normal':3,
+    'Extrem':15,
+    'Complex':10,
+    'Normal':8,
 }
 
 # Normal level
@@ -113,7 +113,7 @@ LIDAR_RANGE = 30.0
 LIDAR_NUM = 120
 
 FPS = 100
-TOLERANT_TIME = 1000
+TOLERANT_TIME = 1500
 USE_LIDAR = True
 USE_IMG = False # Disabled as requested
 USE_ACTION_MASK = False # Disabled as requested
@@ -136,8 +136,8 @@ N_DISCRETE_ACTION = len(discrete_actions)
 #########################
 # model
 GAMMA = 0.98
-BATCH_SIZE = 2048  # Batch size is originally 8192
-LR = 5e-6
+BATCH_SIZE = 2048  # Reduced for more frequent updates
+LR = 1e-4
 TAU = 0.1
 MAX_TRAIN_STEP = 1e6
 ORTHOGONAL_INIT = True
@@ -158,54 +158,30 @@ ATTENTION_CONFIG = {
 USE_ATTENTION = True
 
 ACTOR_CONFIGS = {
-    'n_modal':2+int(USE_IMG)+int(USE_ACTION_MASK),
-    'lidar_shape':LIDAR_NUM,
-    'target_shape':7,
-    'action_mask_shape':N_DISCRETE_ACTION if USE_ACTION_MASK else None,
-    'img_shape':(3,64,64) if USE_IMG else None,
-    'output_size':2,
-    'embed_size':128,
-    'hidden_size':256,
-    'n_hidden_layers':3,
-    'n_embed_layers':2,
-    'img_conv_layers':C_CONV,
-    'img_linear_layers':SIZE_FC,
-    'k_img_conv':3,
-    'orthogonal_init':True,
-    'use_tanh_output':True,
-    'use_tanh_activate':True,
-    'attention_configs': ATTENTION_CONFIG if USE_ATTENTION else None,
+    'input_dim': LIDAR_NUM + 7 + 2, # Lidar + Target + Velocity
+    'hidden_size': 400,
+    'output_size': 2,
+    'use_tanh_output': True,
+    'orthogonal_init': True,
 }
 
 CRITIC_CONFIGS = {
-    'n_modal':2+int(USE_IMG)+int(USE_ACTION_MASK),
-    'lidar_shape':LIDAR_NUM,
-    'target_shape':7,
-    'action_mask_shape':N_DISCRETE_ACTION if USE_ACTION_MASK else None,
-    'img_shape':(3,64,64) if USE_IMG else None,
-    'output_size':1,
-    'embed_size':128,
-    'hidden_size':256,
-    'n_hidden_layers':3,
-    'n_embed_layers':2,
-    'img_conv_layers':C_CONV,
-    'img_linear_layers':SIZE_FC,
-    'k_img_conv':3,
-    'orthogonal_init':True,
-    'use_tanh_output':False,
-    'use_tanh_activate':True,
-    'attention_configs': ATTENTION_CONFIG if USE_ATTENTION else None,
+    'input_dim': LIDAR_NUM + 7 + 2,
+    'hidden_size': 400,
+    'output_size': 1,
+    'use_tanh_output': False,
+    'orthogonal_init': True,
 }
 
 REWARD_RATIO = 0.1
 from typing import OrderedDict
 REWARD_WEIGHT = OrderedDict({'time_cost':1,\
             'rs_dist_reward':0,\
-            'dist_reward':1,\
-            'angle_reward':2,\
-            'box_union_reward':10,\
-            'out_of_map_penalty':10,\
-            'turn_penalty':0.0001,})
+            'dist_reward':100,\
+            'angle_reward':0,\
+            'box_union_reward':100,\
+            'out_of_map_penalty':50,\
+            'turn_penalty':0,})
 
 
 CONFIGS_ACTION = {

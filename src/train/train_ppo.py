@@ -48,7 +48,7 @@ if __name__=="__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--agent_ckpt', type=str, default=None) 
-    parser.add_argument('--train_episode', type=int, default=100000)
+    parser.add_argument('--train_episode', type=int, default=50000)
     parser.add_argument('--eval_episode', type=int, default=100)
     parser.add_argument('--verbose', type=bool, default=True)
     parser.add_argument('--visualize', type=bool, default=False)
@@ -74,7 +74,8 @@ if __name__=="__main__":
     # configs log
     if os.path.exists('./configs.py'):
         copyfile('./configs.py', save_path+'configs.txt')
-    print("You can track the training process by command 'tensorboard --log-dir %s'" % save_path)
+    # More robust tensorboard command for Python 3.8 environments
+    print(f"You can track the training process with:\n  python -m tensorboard --logdir {os.path.abspath(save_path)}\nThen open http://localhost:6006 in your browser.")
 
     seed = SEED
     # env.seed(seed)
@@ -94,6 +95,9 @@ if __name__=="__main__":
         "save_params": False,
         "actor_layers": actor_params,
         "critic_layers": critic_params,
+        "action_std_init": 1.5, # Increased from 0.6
+        "action_std_decay_rate": 0.0002, # Decreased from 0.001 to slow down decay
+        "min_action_std": 0.1,
     }
 
     rl_agent = PPO(configs)
@@ -143,6 +147,13 @@ if __name__=="__main__":
                 if verbose and i % 10 == 0 and step_num == 1: # Print less frequently
                     print("Updating the agent.")
                 actor_loss, critic_loss = parking_agent.agent.update()
+                
+                # Decay action std
+                parking_agent.agent.decay_action_std(
+                    parking_agent.agent.configs.action_std_decay_rate, 
+                    parking_agent.agent.configs.min_action_std
+                )
+                
                 writer.add_scalar("actor_loss", actor_loss, i)
                 writer.add_scalar("critic_loss", critic_loss, i)
             
@@ -158,11 +169,8 @@ if __name__=="__main__":
         if len(reward_per_state_list) > 0:
             writer.add_scalar("avg_reward", np.mean(reward_per_state_list[-1000:]), i)
         
-        # Log std if available
-        if hasattr(parking_agent.agent, 'log_std'):
-            writer.add_scalar("action_std0", parking_agent.agent.log_std.detach().cpu().numpy().reshape(-1)[0],i)
-            if parking_agent.agent.log_std.shape[0] > 1:
-                writer.add_scalar("action_std1", parking_agent.agent.log_std.detach().cpu().numpy().reshape(-1)[1],i)
+        # Log std
+        writer.add_scalar("action_std", parking_agent.agent.action_std, i)
         
         for type_id in scene_chooser.scene_types:
             scene_name = scene_chooser.scene_types[type_id]
@@ -177,14 +185,27 @@ if __name__=="__main__":
             reward_info_sum = np.sum(np.array(reward_info), axis=0)
             reward_info_sum = np.round(reward_info_sum, 2)
             reward_info_list.append(list(reward_info_sum))
+            # Log individual reward components to TensorBoard
+            comp_names = ['time_cost', 'dist_reward', 'angle_reward', 'collision', 'success']
+            for idx, name in enumerate(comp_names):
+                try:
+                    writer.add_scalar(f"reward_component/{name}", float(reward_info_sum[idx]), i)
+                except Exception:
+                    pass
 
         if verbose and i%10==0 and i>0:
             print('success rate:',np.sum(succ_record[-100:]),'/',len(succ_record[-100:]))
-            if hasattr(parking_agent.agent, 'log_std'):
-                print('std:', parking_agent.agent.log_std.detach().cpu().numpy().reshape(-1))
+            print('std:', parking_agent.agent.action_std)
             print("episode:%s  average reward:%s"%(i,np.mean(reward_list[-50:])))
             if len(parking_agent.agent.actor_loss_list) > 0:
                 print('loss:', np.mean(parking_agent.agent.actor_loss_list[-100:]),np.mean(parking_agent.agent.critic_loss_list[-100:]))
+            # Print reward component summary if available
+            if len(reward_info_list) > 0:
+                last_comp = reward_info_list[-1]
+                try:
+                    print('reward components: time_cost={}, dist_reward={}, angle_reward={}, collision={}, success={}'.format(*last_comp))
+                except Exception:
+                    pass
             print("")
 
         # save best model

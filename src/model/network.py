@@ -3,6 +3,7 @@ from typing import List, OrderedDict
 import torch
 import torch.nn as nn
 from torch import cat
+import numpy as np
 
 from model.attention import AttentionNetwork
 
@@ -34,81 +35,36 @@ class Network(nn.Module):
 class MultiObsEmbedding(nn.Module):
     def __init__(self, configs):
         super().__init__()
-        embed_size = configs['embed_size']
-        hidden_size = configs['hidden_size']
-        activate_func = [nn.LeakyReLU(), nn.Tanh()][configs['use_tanh_activate']]
-        self.use_img = False if configs['img_shape'] is None else True
-        self.use_action_mask = False if configs['action_mask_shape'] is None else True
-        self.use_attention = False if configs['attention_configs'] is None else True
-        self.input_action = 'input_action_dim' in configs and configs['input_action_dim'] > 0
-
-        if not self.use_attention:
-            if configs['n_hidden_layers'] == 1:
-                layers = [nn.Linear(configs['n_modal']*embed_size, configs['output_size'])]
-            else:
-                layers = [nn.Linear(configs['n_modal']*embed_size, hidden_size)]
-                for _ in range(configs['n_hidden_layers']-2):
-                    layers.append(activate_func)
-                    layers.append(nn.Linear(hidden_size, hidden_size))
-                layers.append(nn.Linear(hidden_size, configs['output_size']))
-            self.net = nn.Sequential(*layers)
-        else:
-            attention_configs = configs['attention_configs']
-            self.net = AttentionNetwork(
-                embed_size,
-                attention_configs['depth'],
-                attention_configs['heads'],
-                attention_configs['dim_head'],
-                attention_configs['mlp_dim'],
-                configs['n_modal'],
-                attention_configs['hidden_dim'],
-                configs['output_size'],
-            )
+        input_dim = configs['input_dim']
+        output_size = configs['output_size']
+        
+        # Simple MLP structure similar to DRL
+        # DRL: 400 -> 300 -> output
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 400),
+            nn.Tanh(),
+            nn.Linear(400, 300),
+            nn.Tanh(),
+            nn.Linear(300, output_size),
+        )
+        
         self.output_layer = nn.Tanh() if configs['use_tanh_output'] else None
+        
+        if configs.get('orthogonal_init', True):
+            self.orthogonal_init()
 
-        if configs['lidar_shape'] is not None:
-            layers = [nn.Linear(configs['lidar_shape'], embed_size)]
-            for _ in range(configs['n_embed_layers']-1):
-                layers.append(activate_func)
-                layers.append(nn.Linear(embed_size, embed_size))
-            self.embed_lidar = nn.Sequential(*layers)
-
-        if configs['target_shape'] is not None:
-            layers = [nn.Linear(configs['target_shape'], embed_size)]
-            for _ in range(configs['n_embed_layers']-1):
-                layers.append(activate_func)
-                layers.append(nn.Linear(embed_size, embed_size))
-            self.embed_tgt = nn.Sequential(*layers)
-            
-        if configs['action_mask_shape'] is not None:
-            layers = [nn.Linear(configs['action_mask_shape'], embed_size)]
-            for _ in range(configs['n_embed_layers']-1):
-                layers.append(activate_func)
-                layers.append(nn.Linear(embed_size, embed_size))
-            self.embed_am = nn.Sequential(*layers)
-
-        # Removed ImgEncoder usage
-
-        if self.input_action:
-            layers = [nn.Linear(configs['input_action_dim'], embed_size)]
-            for _ in range(configs['n_embed_layers']-1):
-                layers.append(activate_func)
-                layers.append(nn.Linear(embed_size, embed_size))
-            self.embed_action = nn.Sequential(*layers)
+    def orthogonal_init(self):
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
+                nn.init.constant_(layer.bias, 0)
+        # Last layer small gain
+        if isinstance(self.net[-1], nn.Linear):
+             nn.init.orthogonal_(self.net[-1].weight, gain=0.01)
 
     def forward(self, obs):
-        embeddings = []
-        if hasattr(self, 'embed_lidar'):
-            embeddings.append(self.embed_lidar(obs['lidar']))
-        if hasattr(self, 'embed_tgt'):
-            embeddings.append(self.embed_tgt(obs['target']))
-        if hasattr(self, 'embed_am'):
-            embeddings.append(self.embed_am(obs['action_mask']))
-        if hasattr(self, 'embed_action'):
-            embeddings.append(self.embed_action(obs['action']))
-        
-        x = torch.stack(embeddings, dim=1)
-        out = self.net(x)
+        # obs is expected to be a tensor (batch, input_dim)
+        out = self.net(obs)
         if self.output_layer is not None:
             out = self.output_layer(out)
         return out

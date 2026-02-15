@@ -1,0 +1,10 @@
+torch
+numpy
+gymnasium
+shapely
+pygame
+matplotlib
+tensorboard
+heapdict
+einops
+tqdm
