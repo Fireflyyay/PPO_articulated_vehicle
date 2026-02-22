@@ -37,14 +37,7 @@ class PPOConfig(ConfigBase):
 
         # tricks
         self.adv_norm = True
-        self.state_norm = True # Keep state norm? DRL uses fixed scaling. 
-        # User said "refer to DRL input state design", but didn't explicitly say remove state norm.
-        # However, DRL uses fixed scaling in prepare_state.
-        # PPO_AV uses StateNorm.
-        # I will keep StateNorm for now as it's safer if I don't know the exact scales of everything.
-        # But wait, I manually normalized inputs in CarParking.step.
-        # So I should probably disable state_norm or set it to False.
-        self.state_norm = False 
+        self.state_norm = True 
         self.reward_norm = False
         self.use_gae = True
         self.reward_scaling = False
@@ -77,7 +70,10 @@ class PPOAgent(AgentBase):
 
         # As a on-policy RL algorithm, PPO does not have memory, the self.memory represents
         # the buffer
-        self.memory = ReplayMemory(self.configs.batch_size, ["log_prob","next_obs"])
+        extra_items = ["log_prob", "next_obs"]
+        if self.discrete:
+            extra_items.append("action_mask")
+        self.memory = ReplayMemory(self.configs.batch_size, extra_items)
 
         # tricks
         if self.configs.state_norm:
@@ -88,8 +84,17 @@ class PPOAgent(AgentBase):
         '''
         Initialize 1.the network, 2.the optimizer, 3.the checklist.
         '''
-        self.actor_net = \
-            MultiObsEmbedding(self.configs.actor_layers).to(self.device)
+        # IMPORTANT:
+        # - Continuous actions: actor output is mean in [-1, 1] (tanh is fine).
+        # - Discrete actions: actor output is logits (SHOULD NOT be tanh-clipped),
+        #   otherwise logits are confined to [-1, 1] and the policy cannot become confident.
+        actor_layers = self.configs.actor_layers
+        if isinstance(actor_layers, dict):
+            actor_layers = dict(actor_layers)
+        if self.discrete and isinstance(actor_layers, dict):
+            actor_layers["use_tanh_output"] = False
+
+        self.actor_net = MultiObsEmbedding(actor_layers).to(self.device)
         if self.configs.dist_type == "gaussian":
             # Removed learnable log_std
             self.actor_optimizer = \
@@ -136,62 +141,88 @@ class PPOAgent(AgentBase):
             self.action_std = min_std
         print(f"Action std decayed to: {self.action_std}")
 
-    def _actor_forward(self, obs) -> torch.distributions.Distribution: # to be replaced
+    def _mask_logits(self, logits: torch.Tensor, action_mask) -> torch.Tensor:
+        if action_mask is None:
+            return logits
+        mask = torch.as_tensor(action_mask, device=logits.device, dtype=torch.bool)
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(0)
+        if mask.shape != logits.shape:
+            # Allow broadcasting a single mask across batch
+            if mask.shape[-1] == logits.shape[-1] and mask.shape[0] == 1 and logits.shape[0] > 1:
+                mask = mask.expand(logits.shape[0], -1)
+        if mask.shape != logits.shape:
+            return logits
+        masked_logits = logits.clone()
+        masked_logits[~mask] = -1e10
+        return masked_logits
+
+    def _build_dist(self, policy_out: torch.Tensor, action_mask=None) -> torch.distributions.Distribution:
+        if self.discrete:
+            masked_logits = self._mask_logits(policy_out, action_mask)
+            return Categorical(logits=masked_logits)
+
+        if self.configs.dist_type == "beta":
+            alpha, beta = torch.chunk(policy_out, 2, dim=-1)
+            alpha = F.softplus(alpha) + 1.0
+            beta = F.softplus(beta) + 1.0
+            return Beta(alpha, beta)
+
+        if self.configs.dist_type == "gaussian":
+            mean = torch.clamp(policy_out, -1, 1)
+            std = torch.full_like(mean, self.action_std)
+            return Normal(mean, std)
+
+        raise NotImplementedError
+
+    def _actor_forward(self, obs, action_mask=None) -> torch.distributions.Distribution: # to be replaced
         observation = deepcopy(obs)
         if self.configs.state_norm:
             observation = self.state_normalize.state_norm(observation)
         observation = self.obs2tensor(observation)
         
         with torch.no_grad():
-            policy_dist = self.actor_net(observation)
-            if len(policy_dist.shape) > 1 and policy_dist.shape[0] > 1:
+            policy_out = self.actor_net(observation)
+            if len(policy_out.shape) > 1 and policy_out.shape[0] > 1:
                 # raise NotImplementedError # Why was this here?
                 pass
-            if self.discrete:
-                dist = Categorical(F.softmax(policy_dist, dim=1))
-            elif self.configs.dist_type == "beta":
-                alpha, beta = torch.chunk(policy_dist, 2, dim=-1)
-                alpha = F.softplus(alpha) + 1.0
-                beta = F.softplus(beta) + 1.0
-                dist = Beta(alpha, beta)
-            elif self.configs.dist_type == "gaussian":
-                mean =  torch.clamp(policy_dist,-1,1)  
-                # Use decaying action_std
-                std = torch.full_like(mean, self.action_std)
-                dist = Normal(mean, std)
-            else:
-                raise NotImplementedError
+            dist = self._build_dist(policy_out, action_mask=action_mask)
             
         return dist
     
-    def _post_process_action(self, action_dist:torch.distributions.Distribution , action_mask=None, deterministic=False): # to be replaced
-        # if action_mask is not None:
-        #     mean, std = action_dist.mean, action_dist.stddev
-        #     action = self.action_filter.choose_action(mean, std, action_mask, deterministic)
-        #     action = torch.FloatTensor(action).to(self.device)
-        # else:
+    def _post_process_action(self, action_dist: torch.distributions.Distribution, deterministic: bool = False):
         if deterministic:
-            action = action_dist.mean
+            if self.discrete:
+                # For Categorical, mode is argmax of probs
+                action = torch.argmax(action_dist.probs, dim=-1)
+            else:
+                action = action_dist.mean
         else:
             action = action_dist.sample()
 
         if not self.discrete and self.configs.dist_type == "gaussian":
                 action = torch.clamp(action, -1, 1)
+        
         log_prob = action_dist.log_prob(action)
         action = action.detach().cpu().numpy().flatten()
+        
+        # fix: for discrete, action might be scalar after flatten if batch=1, but we want it to be int.
+        # if continuous, it is float.
+        if self.discrete and action.size == 1:
+            action = int(action.item())
+        
         log_prob = log_prob.detach().cpu().numpy().flatten()
         return action, log_prob
 
 
-    def choose_action(self, obs, deterministic=False):
+    def choose_action(self, obs, deterministic: bool = False, action_mask=None):
 
-        dist = self._actor_forward(obs)
-        # action_mask = obs['action_mask']
-        action, other_info = self._post_process_action(dist, None, deterministic)
+        dist = self._actor_forward(obs, action_mask=action_mask)
+        action, other_info = self._post_process_action(dist, deterministic=deterministic)
                 
         return action, other_info
 
-    def get_action(self, obs: np.ndarray):
+    def get_action(self, obs: np.ndarray, action_mask=None):
         '''Take action based on one observation. 
 
         Args:
@@ -202,12 +233,12 @@ class PPOAgent(AgentBase):
                 If the action space is continuous, the action is an (np.ndarray).
             log_prob(np.ndarray): the log probability of taken action.
         '''
-        dist = self._actor_forward(obs)
+        dist = self._actor_forward(obs, action_mask=action_mask)
         action, log_prob = self._post_process_action(dist)
                 
         return action, log_prob
 
-    def get_log_prob(self, obs: np.ndarray, action: np.ndarray):
+    def get_log_prob(self, obs: np.ndarray, action, action_mask=None):
         '''get the log probability for given action based on current policy
 
         Args:
@@ -216,23 +247,38 @@ class PPOAgent(AgentBase):
         Returns:
             log_prob(np.ndarray): the log probability of taken action.
         '''
-        dist = self._actor_forward(obs)
-        
-        action = torch.FloatTensor(action).to(self.device)
-        log_prob = dist.log_prob(action)
+        dist = self._actor_forward(obs, action_mask=action_mask)
+
+        if self.discrete:
+            action_t = torch.as_tensor(action, dtype=torch.int64, device=self.device)
+            if action_t.dim() == 0:
+                action_t = action_t.unsqueeze(0)
+            log_prob = dist.log_prob(action_t)
+        else:
+            action_t = torch.as_tensor(action, dtype=torch.float32, device=self.device)
+            log_prob = dist.log_prob(action_t)
+
         log_prob = log_prob.detach().cpu().numpy().flatten()
         return log_prob
 
     def push_memory(self, observations):
         '''
         Args:
-            observations(tuple): (obs, action, reward, done, log_prob, next_obs)
+            observations(tuple):
+                continuous: (obs, action, reward, done, log_prob, next_obs)
+                discrete:   (obs, action, reward, done, log_prob, next_obs, action_mask)
         '''
-        obs, action, reward, done, log_prob, next_obs = deepcopy(observations)
+        obs, action, reward, done, log_prob, next_obs, *rest = deepcopy(observations)
+        action_mask = rest[0] if len(rest) > 0 else None
         if self.configs.state_norm:
             obs = self.state_normalize.state_norm(obs)
             next_obs = self.state_normalize.state_norm(next_obs,update=True)
-        observations = (obs, action, reward, done, log_prob, next_obs)
+        if self.discrete:
+            if action_mask is None:
+                action_mask = np.ones(int(self.configs.action_dim), dtype=np.int8)
+            observations = (obs, action, reward, done, log_prob, next_obs, action_mask)
+        else:
+            observations = (obs, action, reward, done, log_prob, next_obs)
         self.memory.push(observations)
 
     def _reward_norm(self, reward):
@@ -260,7 +306,7 @@ class PPOAgent(AgentBase):
         state_batch = self.obs2tensor(batches["state"])
         
         if self.discrete:
-            action_batch = torch.IntTensor(np.array(batches["action"])).to(self.device)
+            action_batch = torch.IntTensor(np.array(batches["action"])).to(self.device).reshape(-1)
         else:
             action_batch = torch.FloatTensor(np.array(batches["action"])).to(self.device) 
         rewards = torch.FloatTensor(np.array(batches["reward"])).unsqueeze(1)
@@ -268,8 +314,13 @@ class PPOAgent(AgentBase):
             if self.configs.reward_norm else rewards
         reward_batch = reward_batch.to(self.device)
         done_batch = torch.FloatTensor(np.array(batches["done"])).to(self.device).unsqueeze(1)
-        old_log_prob_batch = torch.FloatTensor(np.array(batches["log_prob"])).to(self.device)
+        old_log_prob_batch = torch.as_tensor(np.array(batches["log_prob"]), dtype=torch.float32, device=self.device)
+        if old_log_prob_batch.dim() == 1:
+            old_log_prob_batch = old_log_prob_batch.view(-1, 1)
         next_state_batch = self.obs2tensor(batches["next_obs"])
+        action_mask_batch = None
+        if self.discrete and "action_mask" in batches:
+            action_mask_batch = torch.as_tensor(batches["action_mask"], dtype=torch.bool, device=self.device)
         self.memory.clear()
 
         # GAE
@@ -308,7 +359,9 @@ class PPOAgent(AgentBase):
                 # state = state_batch[ri]
                 state = self.get_obs(state_batch, ri)
                 if self.discrete:
-                    dist = Categorical(F.softmax(self.actor_net(state),dim=-1))
+                    logits = self.actor_net(state)
+                    mask = action_mask_batch[ri] if action_mask_batch is not None else None
+                    dist = self._build_dist(logits, action_mask=mask)
                     dist_entropy = dist.entropy().view(-1, 1)
                     log_prob= dist.log_prob(action_batch[ri].squeeze()).view(-1, 1)
                     old_log_prob = old_log_prob_batch[ri].view(-1,1)
@@ -391,31 +444,51 @@ class PPOAgent(AgentBase):
 
     def load(self, path: str = None, params_only: bool = None) -> None:
         """Load the model structure and corresponding parameters from a file.
+
+        Args:
+            path: checkpoint path.
+            params_only: if True, only load network parameters/state_norm and skip optimizers/configs.
         """
-        if params_only is not None:
-            self.load_params = params_only
-        
+        load_params_only = bool(params_only) if params_only is not None else False
+
         if len(self.check_list) > 0:
-            checkpoint = torch.load(path, map_location=self.device)
+            # Try safer weights-only loading when we're only interested in tensors.
+            # Fallback to regular torch.load for older torch versions or checkpoints
+            # that include non-tensor objects.
+            try:
+                checkpoint = torch.load(
+                    path,
+                    map_location=self.device,
+                    weights_only=load_params_only,
+                )
+            except TypeError:
+                checkpoint = torch.load(path, map_location=self.device)
+            except Exception:
+                checkpoint = torch.load(path, map_location=self.device)
+
+            allowed_names = None
+            if load_params_only:
+                allowed_names = {"actor_net", "critic_net", "critic_target"}
+
             for name, item, save_state_dict in self.check_list:
-                if name in checkpoint:
-                    if save_state_dict:
-                        item.load_state_dict(checkpoint[name])
+                if allowed_names is not None and name not in allowed_names:
+                    continue
+                if name not in checkpoint:
+                    continue
+                if save_state_dict:
+                    item.load_state_dict(checkpoint[name])
+                else:
+                    if isinstance(item, torch.nn.Parameter):
+                        item.data.copy_(checkpoint[name].data)
                     else:
-                        # For non-state-dict items, we might need to copy data or assign
-                        if isinstance(item, torch.nn.Parameter):
-                            item.data.copy_(checkpoint[name].data)
-                        else:
-                            # This is tricky as we can't easily reassign self.attribute here
-                            # but for state_normalize it's handled below
-                            pass
+                        pass
 
             # if 'log' in checkpoint:
             #     self.log_std.data.copy_(checkpoint['log'].data if isinstance(checkpoint['log'], torch.nn.Parameter) else checkpoint['log']) 
             
             if 'state_norm' in checkpoint:
-                self.state_normalize = checkpoint['state_norm'] 
-            if 'optimizer' in checkpoint.keys():
+                self.state_normalize = checkpoint['state_norm']
+            if (not load_params_only) and ('optimizer' in checkpoint.keys()):
                 self.actor_optimizer, self.critic_optimizer = checkpoint['optimizer']
         
         if self.verbose:

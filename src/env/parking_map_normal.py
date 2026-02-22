@@ -508,6 +508,12 @@ def generate_navigation_case(map_level):
     '''
     Generate navigation case with a square wall [-40, 40] and obstacles.
     '''
+    def _wrap_pi(a: float) -> float:
+        return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+    def _abs_angle_diff(a: float, b: float) -> float:
+        return abs(_wrap_pi(a - b))
+
     # Map boundaries
     min_bound = -40.0
     max_bound = 40.0
@@ -554,24 +560,62 @@ def generate_navigation_case(map_level):
         (valid_max, valid_max), (valid_min, valid_max)
     ])
 
+    # Difficulty constraints (user spec)
+    # - Normal:  dist <= 30m, heading diff <= 45deg
+    # - Complex: 30m <= dist <= 50m, 45deg <= heading diff <= 90deg
+    # - Extrem:  dist >= 50m, heading diff >= 60deg
+    if map_level == 'Normal':
+        dist_min, dist_max = 0.0, 30.0
+        hd_min, hd_max = 0.0, float(np.deg2rad(45))
+    elif map_level == 'Complex':
+        dist_min, dist_max = 30.0, 50.0
+        hd_min, hd_max = float(np.deg2rad(45)), float(np.deg2rad(90))
+    else:  # Extrem
+        dist_min, dist_max = 50.0, None
+        hd_min, hd_max = float(np.deg2rad(60)), float(np.pi)
+
     # Generate start and dest inside the wall
-    min_dist = random_uniform_num(50.0, 80.0)
-    while True:
+    max_tries = 5000
+    for _ in range(max_tries):
         start_x = random_uniform_num(valid_min, valid_max)
         start_y = random_uniform_num(valid_min, valid_max)
         start_point = Point(start_x, start_y)
-        
+
         dest_x = random_uniform_num(valid_min, valid_max)
         dest_y = random_uniform_num(valid_min, valid_max)
         dest_point = Point(dest_x, dest_y)
-        
-        if np.hypot(start_x - dest_x, start_y - dest_y) > min_dist:
-             # Check distance to walls (already handled by valid_min/max but good to be safe)
-             if valid_area.contains(start_point) and valid_area.contains(dest_point):
-                break
-            
-    start_yaw = random_uniform_num(-pi, pi)
-    dest_yaw = random_uniform_num(-pi, pi)
+
+        if not (valid_area.contains(start_point) and valid_area.contains(dest_point)):
+            continue
+
+        dist = float(np.hypot(start_x - dest_x, start_y - dest_y))
+        if dist < dist_min:
+            continue
+        if dist_max is not None and dist > dist_max:
+            continue
+
+        # Sample headings with guaranteed difference range
+        start_yaw = float(random_uniform_num(-pi, pi))
+        delta = float(random_uniform_num(hd_min, hd_max))
+        if random() < 0.5:
+            delta = -delta
+        dest_yaw = _wrap_pi(start_yaw + delta)
+
+        hd = _abs_angle_diff(start_yaw, dest_yaw)
+        if hd < hd_min - 1e-9:
+            continue
+        if hd > hd_max + 1e-9:
+            continue
+
+        break
+    else:
+        # Fallback: if constraints are too strict under some geometry/seed, relax slightly.
+        start_x = random_uniform_num(valid_min, valid_max)
+        start_y = random_uniform_num(valid_min, valid_max)
+        dest_x = random_uniform_num(valid_min, valid_max)
+        dest_y = random_uniform_num(valid_min, valid_max)
+        start_yaw = float(random_uniform_num(-pi, pi))
+        dest_yaw = float(random_uniform_num(-pi, pi))
     
     # Internal obstacles
     for _ in range(n_internal_obstacles):
@@ -636,10 +680,10 @@ class ParkingMapNormal(object):
         self.dest_box = self.dest.create_box()[0]
         
         # Expanded map boundaries to 120x120m (-60 to 60) for longer navigation
-        self.xmin = -60.0
-        self.xmax = 60.0
-        self.ymin = -60.0
-        self.ymax = 60.0
+        self.xmin = -50.0
+        self.xmax = 50.0
+        self.ymin = -50.0
+        self.ymax = 50.0
         
         self.obstacles = list([Area(shape=obs, subtype="obstacle", \
             color=(150, 150, 150, 255)) for obs in obstacles])

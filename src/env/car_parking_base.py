@@ -8,8 +8,9 @@ import sys
 sys.path.append("../")
 from typing import Optional, Union
 import math
-from typing import OrderedDict
 import random
+from collections import OrderedDict
+from copy import deepcopy
 
 import numpy as np
 import gymnasium as gym
@@ -17,7 +18,6 @@ from gymnasium import spaces
 from gymnasium.error import DependencyNotInstalled
 from shapely.geometry import Polygon
 from shapely.affinity import affine_transform
-from heapdict import heapdict
 try:
     # As pygame is necessary for using the environment (reset and step) even without a render mode
     #   therefore, pygame is a necessary import for the environment.
@@ -79,7 +79,6 @@ class CarParking(gym.Env):
         self.vehicle = Vehicle(n_step=NUM_STEP, step_len=STEP_LENGTH, articulated=True, trailer_length= TRAILER_LENGTH, hitch_offset=HITCH_OFFSET)
         self.lidar = LidarSimlator(LIDAR_RANGE, LIDAR_NUM)
         self.reward = 0.0
-        self.prev_reward = 0.0
         self.accum_arrive_reward = 0.0
         
         # Tracking variables for new penalties
@@ -142,7 +141,6 @@ class CarParking(gym.Env):
         level = options.get('level') if options else None
 
         self.reward = 0.0
-        self.prev_reward = 0.0
         self.accum_arrive_reward = 0.0
         self.t = 0.0
         
@@ -156,8 +154,8 @@ class CarParking(gym.Env):
         self.vehicle.reset(initial_state)
         self.matrix = self.coord_transform_matrix()
         
-        # Calculate initial distance
-        self.initial_dist = self.vehicle.state.loc.distance(Point(self.map.dest.loc)) + 1e-6
+        # For reward normalization
+        self.initial_dist = float(self.vehicle.state.loc.distance(Point(self.map.dest.loc))) + 1e-6
         
         obs, _, _, _, info = self.step(None)
         return obs, info
@@ -179,6 +177,7 @@ class CarParking(gym.Env):
         return [scale, 0, 0, -scale, x_off, y_off]
 
     def step(self, action: np.ndarray = None):
+        prev_state = None
         if action is not None:
             # Scale action from [-1, 1] to [min, max]
             steer_min, steer_max = VALID_STEER
@@ -188,6 +187,7 @@ class CarParking(gym.Env):
             scaled_action[0] = 0.5 * (action[0] + 1.0) * (steer_max - steer_min) + steer_min
             scaled_action[1] = 0.5 * (action[1] + 1.0) * (speed_max - speed_min) + speed_min
             
+            prev_state = deepcopy(self.vehicle.state)
             self.vehicle.step(scaled_action)
             self.t += 1
         
@@ -243,8 +243,8 @@ class CarParking(gym.Env):
         # Concatenate all
         obs = np.concatenate([lidar_obs, target_obs, vel_obs])
         
-        # calculate reward
-        reward, done, info = self.get_reward(action)
+        # calculate reward (HOPE-style shaping)
+        reward, done, info = self.get_reward(action, prev_state=prev_state)
         self.reward = reward
         
         terminated = False
@@ -258,35 +258,90 @@ class CarParking(gym.Env):
         
         return obs, reward, terminated, truncated, info
 
-    def get_reward(self, action):
-        reward = 0.0
-        done = False
+    def _wrap_pi(self, a: float) -> float:
+        return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _get_angle_diff(self, a: float, b: float) -> float:
+        return abs(self._wrap_pi(a - b))  # 0..pi
+
+    def _get_reward_info(self, prev_state: State, curr_state: State) -> OrderedDict:
+        """HOPE-style per-step reward components (deltas)."""
+        time_cost = -1.0
+        rs_dist_reward = 0.0
+
+        # Distance progress reward (normalized)
+        dist_diff = float(curr_state.loc.distance(self.map.dest.loc))
+        prev_dist_diff = float(prev_state.loc.distance(self.map.dest.loc))
+        dist_norm_ratio = max(self.initial_dist, 10.0)
+        dist_reward = prev_dist_diff / dist_norm_ratio - dist_diff / dist_norm_ratio
+
+        # Heading alignment progress reward (optional; keep weight at 0 by default)
+        angle_diff = self._get_angle_diff(curr_state.heading, self.map.dest.heading)
+        prev_angle_diff = self._get_angle_diff(prev_state.heading, self.map.dest.heading)
+        angle_norm_ratio = math.pi
+        angle_reward = prev_angle_diff / angle_norm_ratio - angle_diff / angle_norm_ratio
+
+        # Box union reward (incremental IoU-like overlap, monotonic)
+        front_box_ego = Polygon(curr_state.create_box()[0])
+        front_box_dest = Polygon(self.map.dest.create_box()[0])
+        inter = float(front_box_ego.intersection(front_box_dest).area)
+        dest_area = float(front_box_dest.area) + 1e-9
+        # HOPE uses: inter / (2*dest - inter)
+        box_union = inter / max(1e-9, (2.0 * dest_area - inter))
+        if box_union < self.accum_arrive_reward:
+            box_union_reward = 0.0
+        else:
+            prev_acc = self.accum_arrive_reward
+            self.accum_arrive_reward = box_union
+            box_union_reward = box_union - prev_acc
+
+        return OrderedDict(
+            {
+                'time_cost': float(time_cost),
+                'rs_dist_reward': float(rs_dist_reward),
+                'dist_reward': float(dist_reward),
+                'angle_reward': float(angle_reward),
+                'box_union_reward': float(box_union_reward),
+            }
+        )
+
+    def _reward_shaping(self, status: Status, reward_info: OrderedDict) -> float:
+        """Aggregate scalar reward from reward_info (CONTINUE) or fixed terminal rewards."""
+        if status == Status.CONTINUE:
+            r = 0.0
+            for k, w in REWARD_WEIGHT.items():
+                r += float(w) * float(reward_info.get(k, 0.0))
+        elif status == Status.OUTBOUND:
+            r = -50.0
+        elif status == Status.OUTTIME:
+            r = -1.0
+        elif status == Status.ARRIVED:
+            r = 50.0
+        elif status == Status.COLLIDED:
+            r = -50.0
+        else:
+            r = 0.0
+        return float(r) * float(REWARD_RATIO)
+
+    def get_reward(self, action, prev_state: State = None):
+        """Return (reward, done, info) in Gymnasium style.
+
+        NOTE: when action is None (reset probing), reward is 0.
+        """
         info = {}
-        
-        # 1. Time cost
-        reward -= REWARD_WEIGHT['time_cost'] * 0.01
-        
-        # 2. Distance to target
-        dist = self.vehicle.state.loc.distance(Point(self.map.dest.loc))
-        if self.prev_reward == 0.0:
-            self.prev_reward = dist
-        
-        # Normalized distance reward (Progress based)
-        dist_reward_val = (self.prev_reward - dist) / self.initial_dist * REWARD_WEIGHT['dist_reward']
-        reward += dist_reward_val
-        self.prev_reward = dist
-        
-        # 2.5 Angle reward
-        heading_diff = self.vehicle.state.heading - self.map.dest.heading
-        # Normalize to [-pi, pi]
-        heading_diff = (heading_diff + math.pi) % (2 * math.pi) - math.pi
-        angle_reward = 0.0 # Cancelled
-        reward += angle_reward
-        
-        # 3. Collision
-        # Check collision with obstacles
+
+        if action is None:
+            info['status'] = Status.CONTINUE
+            info['reward_info'] = OrderedDict({k: 0.0 for k in REWARD_WEIGHT.keys()})
+            info['path_to_dest'] = None
+            return 0.0, False, info
+
+        # Determine status (collision / outbound / arrived / outtime)
+        status = Status.CONTINUE
+
+        # Collision with obstacles
         is_collision = False
-        vehicle_boxes = self.vehicle.boxes # [front, rear]
+        vehicle_boxes = self.vehicle.boxes  # [front, rear]
         for box in vehicle_boxes:
             for obst in self.map.obstacles:
                 if box.intersects(obst.shape):
@@ -294,59 +349,48 @@ class CarParking(gym.Env):
                     break
             if is_collision:
                 break
-        
-        # Check out of map
+
+        # Out of map
         if not is_collision:
-             if self.vehicle.state.loc.x < self.map.xmin or self.vehicle.state.loc.x > self.map.xmax or \
-                self.vehicle.state.loc.y < self.map.ymin or self.vehicle.state.loc.y > self.map.ymax:
-                 is_collision = True
-                 info['status'] = Status.OUTBOUND
+            x, y = self.vehicle.state.loc.x, self.vehicle.state.loc.y
+            if x < self.map.xmin or x > self.map.xmax or y < self.map.ymin or y > self.map.ymax:
+                status = Status.OUTBOUND
 
         if is_collision:
-            reward -= REWARD_WEIGHT['out_of_map_penalty'] # Using out_of_map_penalty for collision too
-            done = True
-            info['status'] = Status.COLLIDED
-        
-        # 4. Success
-        # Check if arrived
-        # Arrived if angle diff < 10 degrees and front box overlap > 80%
-        
-        heading_diff_abs = abs(heading_diff)
-        
-        # Calculate overlap of front parts
-        front_box_ego = Polygon(self.vehicle.boxes[0])
-        front_box_dest = Polygon(self.map.dest.create_box()[0])
-        
-        intersection_area = front_box_ego.intersection(front_box_dest).area
-        overlap_ratio = intersection_area / front_box_dest.area
-        
-        if heading_diff_abs < np.radians(15) and overlap_ratio > 0.7:
-            reward += REWARD_WEIGHT['box_union_reward']
-            done = True
-            info['status'] = Status.ARRIVED
-        
-        # 5. Turn penalty (smoothness)
-        if action is not None:
-            # action[0] is steering/articulation rate
-            reward -= abs(action[0]) * REWARD_WEIGHT['turn_penalty']
+            status = Status.COLLIDED
 
-        if self.t >= TOLERANT_TIME:
-            done = True
-            info['status'] = Status.OUTTIME
-            
-        if 'status' not in info:
-            info['status'] = Status.CONTINUE
-            
-        info['reward_info'] = {
-            'time_cost': -REWARD_WEIGHT['time_cost'] * 0.01,
-            'dist_reward': dist_reward_val,
-            'angle_reward': angle_reward,
-            'collision': -REWARD_WEIGHT['out_of_map_penalty'] if is_collision else 0,
-            'success': REWARD_WEIGHT['box_union_reward'] if info['status'] == Status.ARRIVED else 0
-        }
-        info['path_to_dest'] = None # No RS path
+        # Success check (same threshold as before)
+        if status == Status.CONTINUE:
+            heading_diff = self._get_angle_diff(self.vehicle.state.heading, self.map.dest.heading)
+            front_box_ego = Polygon(self.vehicle.boxes[0])
+            front_box_dest = Polygon(self.map.dest.create_box()[0])
+            intersection_area = float(front_box_ego.intersection(front_box_dest).area)
+            overlap_ratio = intersection_area / (float(front_box_dest.area) + 1e-9)
+            if heading_diff < float(np.deg2rad(15)) and overlap_ratio > 0.7:
+                status = Status.ARRIVED
+
+        if status == Status.CONTINUE and self.t >= TOLERANT_TIME:
+            status = Status.OUTTIME
+
+        done = status != Status.CONTINUE
+
+        # Reward info (only meaningful during CONTINUE)
+        if prev_state is None:
+            prev_state = self.vehicle.state
+        reward_info = self.get_reward_info(status, prev_state)
+
+        reward = self._reward_shaping(status, reward_info)
+
+        info['status'] = status
+        info['reward_info'] = reward_info
+        info['path_to_dest'] = None
 
         return reward, done, info
+
+    def get_reward_info(self, status: Status, prev_state: State) -> OrderedDict:
+        if status != Status.CONTINUE:
+            return OrderedDict({k: 0.0 for k in REWARD_WEIGHT.keys()})
+        return self._get_reward_info(prev_state, self.vehicle.state)
 
     def render(self, mode='human'):
         if self.screen is None:

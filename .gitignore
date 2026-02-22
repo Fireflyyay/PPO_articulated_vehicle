@@ -1,5 +1,8 @@
 /src/__pycache__/
 /src/*.pyc
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
 /.vscode/
 /.idea/
 /src/.DS_Store
