@@ -18,6 +18,8 @@ import matplotlib.pyplot as plt
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
+import configs as cfg
+
 from model.agent.ppo_agent import PPOAgent as PPO
 from model.agent.parking_agent import ParkingAgent, PrimitivePlanner
 from env.car_parking_base import CarParking
@@ -28,6 +30,145 @@ from configs import *
 if USE_MOTION_PRIMITIVES:
     from primitives.library import load_library
     from env.wrappers.macro_action_wrapper import MacroActionWrapper
+
+# Adaptive primitive expansion imports (kept optional)
+if USE_MOTION_PRIMITIVES:
+    try:
+        from primitives.adaptive_library_manager import AdaptivePrimitiveLibraryManager
+        from primitives.trajectory_miner import EpisodeTrace, TrajectoryMiner
+        from primitives.primitive_pruner import PrimitivePruner
+        from train.adaptive_primitive_scheduler import AdaptivePrimitiveScheduler
+        from reward.shaping_from_discovered_primitives import DiscoveredPrimitiveShaping
+        from model.agent.ppo_agent import expand_discrete_actor_output
+    except Exception:
+        AdaptivePrimitiveLibraryManager = None
+        EpisodeTrace = None
+        TrajectoryMiner = None
+        PrimitivePruner = None
+        AdaptivePrimitiveScheduler = None
+        DiscoveredPrimitiveShaping = None
+        expand_discrete_actor_output = None
+
+
+def _scene_is_hard(scene_name: str) -> bool:
+    return str(scene_name) in ("Complex", "Extrem", "Extreme")
+
+
+def _safe_mean(xs):
+    if xs is None or len(xs) == 0:
+        return 0.0
+    return float(np.mean(xs))
+
+
+def _to_scalar(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        pass
+    try:
+        arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        if arr.size > 0:
+            return float(arr[0])
+    except Exception:
+        pass
+    return float(default)
+
+
+def _run_eval_episodes(env, parking_agent, n_episodes: int, scene_schedule: list, deterministic: bool = True):
+    """Lightweight evaluation (no learning). Returns dict metrics."""
+    succ = []
+    succ_extreme = []
+    lengths = []
+    for k in range(int(n_episodes)):
+        scene = scene_schedule[k % len(scene_schedule)]
+        obs, _ = env.reset(options={'level': scene})
+        parking_agent.reset()
+        done = False
+        step_num = 0
+        while not done:
+            step_num += 1
+            action_mask = None
+            if USE_MOTION_PRIMITIVES and USE_ACTION_MASK and hasattr(env, 'get_action_mask'):
+                action_mask = env.get_action_mask(obs)
+            action, _ = parking_agent.choose_action(obs, deterministic=deterministic, action_mask=action_mask)
+            obs, _, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+        lengths.append(step_num)
+        s = 1 if info.get('status', None) == Status.ARRIVED else 0
+        succ.append(s)
+        if str(scene) in ("Extrem", "Extreme"):
+            succ_extreme.append(s)
+    return {
+        "success": _safe_mean(succ),
+        "success_extreme": _safe_mean(succ_extreme),
+        "avg_len": _safe_mean(lengths),
+    }
+
+
+def _collect_rollouts_for_mining(env, parking_agent, n_episodes: int, scene_schedule: list, deterministic: bool, start_episode_id: int = 0):
+    """Collect EpisodeTrace list for mining (no learning)."""
+    episodes = []
+    for k in range(int(n_episodes)):
+        scene = scene_schedule[k % len(scene_schedule)]
+        obs, _ = env.reset(options={'level': scene})
+        parking_agent.reset()
+
+        done = False
+        ep_obs = []
+        ep_actions = []
+        ep_low = []
+        ep_rewards = []
+        ep_dones = []
+        ep_infos = []
+        total_reward = 0.0
+        takeover_used = False
+
+        while not done:
+            ep_obs.append(np.asarray(obs, dtype=np.float64))
+            action_mask = None
+            if USE_MOTION_PRIMITIVES and USE_ACTION_MASK and hasattr(env, 'get_action_mask'):
+                action_mask = env.get_action_mask(obs)
+            action, _ = parking_agent.choose_action(obs, deterministic=deterministic, action_mask=action_mask)
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            done = terminated or truncated
+
+            takeover_used = takeover_used or bool(info.get('takeover_active', False))
+            ep_actions.append(int(info.get('primitive_id', action)))
+            tr = info.get('macro_exec_trace', {}) if isinstance(info, dict) else {}
+            sub_u = tr.get('sub_actions_phys', None)
+            if sub_u is None:
+                # fallback: use library primitive actions (may over-estimate executed steps)
+                try:
+                    sub_u = env.primitive_lib.get_actions(int(action))
+                except Exception:
+                    sub_u = np.zeros((1, 2), dtype=np.float64)
+            ep_low.append(np.asarray(sub_u, dtype=np.float64))
+
+            ep_rewards.append(float(reward))
+            ep_dones.append(bool(done))
+            ep_infos.append(info if isinstance(info, dict) else {})
+            total_reward += float(reward)
+            obs = next_obs
+
+        success = bool(ep_infos[-1].get('status', None) == Status.ARRIVED) if len(ep_infos) > 0 else False
+        episodes.append(
+            EpisodeTrace(
+                episode_id=int(start_episode_id + k),
+                scene_type=str(scene),
+                success=bool(success),
+                total_reward=float(total_reward),
+                step_count_macro=int(len(ep_actions)),
+                takeover_used=bool(takeover_used),
+                observations=ep_obs,
+                actions_primitive=ep_actions,
+                actions_low_level=ep_low,
+                rewards=ep_rewards,
+                dones=ep_dones,
+                infos=ep_infos,
+                states_optional=None,
+            )
+        )
+    return episodes
 
 class SceneChoose:
     """Failure-driven curriculum sampler (ported from HOPE).
@@ -99,7 +240,7 @@ if __name__=="__main__":
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--agent_ckpt', type=str, default=None) 
-    parser.add_argument('--train_episode', type=int, default=50000)
+    parser.add_argument('--train_episode', type=int, default=100000)
     parser.add_argument('--eval_episode', type=int, default=100)
     parser.add_argument('--verbose', type=bool, default=True)
     parser.add_argument('--visualize', type=bool, default=False)
@@ -210,7 +351,7 @@ if __name__=="__main__":
         "actor_layers": actor_params,
         "critic_layers": critic_params,
         "action_std_init": 1.5, # Increased from 0.6
-        "action_std_decay_rate": 0.0002, # Decreased from 0.001 to slow down decay
+        "action_std_decay_rate": 0.0003, # Decreased from 0.001 to slow down decay
         "min_action_std": 0.1,
         # Ensure gamma is consistent with macro-action horizon
         "gamma": (GAMMA_BASE ** primitive_h) if USE_MOTION_PRIMITIVES else GAMMA,
@@ -224,6 +365,220 @@ if __name__=="__main__":
 
     primitive_planner = PrimitivePlanner() if USE_MOTION_PRIMITIVES else None
     parking_agent = ParkingAgent(rl_agent, planner=primitive_planner)
+
+    # Adaptive primitive expansion components
+    adaptive_enabled = bool(USE_MOTION_PRIMITIVES and USE_ADAPTIVE_PRIMITIVE_EXPANSION)
+    ap_scheduler = None
+    ap_lib_mgr = None
+    ap_miner = None
+    ap_pruner = None
+    ap_shaping = None
+    ap_round_id = 0
+    ap_last_good_ckpt = None
+    ap_last_good_version = None
+    post_expand_lr_restore = None
+
+    # mining buffer
+    ap_trace_buffer = []
+    ap_trace_next_id = 0
+
+    if adaptive_enabled:
+        if AdaptivePrimitiveLibraryManager is None:
+            print("[adaptive] imports failed; disabling adaptive primitive expansion")
+            adaptive_enabled = False
+        else:
+            ap_scheduler = AdaptivePrimitiveScheduler(cfg)
+            ap_lib_mgr = AdaptivePrimitiveLibraryManager(verbose=True)
+            ap_lib_mgr.load(base_path=lib_full_path, save_dir=save_path)
+            ap_miner = TrajectoryMiner(verbose=True)
+            ap_pruner = PrimitivePruner(verbose=True)
+            ap_shaping = DiscoveredPrimitiveShaping(cfg) if DiscoveredPrimitiveShaping is not None else None
+            ap_last_good_version = ap_lib_mgr.active_version_id
+            ap_last_good_ckpt = os.path.join(save_path, "adaptive_primitives", "last_good_agent.pt")
+            parking_agent.agent.save(ap_last_good_ckpt, params_only=True)
+
+            print(f"[adaptive] enabled. base_version={ap_last_good_version}, lib_size={ap_lib_mgr.library_size}")
+
+    def run_adaptive_primitive_round(ep_idx: int):
+        global env, primitive_lib, primitive_h
+        global ap_round_id, ap_last_good_ckpt, ap_last_good_version, post_expand_lr_restore
+
+        if not adaptive_enabled:
+            return
+
+        # round id + bookkeeping
+        ap_round_id = ap_scheduler.on_round_started(ep_idx)
+        writer.add_scalar("adaptive/round_id", float(ap_round_id), ep_idx)
+        writer.add_scalar("adaptive/triggered", 1.0, ep_idx)
+
+        old_version = ap_lib_mgr.active_version_id
+        old_lib_size = int(env.action_space.n)
+        old_lr = float(parking_agent.agent.actor_optimizer.param_groups[0].get('lr', parking_agent.agent.configs.lr_actor))
+        post_expand_lr_restore = old_lr
+
+        # Save rollback checkpoint
+        ckpt_before = os.path.join(save_path, "adaptive_primitives", f"before_round_{ap_round_id}.pt")
+        os.makedirs(os.path.dirname(ckpt_before), exist_ok=True)
+        parking_agent.agent.save(ckpt_before, params_only=True)
+
+        # Validation before
+        val_schedule = ["Complex", "Extrem"]
+        val_before = _run_eval_episodes(env, parking_agent, int(AP_VALIDATION_EPISODES), val_schedule, deterministic=True)
+        writer.add_scalar("adaptive/validation_success_before", float(val_before["success"]), ep_idx)
+        writer.add_scalar("adaptive/validation_extreme_success_before", float(val_before["success_extreme"]), ep_idx)
+
+        # Collect mining rollouts (bias towards hard scenes)
+        mining_schedule = ["Complex", "Extrem", "Complex", "Normal"]
+        rollouts = _collect_rollouts_for_mining(
+            env,
+            parking_agent,
+            n_episodes=int(AP_MINING_ROLLOUTS),
+            scene_schedule=mining_schedule,
+            deterministic=bool(AP_MINING_DETERMINISTIC),
+            start_episode_id=int(1000000 + ap_round_id * 10000),
+        )
+
+        # Mine
+        cands = ap_miner.mine_from_episodes(rollouts, ap_lib_mgr.get_active_library(), cfg)
+        writer.add_scalar("adaptive/candidates_raw_count", float(len(cands)), ep_idx)
+
+        # Dedup
+        c_dedup = ap_pruner.deduplicate(cands, ap_lib_mgr.get_active_library(), cfg)
+        writer.add_scalar("adaptive/candidates_after_dedup", float(len(c_dedup)), ep_idx)
+
+        # Proxy pruning (Phase1 no-op unless user wires env_sampler)
+        c_proxy = ap_pruner.prune_by_proxy_value(c_dedup, env_sampler=None, planner_eval_fn=None, config=cfg)
+        writer.add_scalar("adaptive/candidates_after_prune", float(len(c_proxy)), ep_idx)
+
+        # Feasibility checks (best-effort)
+        c_feas = ap_pruner.validate_feasibility(c_proxy, env, cfg)
+        writer.add_scalar("adaptive/candidates_after_feasibility", float(len(c_feas)), ep_idx)
+
+        # Select top-K to add
+        remaining = int(AP_MAX_LIBRARY_SIZE) - int(old_lib_size)
+        k_add = int(min(AP_MAX_ADD_PER_ROUND, max(0, remaining)))
+        add_list = c_feas[:k_add]
+
+        if k_add <= 0 or len(add_list) == 0:
+            writer.add_scalar("adaptive/added_count", 0.0, ep_idx)
+            writer.add_scalar("adaptive/library_size", float(old_lib_size), ep_idx)
+            return
+
+        # Add to manager and persist a new version
+        added = ap_lib_mgr.add_candidates(add_list, round_id=int(ap_round_id), config=cfg)
+        info = ap_lib_mgr.save_version(save_dir=save_path)
+        new_lib = ap_lib_mgr.get_active_library()
+
+        writer.add_scalar("adaptive/added_count", float(added), ep_idx)
+        writer.add_scalar("adaptive/library_size", float(new_lib.size), ep_idx)
+
+        writer.add_scalar(
+            "adaptive/avg_complexity_added",
+            float(np.mean([c.complexity_score for c in add_list])) if len(add_list) > 0 else 0.0,
+            ep_idx,
+        )
+        writer.add_scalar(
+            "adaptive/avg_utility_added",
+            float(np.mean([c.utility_score for c in add_list])) if len(add_list) > 0 else 0.0,
+            ep_idx,
+        )
+        writer.add_scalar(
+            "adaptive/avg_novelty_added",
+            float(np.mean([c.novelty_score for c in add_list])) if len(add_list) > 0 else 0.0,
+            ep_idx,
+        )
+
+        # Expand actor output dim + clear on-policy buffer
+        if expand_discrete_actor_output is not None:
+            expand_discrete_actor_output(parking_agent.agent, int(new_lib.size), init_mode="random_small")
+        parking_agent.agent.memory.clear()
+
+        # Post-expansion stabilization: lower LR + freeze backbone + logit bias for new actions
+        try:
+            lr_scale = float(AP_POST_EXPAND_LR_SCALE)
+            parking_agent.agent.actor_optimizer.param_groups[0]['lr'] = old_lr * lr_scale
+        except Exception:
+            pass
+        try:
+            parking_agent.agent.freeze_actor_backbone(True)
+        except Exception:
+            pass
+        try:
+            bias = np.zeros((int(new_lib.size),), dtype=np.float32)
+            bias[int(old_lib_size) :] = float(AP_NEW_ACTION_LOGIT_BIAS_INIT)
+            parking_agent.agent.set_action_logit_bias(bias)
+        except Exception:
+            pass
+
+        # Update wrapper/library reference (rebuild wrapper is safest)
+        primitive_lib = new_lib
+        primitive_h = getattr(primitive_lib, 'horizon', primitive_h)
+        env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
+
+        # Update shaping centroids from discovered segments (use end macro obs)
+        if ap_shaping is not None and bool(USE_DISCOVERED_PRIMITIVE_SHAPING):
+            try:
+                by_ep = {int(ep.episode_id): ep for ep in rollouts}
+                feats = []
+                for c in add_list:
+                    eid = int(c.source_metadata.get('episode_id'))
+                    ep = by_ep.get(eid, None)
+                    if ep is None:
+                        continue
+                    mt1 = int(c.source_metadata.get('macro_t1', min(len(ep.observations) - 1, 0)))
+                    mt1 = max(0, min(mt1, len(ep.observations) - 1))
+                    feats.append(ap_shaping.extract_feature_from_obs(ep.observations[mt1]))
+                ap_shaping.add_centroids(feats)
+            except Exception:
+                pass
+
+        # Validation after
+        val_after = _run_eval_episodes(env, parking_agent, int(AP_VALIDATION_EPISODES), val_schedule, deterministic=True)
+        writer.add_scalar("adaptive/validation_success_after", float(val_after["success"]), ep_idx)
+        writer.add_scalar("adaptive/validation_extreme_success_after", float(val_after["success_extreme"]), ep_idx)
+
+        # Rollback if regressed
+        rollback = False
+        if bool(AP_ENABLE_ROLLBACK):
+            drop = float(val_before["success"] - val_after["success"])
+            drop_ext = float(val_before["success_extreme"] - val_after["success_extreme"])
+            if drop > float(AP_ROLLBACK_DROP_TOL) or drop_ext > float(AP_ROLLBACK_DROP_TOL):
+                rollback = True
+
+        if rollback:
+            writer.add_scalar("adaptive/rollback", 1.0, ep_idx)
+            try:
+                ap_lib_mgr.rollback_to(old_version, save_dir=save_path)
+            except Exception:
+                pass
+            # restore wrapper
+            primitive_lib = ap_lib_mgr.get_active_library()
+            primitive_h = getattr(primitive_lib, 'horizon', primitive_h)
+            env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
+
+            # restore agent params and action dim
+            try:
+                expand_discrete_actor_output(parking_agent.agent, int(primitive_lib.size), init_mode="random_small")
+            except Exception:
+                pass
+            try:
+                parking_agent.agent.load(ckpt_before, params_only=True)
+            except Exception:
+                pass
+            parking_agent.agent.memory.clear()
+            try:
+                parking_agent.agent.freeze_actor_backbone(False)
+                parking_agent.agent.clear_action_logit_bias()
+                parking_agent.agent.actor_optimizer.param_groups[0]['lr'] = old_lr
+            except Exception:
+                pass
+        else:
+            writer.add_scalar("adaptive/rollback", 0.0, ep_idx)
+            ap_last_good_version = ap_lib_mgr.active_version_id
+            try:
+                parking_agent.agent.save(ap_last_good_ckpt, params_only=True)
+            except Exception:
+                pass
 
     reward_list = []
     reward_per_state_list = []
@@ -241,6 +596,14 @@ if __name__=="__main__":
         step_num = 0
         reward_info = []
 
+        # ---- EpisodeTrace buffers (macro-step aligned) ----
+        ep_obs_trace = []
+        ep_actions_trace = []
+        ep_low_actions_trace = []
+        ep_rewards_trace = []
+        ep_dones_trace = []
+        ep_infos_trace = []
+
         # Takeover statistics (per-episode)
         ep_takeover_steps = 0
         ep_takeover_triggered = 0
@@ -255,12 +618,24 @@ if __name__=="__main__":
         
         while not done:
             step_num += 1
+            ep_obs_trace.append(np.asarray(obs, dtype=np.float64))
             action_mask = None
             if USE_MOTION_PRIMITIVES and USE_ACTION_MASK and hasattr(env, 'get_action_mask'):
-                action_mask = env.get_action_mask()
+                action_mask = env.get_action_mask(obs)
             action, log_prob = parking_agent.choose_action(obs, action_mask=action_mask)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+
+            # weak shaping reward from discovered primitives (optional)
+            shaping_r = 0.0
+            if adaptive_enabled and ap_shaping is not None and bool(USE_DISCOVERED_PRIMITIVE_SHAPING):
+                try:
+                    shaping_r = float(ap_shaping.reward(obs, next_obs))
+                except Exception:
+                    shaping_r = 0.0
+            reward = float(reward) + float(shaping_r)
+            if shaping_r != 0.0:
+                writer.add_scalar("adaptive/shaping_reward", float(shaping_r), i)
 
             # Takeover accounting (macro-step level)
             takeover_active = bool(info.get('takeover_active', False))
@@ -289,10 +664,30 @@ if __name__=="__main__":
                     pass
             
             if 'reward_info' in info:
-                reward_info.append(list(info['reward_info'].values()))
+                ri = info.get('reward_info', {})
+                if isinstance(ri, dict):
+                    row = [_to_scalar(ri.get(k, 0.0), 0.0) for k in REWARD_WEIGHT.keys()]
+                    reward_info.append(row)
             
             total_reward += reward
             reward_per_state_list.append(reward)
+
+            # ---- EpisodeTrace step record ----
+            try:
+                ep_actions_trace.append(int(info.get('primitive_id', action)))
+            except Exception:
+                ep_actions_trace.append(int(action) if USE_MOTION_PRIMITIVES else -1)
+            tr = info.get('macro_exec_trace', {}) if isinstance(info, dict) else {}
+            sub_u = tr.get('sub_actions_phys', None)
+            if sub_u is None:
+                try:
+                    sub_u = env.primitive_lib.get_actions(int(action))
+                except Exception:
+                    sub_u = np.zeros((1, 2), dtype=np.float64)
+            ep_low_actions_trace.append(np.asarray(sub_u, dtype=np.float64))
+            ep_rewards_trace.append(float(reward))
+            ep_dones_trace.append(bool(done))
+            ep_infos_trace.append(info if isinstance(info, dict) else {})
             
             # Store transition in memory
             # obs, action, reward, done, log_prob, next_obs
@@ -386,10 +781,7 @@ if __name__=="__main__":
             reward_info_list.append(list(reward_info_sum))
 
             # Log reward components dynamically (HOPE-style keys)
-            try:
-                reward_keys = list(info.get('reward_info', {}).keys())
-            except Exception:
-                reward_keys = []
+            reward_keys = list(REWARD_WEIGHT.keys())
 
             for idx, name in enumerate(reward_keys):
                 if idx >= len(reward_info_sum):
@@ -450,4 +842,111 @@ if __name__=="__main__":
             # Print progress
             print(f"Episode {i}/{args.train_episode} | Reward: {total_reward:.2f} | Steps: {step_num} | Success Rate: {np.mean(succ_record[-100:]):.2f}")
             sys.stdout.flush()
+
+        # ---- Build and store EpisodeTrace for mining ----
+        if adaptive_enabled and EpisodeTrace is not None:
+            try:
+                success = 1 if (len(ep_infos_trace) > 0 and ep_infos_trace[-1].get('status', None) == Status.ARRIVED) else 0
+                takeover_used = bool(ep_takeover_used)
+                ep_trace = EpisodeTrace(
+                    episode_id=int(ap_trace_next_id),
+                    scene_type=str(scene_chosen),
+                    success=bool(success),
+                    total_reward=float(total_reward),
+                    step_count_macro=int(len(ep_actions_trace)),
+                    takeover_used=bool(takeover_used),
+                    observations=ep_obs_trace,
+                    actions_primitive=ep_actions_trace,
+                    actions_low_level=ep_low_actions_trace,
+                    rewards=ep_rewards_trace,
+                    dones=ep_dones_trace,
+                    infos=ep_infos_trace,
+                    states_optional=None,
+                )
+                ap_trace_next_id += 1
+
+                keep = True
+                if bool(AP_TRACE_KEEP_SUCCESS_ONLY) and not bool(ep_trace.success):
+                    keep = False
+                    if bool(AP_TRACE_KEEP_NEAR_SUCCESS):
+                        try:
+                            # near-success: last obs dist
+                            lidar_n = int(LIDAR_NUM)
+                            dist_last = float(ep_trace.observations[-1][lidar_n]) * float(MAX_DIST_TO_DEST)
+                            if dist_last <= float(AP_NEAR_SUCCESS_DIST_THR):
+                                keep = True
+                        except Exception:
+                            pass
+                if keep:
+                    ap_trace_buffer.append(ep_trace)
+                    # cap buffer
+                    if len(ap_trace_buffer) > int(AP_TRACE_BUFFER_MAX_EPISODES):
+                        ap_trace_buffer = ap_trace_buffer[-int(AP_TRACE_BUFFER_MAX_EPISODES) :]
+            except Exception:
+                pass
+
+        # ---- Trigger adaptive round between episodes ----
+        if adaptive_enabled:
+            try:
+                # recent success rates
+                w = int(AP_TRIGGER_WINDOW)
+                recent = succ_record[-w:] if len(succ_record) > 0 else []
+                sr_recent = float(np.mean(recent)) if len(recent) > 0 else 0.0
+
+                # hard success: use scene_chooser.scene_record aligned with succ_record
+                hard = []
+                for j in range(1, min(len(scene_chooser.scene_record), len(succ_record), w) + 1):
+                    sid = int(scene_chooser.scene_record[-j])
+                    scene_name = scene_chooser.scene_types.get(sid, 'Normal')
+                    if _scene_is_hard(scene_name):
+                        hard.append(int(succ_record[-j]))
+                sr_hard = float(np.mean(hard)) if len(hard) > 0 else 0.0
+
+                stats = {
+                    "success_rate_recent": sr_recent,
+                    "hard_success_rate_recent": sr_hard,
+                    "plateau": True,
+                }
+                writer.add_scalar("adaptive/success_rate_recent", float(sr_recent), i)
+                writer.add_scalar("adaptive/hard_success_rate_recent", float(sr_hard), i)
+
+                if ap_scheduler.should_trigger(stats, episode_idx=int(i)):
+                    run_adaptive_primitive_round(ep_idx=int(i))
+            except Exception as e:
+                writer.add_scalar("adaptive/triggered", 0.0, i)
+                if verbose:
+                    print(f"[adaptive] trigger check failed: {e}")
+
+        # ---- Post-expansion bias decay / unfreeze ----
+        if adaptive_enabled and ap_scheduler is not None:
+            try:
+                remaining = ap_scheduler.tick_post_expand_freeze()
+                writer.add_scalar("adaptive/post_expand_freeze_remaining", float(remaining), i)
+
+                # decay new-action bias
+                if parking_agent.agent.action_logit_bias is not None:
+                    decay_ep = int(AP_NEW_ACTION_LOGIT_BIAS_DECAY_EPISODES)
+                    if decay_ep > 0:
+                        factor = max(0.0, 1.0 - 1.0 / float(decay_ep))
+                        b = parking_agent.agent.action_logit_bias.detach().cpu().numpy()
+                        b = b * float(factor)
+                        if float(np.max(b)) < 1e-3:
+                            parking_agent.agent.clear_action_logit_bias()
+                        else:
+                            parking_agent.agent.set_action_logit_bias(b)
+
+                # restore lr/unfreeze when freeze window ends
+                if remaining <= 0:
+                    try:
+                        parking_agent.agent.freeze_actor_backbone(False)
+                    except Exception:
+                        pass
+                    if post_expand_lr_restore is not None:
+                        try:
+                            parking_agent.agent.actor_optimizer.param_groups[0]['lr'] = float(post_expand_lr_restore)
+                        except Exception:
+                            pass
+                        post_expand_lr_restore = None
+            except Exception:
+                pass
 

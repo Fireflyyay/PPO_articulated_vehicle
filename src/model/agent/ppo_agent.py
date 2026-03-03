@@ -65,6 +65,10 @@ class PPOAgent(AgentBase):
         # Action std
         self.action_std = self.configs.action_std_init
 
+        # Optional logit bias for discrete actions (cold-start newly added primitives).
+        # Convention: logits <- logits - bias.
+        self.action_logit_bias = None
+
         # the networks
         self._init_network()
 
@@ -141,20 +145,85 @@ class PPOAgent(AgentBase):
             self.action_std = min_std
         print(f"Action std decayed to: {self.action_std}")
 
+    def set_action_logit_bias(self, bias: np.ndarray):
+        """Set a per-action bias to subtract from logits (discrete only).
+
+        Args:
+            bias: shape [action_dim]
+        """
+        if bias is None:
+            self.action_logit_bias = None
+            return
+        b = np.asarray(bias, dtype=np.float32).reshape(-1)
+        self.action_logit_bias = torch.as_tensor(b, dtype=torch.float32, device=self.device)
+
+    def clear_action_logit_bias(self):
+        self.action_logit_bias = None
+
+    def freeze_actor_backbone(self, freeze: bool = True) -> None:
+        """Freeze actor parameters except the last Linear layer."""
+        if not hasattr(self, 'actor_net'):
+            return
+
+        last = None
+        try:
+            last = self.actor_net.net[-1]
+        except Exception:
+            last = None
+
+        # reset: unfreeze all
+        for p in self.actor_net.parameters():
+            p.requires_grad = True
+
+        if not freeze or last is None:
+            return
+
+        # freeze all, then unfreeze last layer
+        for p in self.actor_net.parameters():
+            p.requires_grad = False
+        for p in last.parameters():
+            p.requires_grad = True
+
+    def rebuild_actor_optimizer(self) -> None:
+        """Rebuild actor optimizer (needed after resizing actor output)."""
+        self.actor_optimizer = torch.optim.Adam(self.actor_net.parameters(), self.configs.lr_actor)
+        # refresh checklist references
+        for i, (name, item, save_state_dict) in enumerate(self.check_list):
+            if name == 'actor_net':
+                self.check_list[i] = (name, self.actor_net, save_state_dict)
+            elif name == 'actor_optimizer':
+                self.check_list[i] = (name, self.actor_optimizer, save_state_dict)
+
     def _mask_logits(self, logits: torch.Tensor, action_mask) -> torch.Tensor:
         if action_mask is None:
-            return logits
-        mask = torch.as_tensor(action_mask, device=logits.device, dtype=torch.bool)
-        if mask.dim() == 1:
-            mask = mask.unsqueeze(0)
-        if mask.shape != logits.shape:
-            # Allow broadcasting a single mask across batch
-            if mask.shape[-1] == logits.shape[-1] and mask.shape[0] == 1 and logits.shape[0] > 1:
-                mask = mask.expand(logits.shape[0], -1)
-        if mask.shape != logits.shape:
-            return logits
-        masked_logits = logits.clone()
-        masked_logits[~mask] = -1e10
+            masked_logits = logits
+        else:
+            mask = torch.as_tensor(action_mask, device=logits.device, dtype=torch.bool)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            if mask.shape != logits.shape:
+                # Allow broadcasting a single mask across batch
+                if mask.shape[-1] == logits.shape[-1] and mask.shape[0] == 1 and logits.shape[0] > 1:
+                    mask = mask.expand(logits.shape[0], -1)
+            if mask.shape != logits.shape:
+                masked_logits = logits
+            else:
+                masked_logits = logits.clone()
+                masked_logits[~mask] = -1e10
+
+        # apply optional logit bias (cold-start suppression)
+        if self.action_logit_bias is not None:
+            try:
+                bias = self.action_logit_bias.to(device=masked_logits.device, dtype=torch.float32)
+                if bias.dim() == 1:
+                    bias = bias.unsqueeze(0)
+                if bias.shape[-1] == masked_logits.shape[-1] and bias.shape[0] == 1 and masked_logits.shape[0] > 1:
+                    bias = bias.expand(masked_logits.shape[0], -1)
+                if bias.shape == masked_logits.shape:
+                    masked_logits = masked_logits - bias
+            except Exception:
+                pass
+
         return masked_logits
 
     def _build_dist(self, policy_out: torch.Tensor, action_mask=None) -> torch.distributions.Distribution:
@@ -511,3 +580,93 @@ class PPOAgent(AgentBase):
             # self.actor_target_net = deepcopy(self.actor_net).to(self.device)
             if 'state_norm' in checkpoint:
                 self.state_normalize = checkpoint['state_norm']
+
+
+def expand_discrete_actor_output(
+    ppo_agent: PPOAgent,
+    new_action_dim: int,
+    init_mode: str = "random_small",
+    init_std: float = 0.01,
+) -> PPOAgent:
+    """Expand (or shrink) the discrete actor logits dimension with parameter transfer.
+
+    This is designed for action-space growth when adding new motion primitives.
+
+    Behavior:
+    - Rebuilds `actor_net` with output_size=new_action_dim.
+    - Copies all compatible layers.
+    - Copies old logits rows into the first old_n positions.
+    - Initializes newly added logits rows with small random weights.
+    - Rebuilds actor optimizer.
+
+    Notes:
+    - Critic does not depend on action dim and is unchanged.
+    - On-policy memory should be cleared by caller to avoid mask dim mismatch.
+    """
+    if not bool(getattr(ppo_agent, "discrete", False)):
+        raise ValueError("expand_discrete_actor_output requires PPOAgent(discrete=True)")
+
+    new_action_dim = int(new_action_dim)
+    if new_action_dim <= 0:
+        raise ValueError("new_action_dim must be > 0")
+
+    try:
+        old_last = ppo_agent.actor_net.net[-1]
+    except Exception as e:
+        raise RuntimeError("Unexpected actor_net structure") from e
+
+    if not isinstance(old_last, nn.Linear):
+        raise RuntimeError("Expected actor_net.net[-1] to be nn.Linear")
+
+    old_n = int(old_last.out_features)
+    if new_action_dim == old_n:
+        return ppo_agent
+
+    actor_layers = dict(ppo_agent.configs.actor_layers) if isinstance(ppo_agent.configs.actor_layers, dict) else {}
+    actor_layers["output_size"] = int(new_action_dim)
+    actor_layers["use_tanh_output"] = False
+
+    new_net = MultiObsEmbedding(actor_layers).to(ppo_agent.device)
+
+    with torch.no_grad():
+        # copy shared linear layers except last
+        for i in range(len(new_net.net) - 1):
+            nl = new_net.net[i]
+            if not isinstance(nl, nn.Linear):
+                continue
+            try:
+                ol = ppo_agent.actor_net.net[i]
+            except Exception:
+                continue
+            if isinstance(ol, nn.Linear) and tuple(ol.weight.shape) == tuple(nl.weight.shape):
+                nl.weight.copy_(ol.weight)
+                nl.bias.copy_(ol.bias)
+
+        # last layer partial copy
+        new_last = new_net.net[-1]
+        assert isinstance(new_last, nn.Linear)
+        k = int(min(old_n, new_action_dim))
+        new_last.weight[:k].copy_(old_last.weight[:k])
+        new_last.bias[:k].copy_(old_last.bias[:k])
+
+        if new_action_dim > old_n:
+            if init_mode == "zero":
+                new_last.weight[old_n:].zero_()
+                new_last.bias[old_n:].zero_()
+            else:
+                new_last.weight[old_n:].normal_(mean=0.0, std=float(init_std))
+                new_last.bias[old_n:].zero_()
+
+    ppo_agent.actor_net = new_net
+    ppo_agent.configs.actor_layers = actor_layers
+    ppo_agent.configs.action_dim = int(new_action_dim)
+    ppo_agent.rebuild_actor_optimizer()
+
+    # If we had a previous bias with old shape, drop it.
+    try:
+        if ppo_agent.action_logit_bias is not None and int(ppo_agent.action_logit_bias.numel()) != int(new_action_dim):
+            ppo_agent.clear_action_logit_bias()
+    except Exception:
+        pass
+
+    return ppo_agent

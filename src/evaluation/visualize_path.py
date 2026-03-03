@@ -4,16 +4,65 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import copy
-from shapely.geometry import LinearRing
-from typing import Optional
+from shapely.geometry import LinearRing, Polygon, MultiPolygon
+from typing import Optional, Tuple
 import argparse
+import glob
 
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from env.car_parking_base import CarParking
+from env.vehicle import Status
 from model.agent.ppo_agent import PPOAgent as PPO
 from configs import *
+
+
+def _normalize_status(status_obj) -> Optional[Status]:
+    """Best-effort normalization for status values coming from env info."""
+    if isinstance(status_obj, Status):
+        return status_obj
+    if isinstance(status_obj, str):
+        # Accept: "Status.OUTTIME", "OUTTIME", etc.
+        raw = status_obj.strip()
+        if raw.startswith("Status."):
+            raw = raw.split("Status.", 1)[1]
+        try:
+            return Status[raw]
+        except Exception:
+            return None
+    return None
+
+
+def _episode_result_label(
+    last_info: Optional[dict],
+    terminated: bool,
+    truncated: bool,
+    forced_break_reason: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Return (success, label_text) to be drawn on the figure."""
+    if forced_break_reason:
+        return False, f"FAILURE: {forced_break_reason}"
+
+    status = None
+    if isinstance(last_info, dict):
+        status = _normalize_status(last_info.get('status'))
+
+    if status == Status.ARRIVED:
+        return True, "SUCCESS"
+    if status == Status.COLLIDED:
+        return False, "FAILURE: collision"
+    if status == Status.OUTBOUND:
+        return False, "FAILURE: out of bounds"
+    if status == Status.OUTTIME:
+        return False, "FAILURE: timeout"
+
+    # Fallbacks when status is missing/unexpected
+    if truncated:
+        return False, "FAILURE: truncated"
+    if terminated:
+        return False, "FAILURE: terminated"
+    return False, "FAILURE: unknown"
 
 
 def _find_checkpoint(default_path: str) -> Optional[str]:
@@ -26,6 +75,112 @@ def _find_checkpoint(default_path: str) -> Optional[str]:
         if 'PPO_best.pt' in files:
             return os.path.join(root, 'PPO_best.pt')
     return None
+
+
+def _load_checkpoint(path: str, map_location: str = 'cpu'):
+    """Load checkpoint with safe-first fallback for mixed checkpoints."""
+    try:
+        return torch.load(path, map_location=map_location, weights_only=True)
+    except Exception:
+        return torch.load(path, map_location=map_location)
+
+
+def _extract_checkpoint_configs(checkpoint: object) -> dict:
+    """Best-effort extraction of training configs from checkpoint['configs']."""
+    out = {}
+    if not isinstance(checkpoint, dict):
+        return out
+    cfg_obj = checkpoint.get('configs', None)
+    if cfg_obj is None:
+        return out
+    for key in ('discrete', 'observation_shape', 'action_dim', 'gamma', 'dist_type'):
+        if hasattr(cfg_obj, key):
+            out[key] = getattr(cfg_obj, key)
+    for key in ('actor_layers', 'critic_layers'):
+        if hasattr(cfg_obj, key):
+            v = getattr(cfg_obj, key)
+            out[key] = dict(v) if isinstance(v, dict) else v
+    return out
+
+
+def _infer_primitive_size(npz_path: str) -> Optional[int]:
+    try:
+        data = np.load(npz_path, allow_pickle=True)
+        actions = data['actions']
+        if actions.ndim >= 1:
+            return int(actions.shape[0])
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_adaptive_library_from_checkpoint_dir(checkpoint_path: str) -> Optional[str]:
+    """Resolve active adaptive primitive library next to checkpoint if present."""
+    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
+    active_path = os.path.join(ckpt_dir, 'adaptive_primitives', 'active_version.json')
+    if not os.path.exists(active_path):
+        return None
+    try:
+        import json
+
+        with open(active_path, 'r', encoding='utf-8') as f:
+            obj = json.load(f)
+        version_id = str(obj.get('version_id', '')).strip()
+        if not version_id:
+            return None
+        candidate = os.path.join(ckpt_dir, 'adaptive_primitives', 'versions', f'primitives_v{version_id}.npz')
+        if os.path.exists(candidate):
+            return candidate
+    except Exception:
+        return None
+    return None
+
+
+def _find_matching_primitive_library(src_dir: str, expected_size: int, preferred_dir: Optional[str] = None) -> Optional[str]:
+    """Find a primitive library whose action count matches checkpoint actor output size."""
+    candidates = []
+
+    if preferred_dir and os.path.exists(preferred_dir):
+        for p in glob.glob(os.path.join(preferred_dir, '**', '*.npz'), recursive=True):
+            candidates.append(p)
+
+    # Default configured library first
+    cfg_lib = os.path.normpath(os.path.join(src_dir, PRIMITIVE_LIBRARY_PATH))
+    if os.path.exists(cfg_lib):
+        candidates.append(cfg_lib)
+    elif os.path.exists(PRIMITIVE_LIBRARY_PATH):
+        candidates.append(PRIMITIVE_LIBRARY_PATH)
+
+    # Search experiment outputs where adaptive versions are stored.
+    for p in glob.glob(os.path.join(src_dir, 'log', 'exp', '**', 'adaptive_primitives', 'versions', '*.npz'), recursive=True):
+        candidates.append(p)
+
+    # Deduplicate while keeping order
+    seen = set()
+    uniq = []
+    for p in candidates:
+        ap = os.path.abspath(p)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        uniq.append(ap)
+
+    matched = []
+    for p in uniq:
+        n = _infer_primitive_size(p)
+        if n is None:
+            continue
+        if int(n) == int(expected_size):
+            try:
+                mtime = os.path.getmtime(p)
+            except Exception:
+                mtime = 0.0
+            matched.append((mtime, p))
+
+    if not matched:
+        return None
+    matched.sort(key=lambda x: x[0], reverse=True)
+    return matched[0][1]
 
 
 def _infer_actor_output_size(checkpoint: object) -> Optional[int]:
@@ -63,7 +218,7 @@ def plot_vehicle(ax, state, alpha=0.3, is_final=False):
     ax.plot(x, y, color=color_rear, alpha=alpha, linewidth=1)
     ax.fill(x, y, color=color_rear, alpha=alpha/2)
 
-def visualize(episodes: int = 10):
+def visualize(episodes: int = 10, level: Optional[str] = None):
     # Setup base environment
     base_env = CarParking(render_mode='rgb_array')
     
@@ -75,11 +230,9 @@ def visualize(episodes: int = 10):
         return
 
     # Peek checkpoint to infer whether it is discrete (macro-actions) and the actor output size.
-    try:
-        ckpt_obj = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
-    except Exception:
-        ckpt_obj = torch.load(checkpoint_path, map_location='cpu')
+    ckpt_obj = _load_checkpoint(checkpoint_path, map_location='cpu')
     inferred_actor_out = _infer_actor_output_size(ckpt_obj)
+    ckpt_cfg = _extract_checkpoint_configs(ckpt_obj)
 
     # Decide whether we should use macro-action wrapper.
     # If actor outputs more than 2 dims, it's almost certainly discrete primitives.
@@ -92,41 +245,63 @@ def visualize(episodes: int = 10):
         from env.wrappers.macro_action_wrapper import MacroActionWrapper
 
         src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-        lib_full_path = os.path.normpath(os.path.join(src_dir, PRIMITIVE_LIBRARY_PATH))
-        if not os.path.exists(lib_full_path) and os.path.exists(PRIMITIVE_LIBRARY_PATH):
-            lib_full_path = PRIMITIVE_LIBRARY_PATH
+
+        preferred_lib = _resolve_adaptive_library_from_checkpoint_dir(checkpoint_path)
+        expected_action_dim = int(ckpt_cfg.get('action_dim', inferred_actor_out if inferred_actor_out is not None else 0))
+
+        lib_full_path = None
+        if preferred_lib is not None:
+            if expected_action_dim <= 0 or _infer_primitive_size(preferred_lib) == expected_action_dim:
+                lib_full_path = preferred_lib
+
+        if lib_full_path is None and expected_action_dim > 0:
+            preferred_dir = os.path.dirname(preferred_lib) if preferred_lib is not None else None
+            lib_full_path = _find_matching_primitive_library(src_dir, expected_action_dim, preferred_dir=preferred_dir)
+
+        if lib_full_path is None:
+            lib_full_path = os.path.normpath(os.path.join(src_dir, PRIMITIVE_LIBRARY_PATH))
+            if not os.path.exists(lib_full_path) and os.path.exists(PRIMITIVE_LIBRARY_PATH):
+                lib_full_path = PRIMITIVE_LIBRARY_PATH
+
         primitive_lib = load_library(lib_full_path)
         primitive_h = getattr(primitive_lib, 'horizon', PRIMITIVE_H)
         env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
-        print(f"Using MacroActionWrapper: action_space.n={env.action_space.n}, H={primitive_h}")
+        print(f"Using MacroActionWrapper: action_space.n={env.action_space.n}, H={primitive_h}, lib={lib_full_path}")
+
+        if inferred_actor_out is not None and int(env.action_space.n) != int(inferred_actor_out):
+            raise RuntimeError(
+                f"Checkpoint actor output ({inferred_actor_out}) and primitive library size ({env.action_space.n}) mismatch. "
+                f"Please provide a matched checkpoint/library pair."
+            )
 
     # For plotting/trajectory access, always use the underlying base env.
     plot_env = base_env
 
     # Setup agent (match training-time logic)
-    actor_params = dict(ACTOR_CONFIGS)
-    critic_params = dict(CRITIC_CONFIGS)
+    actor_params = dict(ckpt_cfg.get('actor_layers', ACTOR_CONFIGS))
+    critic_params = dict(ckpt_cfg.get('critic_layers', CRITIC_CONFIGS))
     obs_shape = env.observation_shape if hasattr(env, 'observation_shape') else base_env.observation_shape
     actor_params['input_dim'] = int(obs_shape[0])
     critic_params['input_dim'] = int(obs_shape[0])
 
     if use_macro_actions:
         actor_params['output_size'] = env.action_space.n
+        actor_params['use_tanh_output'] = False
     else:
         actor_params['output_size'] = env.action_space.shape[0]
 
     configs = {
-        "discrete": use_macro_actions,
+        "discrete": bool(ckpt_cfg.get('discrete', use_macro_actions)),
         "observation_shape": obs_shape,
         "action_dim": env.action_space.n if use_macro_actions else env.action_space.shape[0],
         "hidden_size": 64,
         "activation": "tanh",
-        "dist_type": "gaussian",
+        "dist_type": ckpt_cfg.get('dist_type', "gaussian"),
         "save_params": False,
         "actor_layers": actor_params,
         "critic_layers": critic_params,
         "load_params": True,
-        "gamma": (GAMMA_BASE ** primitive_h) if use_macro_actions else GAMMA,
+        "gamma": float(ckpt_cfg.get('gamma', (GAMMA_BASE ** primitive_h) if use_macro_actions else GAMMA)),
     }
 
     agent = PPO(configs, discrete=use_macro_actions, load_params=True)
@@ -137,16 +312,32 @@ def visualize(episodes: int = 10):
     if not os.path.exists(img_dir):
         os.makedirs(img_dir)
 
+    if level is None:
+        print(f"Scene level: {MAP_LEVEL}")
+    else:
+        print(f"Scene level (override): {level}")
+
     for i in range(int(episodes)):
-        obs, _ = env.reset()
+        if level is None:
+            obs, _ = env.reset()
+        else:
+            obs, _ = env.reset(options={"level": level})
         done = False
+        last_info = {}
+        last_terminated = False
+        last_truncated = False
+        forced_break_reason = None
         
         # Run episode
         while not done:
             action, _ = agent.choose_action(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+            last_info = info
+            last_terminated = bool(terminated)
+            last_truncated = bool(truncated)
             if len(plot_env.vehicle.trajectory) > 2000: # Safety break
+                forced_break_reason = "max steps reached"
                 break
         
         states = plot_env.vehicle.trajectory
@@ -154,11 +345,31 @@ def visualize(episodes: int = 10):
         # Plotting
         fig, ax = plt.subplots(figsize=(12, 12))
         
-        # Plot obstacles
+        # Plot obstacles (support LinearRing / Polygon / MultiPolygon)
         for area in plot_env.map.obstacles:
-            x, y = area.shape.xy
-            ax.plot(x, y, color='black', linewidth=2)
-            ax.fill(x, y, color='gray', alpha=0.4)
+            geom = area.shape
+            if isinstance(geom, LinearRing):
+                x, y = geom.xy
+                ax.plot(x, y, color='black', linewidth=2)
+                ax.fill(x, y, color='gray', alpha=0.4)
+            elif isinstance(geom, Polygon):
+                x, y = geom.exterior.xy
+                ax.plot(x, y, color='black', linewidth=2)
+                ax.fill(x, y, color='gray', alpha=0.4)
+                # holes = drivable area; paint as white for clarity
+                for interior in list(geom.interiors):
+                    xi, yi = interior.xy
+                    ax.plot(xi, yi, color='black', linewidth=1, alpha=0.7)
+                    ax.fill(xi, yi, color='white', alpha=1.0)
+            elif isinstance(geom, MultiPolygon):
+                for g in geom.geoms:
+                    x, y = g.exterior.xy
+                    ax.plot(x, y, color='black', linewidth=2)
+                    ax.fill(x, y, color='gray', alpha=0.4)
+                    for interior in list(g.interiors):
+                        xi, yi = interior.xy
+                        ax.plot(xi, yi, color='black', linewidth=1, alpha=0.7)
+                        ax.fill(xi, yi, color='white', alpha=1.0)
             
         # Plot target (destination)
         dest_front, dest_rear = plot_env.map.dest.create_box()
@@ -189,6 +400,27 @@ def visualize(episodes: int = 10):
         ax.set_xlim(plot_env.map.xmin, plot_env.map.xmax)
         ax.set_ylim(plot_env.map.ymin, plot_env.map.ymax)
         ax.set_title(f"Articulated Vehicle Path Planning - Episode {i+1}")
+
+        # Annotate success / failure (and reason in English)
+        success, label = _episode_result_label(
+            last_info=last_info,
+            terminated=last_terminated,
+            truncated=last_truncated,
+            forced_break_reason=forced_break_reason,
+        )
+        label_color = 'green' if success else 'red'
+        ax.text(
+            0.02,
+            0.98,
+            label,
+            transform=ax.transAxes,
+            ha='left',
+            va='top',
+            fontsize=14,
+            fontweight='bold',
+            color=label_color,
+            bbox=dict(facecolor='white', edgecolor=label_color, alpha=0.9, boxstyle='round,pad=0.3'),
+        )
         ax.grid(True, linestyle=':', alpha=0.5)
         
         save_path = os.path.join(img_dir, f"path_planning_{i+1}.png")
@@ -199,5 +431,6 @@ def visualize(episodes: int = 10):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--episodes', type=int, default=10)
+    parser.add_argument('--level', type=str, default=None, choices=["Normal", "Complex", "Extrem"])
     args = parser.parse_args()
-    visualize(episodes=args.episodes)
+    visualize(episodes=args.episodes, level=args.level)

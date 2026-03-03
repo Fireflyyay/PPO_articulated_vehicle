@@ -17,6 +17,7 @@ import gymnasium as gym
 from gymnasium import spaces
 from gymnasium.error import DependencyNotInstalled
 from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, LinearRing
 from shapely.affinity import affine_transform
 try:
     # As pygame is necessary for using the environment (reset and step) even without a render mode
@@ -31,6 +32,7 @@ from env.vehicle import *
 from env.map_base import *
 from env.lidar_simulator import LidarSimlator
 from env.parking_map_normal import ParkingMapNormal
+from env.global_guidance import SoftGlobalGuidance
 # from env.parking_map_dlp import ParkingMapDLP # Exclude DLP
 # import env.reeds_shepp as rsCurve # Exclude RS
 # from env.observation_processor import Obs_Processor # Exclude Image
@@ -71,13 +73,30 @@ class CarParking(gym.Env):
         self.k = None
         self.level = MAP_LEVEL
         self.tgt_repr_size = 7 # relative_distance, cos(theta), sin(theta), cos(phi), sin(phi)
+        self._map_cache = {}
 
         if self.level in ['Normal', 'Complex', 'Extrem']:
-            self.map = ParkingMapNormal(self.level)
+            self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
         #     self.map = ParkingMapDLP()
         self.vehicle = Vehicle(n_step=NUM_STEP, step_len=STEP_LENGTH, articulated=True, trailer_length= TRAILER_LENGTH, hitch_offset=HITCH_OFFSET)
         self.lidar = LidarSimlator(LIDAR_RANGE, LIDAR_NUM)
+        self.global_guidance = None
+        if ENABLE_GLOBAL_SOFT_GUIDANCE:
+            self.global_guidance = SoftGlobalGuidance(
+                grid_resolution=GUIDANCE_GRID_RESOLUTION,
+                obstacle_inflation=GUIDANCE_OBS_INFLATION,
+                map_margin=GUIDANCE_MAP_MARGIN,
+                lookahead_base=GUIDANCE_LOOKAHEAD_BASE,
+                lookahead_speed_gain=GUIDANCE_LOOKAHEAD_SPEED_GAIN,
+                lookahead_min=GUIDANCE_LOOKAHEAD_MIN,
+                lookahead_max=GUIDANCE_LOOKAHEAD_MAX,
+                progress_search_window=GUIDANCE_PROGRESS_WINDOW,
+                min_clearance_m=GUIDANCE_MIN_CLEARANCE_M,
+                full_clearance_m=GUIDANCE_FULL_CLEARANCE_M,
+                near_obs_dist_m=GUIDANCE_NEAR_OBS_DIST_M,
+                max_dense_ratio=GUIDANCE_MAX_DENSE_RATIO,
+            )
         self.reward = 0.0
         self.accum_arrive_reward = 0.0
         
@@ -111,8 +130,10 @@ class CarParking(gym.Env):
             # parking lot in the polar coordinate of the ego car's view
             
             # Widen input state: Flatten everything into a single vector
-            # Lidar (120) + Target (7) + Velocity (2) = 129
+            # Lidar + Target + Velocity (+ optional soft global guidance hint)
             self.obs_dim = LIDAR_NUM + self.tgt_repr_size + 2
+            if ENABLE_GLOBAL_SOFT_GUIDANCE:
+                self.obs_dim += GUIDANCE_FEATURE_DIM
             
             low_bound = -np.inf * np.ones(self.obs_dim)
             high_bound = np.inf * np.ones(self.obs_dim)
@@ -125,13 +146,23 @@ class CarParking(gym.Env):
     
     def set_level(self, level:str=None):
         if level is None:
-            self.map = ParkingMapNormal()
+            self.map = self._get_or_create_map('Normal')
+            self.level = 'Normal'
+            return
+        if level == self.level and self.level in self._map_cache:
+            self.map = self._map_cache[self.level]
             return
         self.level = level
         if self.level in ['Normal', 'Complex', 'Extrem',]:
-            self.map = ParkingMapNormal(self.level)
+            self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
         #     self.map = ParkingMapDLP()
+
+    def _get_or_create_map(self, level: str):
+        level = str(level)
+        if level not in self._map_cache:
+            self._map_cache[level] = ParkingMapNormal(level)
+        return self._map_cache[level]
 
     def reset(self, seed: int = None, options: dict = None) -> tuple:
         super().reset(seed=seed)
@@ -153,11 +184,27 @@ class CarParking(gym.Env):
         initial_state = self.map.reset(case_id, data_dir)
         self.vehicle.reset(initial_state)
         self.matrix = self.coord_transform_matrix()
+
+        if ENABLE_GLOBAL_SOFT_GUIDANCE and self.global_guidance is not None:
+            try:
+                dest_center = np.mean(self.map.dest_box.coords[:-1], axis=0)
+                self.global_guidance.plan_path(
+                    self.map,
+                    start_xy=(float(self.vehicle.state.loc.x), float(self.vehicle.state.loc.y)),
+                    goal_xy=(float(dest_center[0]), float(dest_center[1])),
+                )
+            except Exception:
+                pass
         
         # For reward normalization
         self.initial_dist = float(self.vehicle.state.loc.distance(Point(self.map.dest.loc))) + 1e-6
-        
-        obs, _, _, _, info = self.step(None)
+
+        obs = self._build_observation()
+        info = {
+            'status': Status.CONTINUE,
+            'reward_info': OrderedDict({k: 0.0 for k in REWARD_WEIGHT.keys()}),
+            'path_to_dest': None,
+        }
         return obs, info
 
     def coord_transform_matrix(self) -> list:
@@ -176,21 +223,7 @@ class CarParking(gym.Env):
         y_off = win_h/2
         return [scale, 0, 0, -scale, x_off, y_off]
 
-    def step(self, action: np.ndarray = None):
-        prev_state = None
-        if action is not None:
-            # Scale action from [-1, 1] to [min, max]
-            steer_min, steer_max = VALID_STEER
-            speed_min, speed_max = VALID_SPEED
-            
-            scaled_action = np.zeros_like(action)
-            scaled_action[0] = 0.5 * (action[0] + 1.0) * (steer_max - steer_min) + steer_min
-            scaled_action[1] = 0.5 * (action[1] + 1.0) * (speed_max - speed_min) + speed_min
-            
-            prev_state = deepcopy(self.vehicle.state)
-            self.vehicle.step(scaled_action)
-            self.t += 1
-        
+    def _build_observation(self):
         # get observation
         lidar_obs = np.zeros(LIDAR_NUM)
         if self.use_lidar_observation:
@@ -239,9 +272,41 @@ class CarParking(gym.Env):
             self.vehicle.state.speed / 2.5,
             self.vehicle.state.steering / 0.6
         ])
+
+        guidance_obs = np.zeros((GUIDANCE_FEATURE_DIM,), dtype=np.float64) if ENABLE_GLOBAL_SOFT_GUIDANCE else np.zeros((0,), dtype=np.float64)
+        if ENABLE_GLOBAL_SOFT_GUIDANCE and self.global_guidance is not None:
+            try:
+                guidance_obs = self.global_guidance.get_soft_hint(
+                    state_x=float(self.vehicle.state.loc.x),
+                    state_y=float(self.vehicle.state.loc.y),
+                    heading=float(self.vehicle.state.heading),
+                    speed=float(self.vehicle.state.speed),
+                    lidar_norm=lidar_obs,
+                    lidar_range=LIDAR_RANGE,
+                )
+            except Exception:
+                guidance_obs = np.zeros((GUIDANCE_FEATURE_DIM,), dtype=np.float64)
         
         # Concatenate all
-        obs = np.concatenate([lidar_obs, target_obs, vel_obs])
+        obs = np.concatenate([lidar_obs, target_obs, vel_obs, guidance_obs])
+        return obs
+
+    def step(self, action: np.ndarray = None):
+        prev_state = None
+        if action is not None:
+            # Scale action from [-1, 1] to [min, max]
+            steer_min, steer_max = VALID_STEER
+            speed_min, speed_max = VALID_SPEED
+            
+            scaled_action = np.zeros_like(action)
+            scaled_action[0] = 0.5 * (action[0] + 1.0) * (steer_max - steer_min) + steer_min
+            scaled_action[1] = 0.5 * (action[1] + 1.0) * (speed_max - speed_min) + speed_min
+            
+            prev_state = deepcopy(self.vehicle.state)
+            self.vehicle.step(scaled_action)
+            self.t += 1
+
+        obs = self._build_observation()
         
         # calculate reward (HOPE-style shaping)
         reward, done, info = self.get_reward(action, prev_state=prev_state)
@@ -264,9 +329,88 @@ class CarParking(gym.Env):
     def _get_angle_diff(self, a: float, b: float) -> float:
         return abs(self._wrap_pi(a - b))  # 0..pi
 
+    def _get_slot_approach_dir_diff(self, state: State) -> float:
+        """Angle diff between (agent->slot-center direction) and slot heading, in [0, pi]."""
+        dest_center = np.mean(self.map.dest_box.coords[:-1], axis=0)
+        dx = float(dest_center[0] - state.loc.x)
+        dy = float(dest_center[1] - state.loc.y)
+
+        # If agent is almost at slot center, approach direction is ill-defined.
+        if dx * dx + dy * dy < 1e-8:
+            return 0.0
+
+        approach_dir = math.atan2(dy, dx)
+        return self._get_angle_diff(approach_dir, self.map.dest.heading)
+
+    def _lerp(self, x: float, x0: float, x1: float, y0: float, y1: float) -> float:
+        if abs(x1 - x0) < 1e-9:
+            return float(y1)
+        t = (x - x0) / (x1 - x0)
+        t = max(0.0, min(1.0, t))
+        return float(y0 + t * (y1 - y0))
+
+    def _estimate_angle_gate_distance_ref(self) -> float:
+        """Estimate distance reference from corridor size and central open-space size."""
+        level = getattr(self, "level", MAP_LEVEL)
+        corridor_span = 0.5 * (
+            float(PARA_PARK_WALL_DIST_DICT.get(level, PARA_PARK_WALL_DIST_DICT['Normal']))
+            + float(BAY_PARK_WALL_DIST_DICT.get(level, BAY_PARK_WALL_DIST_DICT['Normal']))
+        )
+
+        max_len = float(MAX_PARK_LOT_LEN_DICT.get(level, MAX_PARK_LOT_LEN_DICT['Normal']))
+        max_wid = float(MAX_PARK_LOT_WIDTH_DICT.get(level, WIDTH + 0.6))
+        central_open = 0.5 * (max(max_len - LENGTH, 0.2) + max(max_wid - WIDTH, 0.2))
+
+        # corridor controls global maneuver radius; central_open controls slot vicinity freedom
+        dist_ref = 0.18 * corridor_span + 1.5 * central_open
+        return float(max(2.5, dist_ref))
+
+    def _angle_distance_gate(self, curr_state: State) -> float:
+        """Distance gate for angle rewards: peak in mid-range interval, slightly smaller near slot."""
+        if not bool(ANGLE_REWARD_DIST_GATE_ENABLE):
+            return 1.0
+
+        dist = float(curr_state.loc.distance(self.map.dest.loc))
+        dist_ref = self._estimate_angle_gate_distance_ref()
+
+        near_scale = float(ANGLE_REWARD_DIST_GATE_NEAR_SCALE)
+        far_scale = float(ANGLE_REWARD_DIST_GATE_FAR_SCALE)
+        peak_scale = float(ANGLE_REWARD_DIST_GATE_PEAK_SCALE)
+
+        near_end = float(ANGLE_REWARD_DIST_GATE_NEAR_END_REF_RATIO) * dist_ref
+        mid_low = float(ANGLE_REWARD_DIST_GATE_MID_LOW_REF_RATIO) * dist_ref
+        mid_high = float(ANGLE_REWARD_DIST_GATE_MID_HIGH_REF_RATIO) * dist_ref
+        far_start = float(ANGLE_REWARD_DIST_GATE_FAR_START_REF_RATIO) * dist_ref
+
+        # ensure monotonic boundaries
+        mid_low = max(mid_low, near_end + 0.05)
+        mid_high = max(mid_high, mid_low + 0.05)
+        far_start = max(far_start, mid_high + 0.05)
+
+        if dist <= near_end:
+            return near_scale
+        if dist <= mid_low:
+            return self._lerp(dist, near_end, mid_low, near_scale, peak_scale)
+        if dist <= mid_high:
+            return peak_scale
+        if dist <= far_start:
+            return self._lerp(dist, mid_high, far_start, peak_scale, far_scale)
+        return far_scale
+
     def _get_reward_info(self, prev_state: State, curr_state: State) -> OrderedDict:
         """HOPE-style per-step reward components (deltas)."""
-        time_cost = -1.0
+        # Time penalty ramp-up:
+        # start with a small penalty at episode beginning, then increase to
+        # the original constant scale (typically -1.0).
+        if bool(TIME_COST_RAMP_ENABLE):
+            ramp_steps = max(1.0, float(TOLERANT_TIME) * float(TIME_COST_RAMP_RATIO))
+            p = min(max(float(self.t) / ramp_steps, 0.0), 1.0)
+            curr_scale = float(TIME_COST_INIT_SCALE) + (
+                float(TIME_COST_FINAL_SCALE) - float(TIME_COST_INIT_SCALE)
+            ) * p
+            time_cost = -float(curr_scale)
+        else:
+            time_cost = -1.0
         rs_dist_reward = 0.0
 
         # Distance progress reward (normalized)
@@ -280,6 +424,20 @@ class CarParking(gym.Env):
         prev_angle_diff = self._get_angle_diff(prev_state.heading, self.map.dest.heading)
         angle_norm_ratio = math.pi
         angle_reward = prev_angle_diff / angle_norm_ratio - angle_diff / angle_norm_ratio
+
+        # Approach-direction alignment progress reward:
+        # angle between (agent->slot-center direction) and slot heading.
+        # Smaller angle is better.
+        approach_angle_diff = self._get_slot_approach_dir_diff(curr_state)
+        prev_approach_angle_diff = self._get_slot_approach_dir_diff(prev_state)
+        approach_angle_reward = (
+            prev_approach_angle_diff / angle_norm_ratio
+            - approach_angle_diff / angle_norm_ratio
+        )
+
+        angle_gate = self._angle_distance_gate(curr_state)
+        angle_reward *= angle_gate
+        approach_angle_reward *= angle_gate
 
         # Box union reward (incremental IoU-like overlap, monotonic)
         front_box_ego = Polygon(curr_state.create_box()[0])
@@ -301,6 +459,7 @@ class CarParking(gym.Env):
                 'rs_dist_reward': float(rs_dist_reward),
                 'dist_reward': float(dist_reward),
                 'angle_reward': float(angle_reward),
+                'approach_angle_reward': float(approach_angle_reward),
                 'box_union_reward': float(box_union_reward),
             }
         )
@@ -429,22 +588,33 @@ class CarParking(gym.Env):
             )
 
     def _draw_polygon(self, polygon, color):
+        def _to_screen(coords):
+            transformed = []
+            for x, y in coords:
+                sx = x * self.matrix[0] + self.matrix[4]
+                sy = y * self.matrix[3] + self.matrix[5]
+                transformed.append((sx, sy))
+            return transformed
+
         if isinstance(polygon, LinearRing):
-            coords = list(polygon.coords)
-        elif isinstance(polygon, Polygon):
-            coords = list(polygon.exterior.coords)
-        else:
+            pygame.draw.polygon(self.screen, color, _to_screen(list(polygon.coords)))
             return
-            
-        transformed_coords = []
-        for x, y in coords:
-            # Transform to screen coordinates
-            # matrix: [scale, 0, 0, -scale, x_off, y_off]
-            sx = x * self.matrix[0] + self.matrix[4]
-            sy = y * self.matrix[3] + self.matrix[5]
-            transformed_coords.append((sx, sy))
-            
-        pygame.draw.polygon(self.screen, color, transformed_coords)
+
+        if isinstance(polygon, Polygon):
+            # Draw exterior (solid)
+            pygame.draw.polygon(self.screen, color, _to_screen(list(polygon.exterior.coords)))
+            # Carve holes using background color so drivable space is visible
+            for interior in list(polygon.interiors):
+                pygame.draw.polygon(self.screen, BG_COLOR, _to_screen(list(interior.coords)))
+            return
+
+        if isinstance(polygon, MultiPolygon):
+            for g in polygon.geoms:
+                self._draw_polygon(g, color)
+            return
+
+        # Unsupported geometry type
+        return
 
     def close(self):
         if self.screen is not None:

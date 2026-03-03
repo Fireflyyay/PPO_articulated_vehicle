@@ -133,6 +133,85 @@ class MacroActionWrapper(gym.Wrapper):
         # Cached obstacles for faster masking (rebuilt on reset)
         self._mask_obstacles_prepared = None
         self._mask_obstacles_bounds = None
+        # Optional fast-prune before precise mask simulation (can be toggled in configs)
+        try:
+            from configs import ACTION_MASK_USE_FAST_PRUNE
+
+            self._mask_use_fast_prune = bool(ACTION_MASK_USE_FAST_PRUNE)
+        except Exception:
+            self._mask_use_fast_prune = True
+
+        try:
+            from configs import ACTION_MASK_MODE
+
+            mode = str(ACTION_MASK_MODE).strip().lower()
+        except Exception:
+            mode = "hybrid"
+        if mode not in ("fast_only", "hybrid", "full"):
+            mode = "hybrid"
+        self._action_mask_mode = mode
+
+        try:
+            from configs import ACTION_MASK_UPDATE_EVERY_K
+
+            self._action_mask_update_every_k = max(1, int(ACTION_MASK_UPDATE_EVERY_K))
+        except Exception:
+            self._action_mask_update_every_k = 1
+
+        self._action_mask_cached = None
+        self._action_mask_calls_since_update = 0
+
+    def _ensure_mask_obstacle_cache(self):
+        if self._mask_obstacles_prepared is not None and self._mask_obstacles_bounds is not None:
+            return
+        try:
+            world_map = getattr(self.env, 'map', None)
+            obstacles = getattr(world_map, 'obstacles', []) or []
+            if prep is not None:
+                self._mask_obstacles_prepared = [prep(o.shape) for o in obstacles]
+            else:
+                self._mask_obstacles_prepared = [o.shape for o in obstacles]
+            self._mask_obstacles_bounds = [o.shape.bounds for o in obstacles]
+        except Exception:
+            self._mask_obstacles_prepared = []
+            self._mask_obstacles_bounds = []
+
+    def _get_mask_candidate_ids(self, obs_vec, n_actions: int):
+        """Best-effort fast pruning via takeover planner's grid index.
+
+        Returns:
+            np.ndarray[int] candidate primitive ids, or None if unavailable.
+        """
+        if not bool(getattr(self, '_mask_use_fast_prune', True)):
+            return None
+
+        planner = getattr(self, '_takeover_planner', None)
+        if planner is None or not hasattr(planner, 'index'):
+            return None
+        if obs_vec is None:
+            return None
+
+        try:
+            obs_vec = np.asarray(obs_vec, dtype=np.float64).reshape(-1)
+            try:
+                from configs import LIDAR_NUM
+
+                lidar_n = int(LIDAR_NUM)
+            except Exception:
+                lidar_n = int(getattr(planner, 'lidar_num', 120))
+
+            lidar = obs_vec[:lidar_n]
+            occupied_cells, _ = planner._build_occupied_cells_from_lidar(lidar)
+            candidate_mask = planner.index.fast_prune_primitives(occupied_cells)
+            candidate_mask = np.asarray(candidate_mask, dtype=np.bool_).reshape(-1)
+
+            if candidate_mask.shape[0] != int(n_actions):
+                return None
+
+            candidate_ids = np.flatnonzero(candidate_mask)
+            return candidate_ids.astype(np.int64)
+        except Exception:
+            return None
 
     def _physical_to_normalized_action(self, action_phys: np.ndarray) -> np.ndarray:
         """Convert a physical action (steer, speed) into env-expected [-1, 1]."""
@@ -175,6 +254,31 @@ class MacroActionWrapper(gym.Wrapper):
         done = False
         info = {}
         steps_executed = 0
+
+        # Optional execution trace for mining (low-level actions & states).
+        # Stored in `info['macro_exec_trace']` as best-effort; callers can ignore.
+        macro_exec_trace = {
+            "sub_actions_phys": [],   # list[np.ndarray(2,)] in primitive physical units
+            "sub_actions_norm": [],   # list[np.ndarray(2,)] normalized to env step range
+            "sub_states": [],         # list[dict] vehicle state snapshots (best-effort)
+            "status_seq": [],         # list[str]
+        }
+
+        # Record initial state snapshot if available.
+        try:
+            base_env = self.env
+            if hasattr(base_env, 'vehicle') and getattr(base_env.vehicle, 'state', None) is not None:
+                st = base_env.vehicle.state
+                macro_exec_trace["sub_states"].append({
+                    "x": float(st.loc.x),
+                    "y": float(st.loc.y),
+                    "heading": float(st.heading),
+                    "rear_heading": float(getattr(st, 'rear_heading', st.heading)),
+                    "speed": float(getattr(st, 'speed', 0.0)),
+                    "steering": float(getattr(st, 'steering', 0.0)),
+                })
+        except Exception:
+            pass
         
         last_obs = None
         
@@ -194,10 +298,19 @@ class MacroActionWrapper(gym.Wrapper):
 
         for t in range(max_steps):
             # Execute one low-level step
-            action = actions[t]
+            action_phys = np.asarray(actions[t], dtype=np.float64).reshape(-1)
+            action_norm = action_phys
             if self.normalize_before_step:
-                action = self._physical_to_normalized_action(action)
-            step_result = self.env.step(action)
+                action_norm = self._physical_to_normalized_action(action_phys)
+
+            # trace: actions
+            try:
+                macro_exec_trace["sub_actions_phys"].append(action_phys.copy())
+                macro_exec_trace["sub_actions_norm"].append(np.asarray(action_norm, dtype=np.float64).reshape(-1).copy())
+            except Exception:
+                pass
+
+            step_result = self.env.step(action_norm)
             
             # Check return signature
             if len(step_result) == 5:
@@ -216,6 +329,26 @@ class MacroActionWrapper(gym.Wrapper):
             
             # Merge info
             info.update(step_info)
+
+            # trace: status and state
+            try:
+                st = getattr(getattr(self.env, 'vehicle', None), 'state', None)
+                if st is not None:
+                    macro_exec_trace["sub_states"].append({
+                        "x": float(st.loc.x),
+                        "y": float(st.loc.y),
+                        "heading": float(st.heading),
+                        "rear_heading": float(getattr(st, 'rear_heading', st.heading)),
+                        "speed": float(getattr(st, 'speed', 0.0)),
+                        "steering": float(getattr(st, 'steering', 0.0)),
+                    })
+            except Exception:
+                pass
+            try:
+                st_status = step_info.get('status', None)
+                macro_exec_trace["status_seq"].append(str(st_status))
+            except Exception:
+                pass
             
             if done:
                 break
@@ -224,6 +357,16 @@ class MacroActionWrapper(gym.Wrapper):
         info['executed_steps'] = steps_executed
         if used_prefix_steps is not None:
             info['prefix_steps_used'] = int(used_prefix_steps)
+
+        # attach trace (convert lists of arrays to stacked arrays when possible)
+        try:
+            if len(macro_exec_trace.get("sub_actions_phys", [])) > 0 and isinstance(macro_exec_trace["sub_actions_phys"][0], np.ndarray):
+                macro_exec_trace["sub_actions_phys"] = np.stack(macro_exec_trace["sub_actions_phys"], axis=0)
+            if len(macro_exec_trace.get("sub_actions_norm", [])) > 0 and isinstance(macro_exec_trace["sub_actions_norm"][0], np.ndarray):
+                macro_exec_trace["sub_actions_norm"] = np.stack(macro_exec_trace["sub_actions_norm"], axis=0)
+        except Exception:
+            pass
+        info['macro_exec_trace'] = macro_exec_trace
 
         # Provide a terminal plan (HOPE-compatible key) for the next decision.
         # Online planner is called at high frequency, and only commits a short prefix.
@@ -618,7 +761,7 @@ class MacroActionWrapper(gym.Wrapper):
 
         return plan
 
-    def get_action_mask(self):
+    def get_action_mask(self, obs_vec=None):
         """Return a binary mask over primitives: 1=feasible, 0=infeasible.
 
         Feasibility is checked by forward simulating each primitive from the
@@ -633,31 +776,66 @@ class MacroActionWrapper(gym.Wrapper):
         if getattr(self, "_takeover_active", False):
             return np.ones(self.action_space.n, dtype=np.int8)
 
+        if (
+            self._action_mask_update_every_k > 1
+            and self._action_mask_cached is not None
+            and self._action_mask_calls_since_update < (self._action_mask_update_every_k - 1)
+        ):
+            self._action_mask_calls_since_update += 1
+            return self._action_mask_cached.copy()
+
         # If base env doesn't expose expected attributes, fall back to no mask.
         base_env = self.env
         if not hasattr(base_env, 'vehicle') or not hasattr(base_env, 'map'):
-            return np.ones(self.action_space.n, dtype=np.int8)
+            mask = np.ones(self.action_space.n, dtype=np.int8)
+            self._action_mask_cached = mask.copy()
+            self._action_mask_calls_since_update = 0
+            return mask
 
         vehicle = base_env.vehicle
         world_map = base_env.map
         if vehicle is None or getattr(vehicle, 'state', None) is None:
-            return np.ones(self.action_space.n, dtype=np.int8)
+            mask = np.ones(self.action_space.n, dtype=np.int8)
+            self._action_mask_cached = mask.copy()
+            self._action_mask_calls_since_update = 0
+            return mask
 
         state0 = vehicle.state
         n_actions = self.action_space.n
-        mask = np.ones(n_actions, dtype=np.int8)
+
+        mode = getattr(self, "_action_mask_mode", "hybrid")
+        if mode == "full":
+            candidate_ids = None
+        else:
+            candidate_ids = self._get_mask_candidate_ids(obs_vec, n_actions)
+
+        if mode == "fast_only":
+            if candidate_ids is None:
+                mask = np.ones(n_actions, dtype=np.int8)
+            else:
+                mask = np.zeros(n_actions, dtype=np.int8)
+                mask[candidate_ids] = 1
+            if mask.sum() == 0:
+                mask[:] = 1
+            self._action_mask_cached = mask.copy()
+            self._action_mask_calls_since_update = 0
+            return mask
+
+        if candidate_ids is None:
+            mask = np.ones(n_actions, dtype=np.int8)
+            eval_ids = range(n_actions)
+        else:
+            mask = np.zeros(n_actions, dtype=np.int8)
+            eval_ids = candidate_ids
 
         # Cache obstacles list for speed (prepared in reset when possible)
         obstacles = getattr(world_map, 'obstacles', []) or []
         xmin, xmax = world_map.xmin, world_map.xmax
         ymin, ymax = world_map.ymin, world_map.ymax
 
-        prepared = self._mask_obstacles_prepared
-        obst_bounds = self._mask_obstacles_bounds
-        if prepared is None or obst_bounds is None:
-            # Fallback: build lightweight bounds cache
-            prepared = [o.shape for o in obstacles]
-            obst_bounds = [o.shape.bounds for o in obstacles]
+        self._ensure_mask_obstacle_cache()
+        prepared = self._mask_obstacles_prepared if self._mask_obstacles_prepared is not None else []
+        obst_bounds = self._mask_obstacles_bounds if self._mask_obstacles_bounds is not None else []
 
         def bounds_overlap(a, b):
             return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
@@ -668,7 +846,7 @@ class MacroActionWrapper(gym.Wrapper):
         except Exception:
             NUM_STEP = None
 
-        for pid in range(n_actions):
+        for pid in eval_ids:
             actions = self.primitive_lib.get_actions(pid)
             # Defensive: if library H differs, respect wrapper's H
             steps = min(self.H, int(actions.shape[0]))
@@ -719,6 +897,9 @@ class MacroActionWrapper(gym.Wrapper):
         if mask.sum() == 0:
             mask[:] = 1
 
+        self._action_mask_cached = mask.copy()
+        self._action_mask_calls_since_update = 0
+
         return mask
 
     def reset(self, **kwargs):
@@ -730,16 +911,69 @@ class MacroActionWrapper(gym.Wrapper):
         self._takeover_fail_count = 0
         self._prefix_steps_queue.clear()
 
-        # Rebuild prepared obstacles cache for fast action masking.
-        try:
-            world_map = getattr(self.env, 'map', None)
-            obstacles = getattr(world_map, 'obstacles', []) or []
-            if prep is not None:
-                self._mask_obstacles_prepared = [prep(o.shape) for o in obstacles]
-            else:
-                self._mask_obstacles_prepared = [o.shape for o in obstacles]
-            self._mask_obstacles_bounds = [o.shape.bounds for o in obstacles]
-        except Exception:
-            self._mask_obstacles_prepared = None
-            self._mask_obstacles_bounds = None
+        # Invalidate obstacle cache; it will be rebuilt lazily on first mask query.
+        self._mask_obstacles_prepared = None
+        self._mask_obstacles_bounds = None
+
+        self._action_mask_cached = None
+        self._action_mask_calls_since_update = 0
         return out
+
+
+def update_primitive_library(env_or_wrapper, new_lib, H: int = None):
+    """Hot-update a MacroActionWrapper (or wrapped env) with a new primitive library.
+
+    This is intended to be called between episodes.
+
+    Args:
+        env_or_wrapper: MacroActionWrapper instance (preferred). If a base env is
+            passed by mistake, it is returned unchanged.
+        new_lib: PrimitiveLibrary-like object
+        H: optional horizon override
+
+    Returns:
+        updated wrapper (same object if possible)
+    """
+    w = env_or_wrapper
+    if not isinstance(w, MacroActionWrapper):
+        return env_or_wrapper
+
+    w.primitive_lib = new_lib
+    if H is None:
+        H = getattr(new_lib, 'horizon', None)
+    if H is not None:
+        w.H = int(H)
+
+    # update action space
+    try:
+        from gymnasium import spaces
+
+        w.action_space = spaces.Discrete(int(getattr(new_lib, 'size')))
+    except Exception:
+        pass
+
+    # refresh cached deltas used by approximate planner ranking
+    w._primitive_deltas = getattr(new_lib, 'deltas', None)
+
+    # refresh takeover planner index (best-effort)
+    try:
+        grid_index = getattr(new_lib, 'grid_index', None)
+        if getattr(w, '_takeover_planner', None) is not None and grid_index is not None:
+            w._takeover_planner.grid_index = grid_index
+    except Exception:
+        pass
+
+    # reset prepared caches to avoid stale references
+    try:
+        w._mask_obstacles_prepared = None
+        w._mask_obstacles_bounds = None
+    except Exception:
+        pass
+
+    try:
+        w._action_mask_cached = None
+        w._action_mask_calls_since_update = 0
+    except Exception:
+        pass
+
+    return w

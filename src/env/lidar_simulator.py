@@ -4,7 +4,7 @@ sys.path.append("../")
 sys.path.append(".")
 import math
 import numpy as np
-from shapely.geometry import LineString, Point
+from shapely.geometry import LineString, Point, LinearRing, Polygon, MultiPolygon, GeometryCollection
 from shapely.affinity import affine_transform
 
 from env.vehicle import State,VehicleBox
@@ -71,8 +71,42 @@ class LidarSimlator():
             rotated_obs = affine_transform(obs, affine_mat)
             if rotated_obs.distance(ORIGIN) < self.lidar_range:
                 rotated_obstacles.append(rotated_obs)
-        
+
         return rotated_obstacles
+
+    @staticmethod
+    def _extract_rings(geom):
+        """Extract LinearRings representing obstacle boundaries.
+
+        Supports:
+        - LinearRing
+        - Polygon (exterior + interior rings)
+        - MultiPolygon (all component polygons)
+        - GeometryCollection (flatten)
+        """
+        if geom is None:
+            return []
+        if isinstance(geom, LinearRing):
+            return [geom]
+        if isinstance(geom, Polygon):
+            rings = [geom.exterior]
+            rings.extend(list(geom.interiors))
+            return rings
+        if isinstance(geom, MultiPolygon):
+            rings = []
+            for g in geom.geoms:
+                rings.extend(LidarSimlator._extract_rings(g))
+            return rings
+        if isinstance(geom, GeometryCollection):
+            rings = []
+            for g in geom.geoms:
+                rings.extend(LidarSimlator._extract_rings(g))
+            return rings
+        # Best-effort: use .boundary if available
+        try:
+            return LidarSimlator._extract_rings(geom.boundary)
+        except Exception:
+            return []
     
     def _fast_calc_lidar_obs(self, obstacles:list):
         '''
@@ -91,14 +125,17 @@ class LidarSimlator():
         b = -np.cos(theta).reshape(-1,1)
         c = 0
 
-        # convert obstacles(LinerRing) to edges ((x1,y1), (x2,y2))
+        # Convert obstacle boundaries to edges ((x1,y1), (x2,y2))
         x1s, x2s, y1s, y2s = [], [], [], []
         for obst in obstacles:
-            obst_coords = np.array(obst.coords) # (n+1,2)
-            x1s.extend(list(obst_coords[:-1, 0]))
-            x2s.extend(list(obst_coords[1:, 0]))
-            y1s.extend(list(obst_coords[:-1, 1]))
-            y2s.extend(list(obst_coords[1:, 1]))
+            for ring in self._extract_rings(obst):
+                ring_coords = np.array(ring.coords)  # (n+1, 2)
+                if ring_coords.shape[0] < 2:
+                    continue
+                x1s.extend(list(ring_coords[:-1, 0]))
+                x2s.extend(list(ring_coords[1:, 0]))
+                y1s.extend(list(ring_coords[:-1, 1]))
+                y2s.extend(list(ring_coords[1:, 1]))
         if len(x1s) == 0: # no obstacle around
             return np.ones((self.lidar_num))*self.lidar_range
         

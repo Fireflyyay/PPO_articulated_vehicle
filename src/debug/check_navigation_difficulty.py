@@ -14,6 +14,7 @@ This is a lightweight sanity check, not a full env rollout.
 import os
 import sys
 import argparse
+import random as pyrandom
 
 import numpy as np
 
@@ -47,7 +48,12 @@ def _constraints(level: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=200)
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
+
+    # Make this check deterministic to avoid flaky assertion failures.
+    np.random.seed(int(args.seed))
+    pyrandom.seed(int(args.seed))
 
     rng_levels = ["Normal", "Complex", "Extrem"]
 
