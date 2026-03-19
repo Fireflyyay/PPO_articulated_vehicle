@@ -75,6 +75,10 @@ class CarParking(gym.Env):
         self.tgt_repr_size = 7 # relative_distance, cos(theta), sin(theta), cos(phi), sin(phi)
         self._map_cache = {}
 
+        if bool(NAVIGATION_PRELOAD_ALL_LEVEL_MAPS):
+            for cache_level in ['Normal', 'Complex', 'Extrem']:
+                self._get_or_create_map(cache_level)
+
         if self.level in ['Normal', 'Complex', 'Extrem']:
             self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
@@ -181,20 +185,48 @@ class CarParking(gym.Env):
 
         if level is not None:
             self.set_level(level)
-        initial_state = self.map.reset(case_id, data_dir)
-        self.vehicle.reset(initial_state)
-        self.matrix = self.coord_transform_matrix()
+        guidance_ready = False
+        last_reset_error = None
+        max_scene_retries = 1
+        if ENABLE_GLOBAL_SOFT_GUIDANCE and self.global_guidance is not None and bool(NAVIGATION_REQUIRE_GUIDANCE_SUCCESS):
+            max_scene_retries = int(max(1, NAVIGATION_RESET_MAX_SCENE_RETRIES))
 
-        if ENABLE_GLOBAL_SOFT_GUIDANCE and self.global_guidance is not None:
+        for _ in range(max_scene_retries):
             try:
-                dest_center = np.mean(self.map.dest_box.coords[:-1], axis=0)
-                self.global_guidance.plan_path(
-                    self.map,
-                    start_xy=(float(self.vehicle.state.loc.x), float(self.vehicle.state.loc.y)),
-                    goal_xy=(float(dest_center[0]), float(dest_center[1])),
-                )
-            except Exception:
-                pass
+                initial_state = self.map.reset(case_id, data_dir)
+                self.vehicle.reset(initial_state)
+                self.matrix = self.coord_transform_matrix()
+
+                if ENABLE_GLOBAL_SOFT_GUIDANCE and self.global_guidance is not None:
+                    guidance_ready = False
+                    precomputed_path = getattr(self.map, 'guidance_path_points', None)
+                    if precomputed_path is not None:
+                        guidance_ready = bool(self.global_guidance.set_precomputed_path(precomputed_path))
+
+                    if not guidance_ready:
+                        dest_center = np.mean(self.map.dest_box.coords[:-1], axis=0)
+                        guidance_ready = bool(
+                            self.global_guidance.plan_path(
+                                self.map,
+                                start_xy=(float(self.vehicle.state.loc.x), float(self.vehicle.state.loc.y)),
+                                goal_xy=(float(dest_center[0]), float(dest_center[1])),
+                            )
+                        )
+                    if bool(NAVIGATION_REQUIRE_GUIDANCE_SUCCESS) and (not guidance_ready):
+                        continue
+                else:
+                    guidance_ready = True
+                break
+            except Exception as exc:
+                last_reset_error = exc
+                guidance_ready = False
+                continue
+
+        if ENABLE_GLOBAL_SOFT_GUIDANCE and self.global_guidance is not None and bool(NAVIGATION_REQUIRE_GUIDANCE_SUCCESS):
+            if not guidance_ready:
+                if last_reset_error is not None:
+                    raise RuntimeError("Failed to reset environment with a valid guidance path") from last_reset_error
+                raise RuntimeError("Failed to reset environment with a valid guidance path")
         
         # For reward normalization
         self.initial_dist = float(self.vehicle.state.loc.distance(Point(self.map.dest.loc))) + 1e-6

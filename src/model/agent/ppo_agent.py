@@ -1,4 +1,5 @@
 from copy import deepcopy
+from collections import deque
 
 import torch
 import torch.nn as nn
@@ -45,6 +46,13 @@ class PPOConfig(ConfigBase):
         self.policy_entropy = False
         self.entropy_coef = 0.01
 
+        # planner-supervised auxiliary loss
+        self.use_imitation_loss = False
+        self.imitation_buffer_size = 8192
+        self.imitation_batch_size = 256
+        self.imitation_min_buffer = 128
+        self.imitation_loss_weight = 0.05
+
         self.merge_configs(configs)
 
 
@@ -78,6 +86,12 @@ class PPOAgent(AgentBase):
         if self.discrete:
             extra_items.append("action_mask")
         self.memory = ReplayMemory(self.configs.batch_size, extra_items)
+        self.imitation_memory = {
+            "state": deque([], maxlen=int(self.configs.imitation_buffer_size)),
+            "action": deque([], maxlen=int(self.configs.imitation_buffer_size)),
+            "action_mask": deque([], maxlen=int(self.configs.imitation_buffer_size)),
+        }
+        self.last_imitation_loss = 0.0
 
         # tricks
         if self.configs.state_norm:
@@ -186,13 +200,47 @@ class PPOAgent(AgentBase):
 
     def rebuild_actor_optimizer(self) -> None:
         """Rebuild actor optimizer (needed after resizing actor output)."""
-        self.actor_optimizer = torch.optim.Adam(self.actor_net.parameters(), self.configs.lr_actor)
+        actor_lr = float(self.configs.lr_actor)
+        try:
+            actor_lr = float(self.actor_optimizer.param_groups[0].get('lr', actor_lr))
+        except Exception:
+            pass
+        self.actor_optimizer = torch.optim.Adam(self.actor_net.parameters(), actor_lr)
         # refresh checklist references
         for i, (name, item, save_state_dict) in enumerate(self.check_list):
             if name == 'actor_net':
                 self.check_list[i] = (name, self.actor_net, save_state_dict)
             elif name == 'actor_optimizer':
                 self.check_list[i] = (name, self.actor_optimizer, save_state_dict)
+
+    def get_learning_rates(self):
+        actor_lr = float(self.configs.lr_actor)
+        critic_lr = float(self.configs.lr_critic)
+        try:
+            actor_lr = float(self.actor_optimizer.param_groups[0].get('lr', actor_lr))
+        except Exception:
+            pass
+        try:
+            critic_lr = float(self.critic_optimizer.param_groups[0].get('lr', critic_lr))
+        except Exception:
+            pass
+        return actor_lr, critic_lr
+
+    def set_learning_rates(self, actor_lr: float, critic_lr: float = None):
+        actor_lr = float(actor_lr)
+        if critic_lr is None:
+            base_actor_lr = float(self.configs.lr_actor)
+            base_critic_lr = float(self.configs.lr_critic)
+            ratio = base_critic_lr / base_actor_lr if base_actor_lr > 0 else 1.0
+            critic_lr = actor_lr * ratio
+        critic_lr = float(critic_lr)
+
+        for group in self.actor_optimizer.param_groups:
+            group['lr'] = actor_lr
+        for group in self.critic_optimizer.param_groups:
+            group['lr'] = critic_lr
+
+        return actor_lr, critic_lr
 
     def _mask_logits(self, logits: torch.Tensor, action_mask) -> torch.Tensor:
         if action_mask is None:
@@ -350,6 +398,58 @@ class PPOAgent(AgentBase):
             observations = (obs, action, reward, done, log_prob, next_obs)
         self.memory.push(observations)
 
+    def push_imitation_memory(self, obs, action, action_mask=None):
+        if not bool(self.discrete):
+            return
+
+        self.imitation_memory["state"].append(deepcopy(obs))
+        self.imitation_memory["action"].append(int(action))
+        self.imitation_memory["action_mask"].append(None if action_mask is None else np.asarray(action_mask, dtype=np.int8).copy())
+
+    def imitation_buffer_size(self) -> int:
+        return int(len(self.imitation_memory["state"]))
+
+    def _sample_imitation_batch(self):
+        size = self.imitation_buffer_size()
+        min_size = int(getattr(self.configs, "imitation_min_buffer", 0))
+        if size < max(1, min_size):
+            return None
+
+        batch_size = int(min(size, max(1, int(self.configs.imitation_batch_size))))
+        idx = np.random.randint(size, size=batch_size)
+        states = [self.imitation_memory["state"][int(i)] for i in idx]
+        actions = np.asarray([self.imitation_memory["action"][int(i)] for i in idx], dtype=np.int64)
+        masks_raw = [self.imitation_memory["action_mask"][int(i)] for i in idx]
+        if all(m is None for m in masks_raw):
+            masks = None
+        else:
+            masks = []
+            for m in masks_raw:
+                if m is None:
+                    masks.append(np.ones((int(self.configs.action_dim),), dtype=np.int8))
+                else:
+                    masks.append(np.asarray(m, dtype=np.int8))
+            masks = np.asarray(masks)
+        return states, actions, masks
+
+    def _compute_imitation_loss(self):
+        if not bool(self.discrete) or not bool(getattr(self.configs, "use_imitation_loss", False)):
+            return None
+
+        sampled = self._sample_imitation_batch()
+        if sampled is None:
+            return None
+
+        states, actions, action_mask = sampled
+        state_tensor = self.obs2tensor(states)
+        action_tensor = torch.as_tensor(actions, dtype=torch.int64, device=self.device).reshape(-1)
+        logits = self.actor_net(state_tensor)
+        mask_tensor = None
+        if action_mask is not None:
+            mask_tensor = torch.as_tensor(action_mask, dtype=torch.bool, device=self.device)
+        dist = self._build_dist(logits, action_mask=mask_tensor)
+        return -dist.log_prob(action_tensor).mean()
+
     def _reward_norm(self, reward):
         return (reward - reward.mean()) / (reward.std() + 1e-8)
 
@@ -391,6 +491,7 @@ class PPOAgent(AgentBase):
         if self.discrete and "action_mask" in batches:
             action_mask_batch = torch.as_tensor(batches["action_mask"], dtype=torch.bool, device=self.device)
         self.memory.clear()
+        imitation_loss_value = 0.0
 
         # GAE
         gae = 0
@@ -463,10 +564,15 @@ class PPOAgent(AgentBase):
                 if self.configs.policy_entropy:
                     actor_loss += - self.configs.entropy_coef * dist_entropy
                 critic_loss = F.mse_loss(v_target[ri], self.critic_net(state))
+                imitation_loss = self._compute_imitation_loss()
+                total_actor_loss = actor_loss.mean()
+                if imitation_loss is not None:
+                    total_actor_loss = total_actor_loss + float(self.configs.imitation_loss_weight) * imitation_loss
+                    imitation_loss_value = float(imitation_loss.detach().cpu().item())
 
                 self.actor_optimizer.zero_grad()
                 self.critic_optimizer.zero_grad()
-                actor_loss.mean().backward()
+                total_actor_loss.backward()
                 critic_loss.mean().backward()
                 
                 self.actor_loss_list.append(actor_loss.mean().item())
@@ -482,6 +588,8 @@ class PPOAgent(AgentBase):
         if self.configs.lr_decay: # learning rate decay
             self.actor_optimizer.param_groups["lr"] = self.lr_decay(self.configs.lr_actor)
             self.critic_optimizer.param_groups["lr"] = self.lr_decay(self.configs.lr_critic)
+
+        self.last_imitation_loss = float(imitation_loss_value)
 
         # for debug
         a = actor_loss.detach().cpu().numpy()[0][0]

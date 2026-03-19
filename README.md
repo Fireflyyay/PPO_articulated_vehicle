@@ -85,6 +85,7 @@ python src/evaluation/visualize_path.py --episodes 5 --level Complex
 
 关键开关位于 src/configs.py：
 
+- TAKEOVER_ENABLE：总开关，设为 False 可完全禁用 takeover
 - TAKEOVER_USE_RHP：是否启用 RHP 接管规划器
 - TAKEOVER_DIST_BASE / TAKEOVER_DIST_HYSTERESIS / TAKEOVER_EARLY_*：触发阈值
 - OCCUPANCY_INFLATION_RADIUS / TAKEOVER_SCORE_WEIGHTS：碰撞裁剪与打分权重

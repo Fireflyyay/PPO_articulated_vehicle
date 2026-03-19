@@ -5,6 +5,7 @@ import copy
 import math
 import time
 from shapely.geometry import Polygon
+from shapely.affinity import affine_transform
 try:
     from shapely.prepared import prep
 except Exception:  # pragma: no cover
@@ -63,6 +64,7 @@ class MacroActionWrapper(gym.Wrapper):
         self._takeover_planner = None
         try:
             from configs import (
+                TAKEOVER_ENABLE,
                 TAKEOVER_USE_RHP,
                 LIDAR_NUM,
                 LIDAR_RANGE,
@@ -72,8 +74,10 @@ class MacroActionWrapper(gym.Wrapper):
                 TAKEOVER_MAX_PREFIX_STEPS,
             )
 
-            use_rhp = bool(TAKEOVER_USE_RHP)
+            self._takeover_enabled = bool(TAKEOVER_ENABLE)
+            use_rhp = bool(self._takeover_enabled and TAKEOVER_USE_RHP)
         except Exception:
+            self._takeover_enabled = True
             use_rhp = False
             LIDAR_NUM = None
             LIDAR_RANGE = None
@@ -236,6 +240,96 @@ class MacroActionWrapper(gym.Wrapper):
         denom = np.where(np.abs(denom) < 1e-9, 1.0, denom)
         action_norm = 2.0 * (action_phys - low) / denom - 1.0
         return np.clip(action_norm, -1.0, 1.0)
+
+    def _simulate_mask_primitive_end_state(self, state0, actions, xmin, xmax, ymin, ymax, num_step: int):
+        """Fast scalar rollout for action-mask feasibility checks."""
+        model = getattr(self.env.vehicle, 'kinetic_model', None)
+        if model is None:
+            return None, False
+
+        x = float(state0.loc.x)
+        y = float(state0.loc.y)
+        heading = float(state0.heading)
+        rear_heading = float(getattr(state0, 'rear_heading', heading))
+
+        mini_iter = max(1, int(getattr(model, 'mini_iter', 1)))
+        step_len = float(getattr(model, 'step_len', 0.0))
+        speed_range = getattr(model, 'speed_range', None)
+        angle_range = getattr(model, 'angle_range', None)
+        if speed_range is None or angle_range is None:
+            return None, False
+
+        dt = step_len / float(mini_iter)
+        is_articulated = hasattr(model, 'trailer_length') and hasattr(model, 'hitch_offset')
+
+        if is_articulated:
+            l1 = float(model.hitch_offset)
+            l2 = float(model.trailer_length)
+            phi_max = float(np.deg2rad(36.0))
+        else:
+            wheel_base = float(getattr(model, 'wheel_base', 1.0))
+
+        for action in actions:
+            steer, speed_cmd = np.asarray(action, dtype=np.float64).reshape(-1)
+            speed = float(np.clip(speed_cmd, *speed_range))
+            steering = float(np.clip(steer, *angle_range))
+
+            if is_articulated:
+                omega = steering
+                for _ in range(int(num_step)):
+                    for _ in range(mini_iter):
+                        phi = (heading - rear_heading + np.pi) % (2.0 * np.pi) - np.pi
+                        effective_omega = omega
+                        if phi >= phi_max and omega > 0.0:
+                            effective_omega = 0.0
+                        elif phi <= -phi_max and omega < 0.0:
+                            effective_omega = 0.0
+
+                        denom = l1 * math.cos(phi) + l2
+                        if abs(denom) < 1e-6:
+                            denom = 1e-6
+
+                        theta1_dot = (speed * math.sin(phi) + l2 * effective_omega) / denom
+                        theta2_dot = theta1_dot - effective_omega
+                        x += speed * math.cos(heading) * dt
+                        y += speed * math.sin(heading) * dt
+                        heading += theta1_dot * dt
+                        rear_heading += theta2_dot * dt
+            else:
+                heading_dot = speed * math.tan(steering) / max(wheel_base, 1e-6)
+                for _ in range(int(num_step) * mini_iter):
+                    x += speed * math.cos(heading) * dt
+                    y += speed * math.sin(heading) * dt
+                    heading += heading_dot * dt
+                rear_heading = heading
+
+            if x < xmin or x > xmax or y < ymin or y > ymax:
+                return None, False
+
+        return (x, y, heading, rear_heading), True
+
+    def _create_mask_boxes(self, x: float, y: float, heading: float, rear_heading: float):
+        from configs import FrontVehicleBox, RearVehicleBox, HITCH_OFFSET, TRAILER_LENGTH
+
+        cos_theta = math.cos(heading)
+        sin_theta = math.sin(heading)
+        front_box = affine_transform(
+            FrontVehicleBox,
+            [cos_theta, -sin_theta, sin_theta, cos_theta, x, y],
+        )
+
+        hx = x - float(HITCH_OFFSET) * math.cos(heading)
+        hy = y - float(HITCH_OFFSET) * math.sin(heading)
+        tx = hx - float(TRAILER_LENGTH) * math.cos(rear_heading)
+        ty = hy - float(TRAILER_LENGTH) * math.sin(rear_heading)
+        cos_theta_r = math.cos(rear_heading)
+        sin_theta_r = math.sin(rear_heading)
+        rear_box = affine_transform(
+            RearVehicleBox,
+            [cos_theta_r, -sin_theta_r, sin_theta_r, cos_theta_r, tx, ty],
+        )
+
+        return (front_box, rear_box)
         
     def step(self, primitive_id):
         """
@@ -372,8 +466,10 @@ class MacroActionWrapper(gym.Wrapper):
         # Online planner is called at high frequency, and only commits a short prefix.
         try:
             self._maybe_plan_terminal_takeover(last_obs, done, info)
-        except Exception:
-            pass
+        except Exception as exc:
+            info.setdefault('takeover_active', False)
+            info.setdefault('takeover_triggered', False)
+            info['takeover_error'] = str(exc)
         
         # Return consistent with Gymnasium
         return last_obs, total_reward, terminated, truncated, info
@@ -401,20 +497,25 @@ class MacroActionWrapper(gym.Wrapper):
         return {
             "goal_x": dist * math.cos(rel_angle),
             "goal_y": dist * math.sin(rel_angle),
-            "goal_heading": _wrap_pi(rel_heading),
-            "articulation": _wrap_pi(articulation),
+                "goal_heading": self._wrap_pi(rel_heading),
+                "articulation": self._wrap_pi(articulation),
             "dist": dist,
             "rel_angle": rel_angle,
         }
 
     def _should_takeover(self, obs_vec: np.ndarray) -> bool:
         """Dynamic trigger + hysteresis for terminal takeover."""
+        if not getattr(self, '_takeover_enabled', True):
+            return False
+
         goal = self._parse_goal_repr_from_obs(obs_vec)
         dist = float(goal.get("dist", 1e9))
         try:
             from configs import (
                 TAKEOVER_DIST_BASE,
                 TAKEOVER_DIST_HYSTERESIS,
+                TAKEOVER_NEAR_GOAL_ONLY,
+                TAKEOVER_NEAR_GOAL_DIST,
                 TAKEOVER_EARLY_HEADING_ERR,
                 TAKEOVER_EARLY_ARTICULATION,
                 TAKEOVER_EARLY_MIN_LIDAR,
@@ -426,6 +527,8 @@ class MacroActionWrapper(gym.Wrapper):
 
             base = float(TAKEOVER_DIST_BASE)
             hyst = float(TAKEOVER_DIST_HYSTERESIS)
+            near_goal_only = bool(TAKEOVER_NEAR_GOAL_ONLY)
+            near_goal_dist = float(TAKEOVER_NEAR_GOAL_DIST)
             heading_thr = float(TAKEOVER_EARLY_HEADING_ERR)
             art_thr = float(TAKEOVER_EARLY_ARTICULATION)
             min_lidar_thr = float(TAKEOVER_EARLY_MIN_LIDAR)
@@ -435,6 +538,7 @@ class MacroActionWrapper(gym.Wrapper):
             lidar_r = float(LIDAR_RANGE)
         except Exception:
             base, hyst = 10.0, 2.0
+            near_goal_only, near_goal_dist = True, 4.0
             heading_thr, art_thr, min_lidar_thr = math.radians(35), math.radians(25), 2.0
             speed_gain, dens_gain = 0.0, 0.0
             lidar_n, lidar_r = 120, 30.0
@@ -457,6 +561,13 @@ class MacroActionWrapper(gym.Wrapper):
             speed_mps = 0.0
         takeover_dist = base + speed_gain * speed_mps + dens_gain * obs_density
 
+        if near_goal_only:
+            if self._takeover_active:
+                if dist > (near_goal_dist + hyst):
+                    return False
+            elif dist > near_goal_dist:
+                return False
+
         if self._takeover_active:
             # hysteresis exit
             return dist <= (takeover_dist + hyst)
@@ -477,6 +588,14 @@ class MacroActionWrapper(gym.Wrapper):
         if done:
             self._takeover_active = False
             self._prefix_steps_queue.clear()
+            return
+
+        if not getattr(self, '_takeover_enabled', True):
+            self._takeover_active = False
+            self._takeover_fail_count = 0
+            self._prefix_steps_queue.clear()
+            info['takeover_active'] = False
+            info['takeover_triggered'] = False
             return
 
         base_env = self.env
@@ -557,6 +676,8 @@ class MacroActionWrapper(gym.Wrapper):
 
         if plan_ids is not None and len(plan_ids) > 0:
             info['path_to_dest'] = list(map(int, plan_ids))
+            info['takeover_expert_primitive'] = int(plan_ids[0])
+            info['takeover_plan_length'] = int(len(plan_ids))
             if prefix_steps is not None:
                 self._prefix_steps_queue = [int(prefix_steps)] + [None] * max(0, len(plan_ids) - 1)
                 info['takeover_prefix_steps'] = int(prefix_steps)
@@ -848,31 +969,21 @@ class MacroActionWrapper(gym.Wrapper):
 
         for pid in eval_ids:
             actions = self.primitive_lib.get_actions(pid)
-            # Defensive: if library H differs, respect wrapper's H
             steps = min(self.H, int(actions.shape[0]))
-
-            state = copy.deepcopy(state0)
-            feasible = True
-
-            for t in range(steps):
-                action = actions[t]
-
-                # Step with the same kinematic model as the real env.
-                if NUM_STEP is None:
-                    state = vehicle.kinetic_model.step(state, action)
-                else:
-                    state = vehicle.kinetic_model.step(state, action, step_time=NUM_STEP)
-
-                # Out-of-map
-                x, y = state.loc.x, state.loc.y
-                if x < xmin or x > xmax or y < ymin or y > ymax:
-                    feasible = False
-                    break
+            end_state, feasible = self._simulate_mask_primitive_end_state(
+                state0,
+                actions[:steps],
+                xmin,
+                xmax,
+                ymin,
+                ymax,
+                NUM_STEP if NUM_STEP is not None else getattr(vehicle.kinetic_model, 'n_step', 1),
+            )
 
             # Collision check only at the end state (much faster; allows rare
             # false-feasible cases where intermediate collision would occur).
-            if feasible and len(prepared) > 0:
-                boxes = state.create_box()
+            if feasible and len(prepared) > 0 and end_state is not None:
+                boxes = self._create_mask_boxes(*end_state)
                 collided = False
                 for box in boxes:
                     bb = box.bounds

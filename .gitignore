@@ -23,3 +23,5 @@ venv/
 .ipynb_checkpoints/
 *.swp
 Thumbs.db
+/src/log/*
+

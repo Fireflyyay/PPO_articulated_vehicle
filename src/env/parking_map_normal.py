@@ -3,6 +3,9 @@ import sys
 sys.path.append("../")
 from math import pi, cos, sin
 import os
+import heapq
+from collections import deque
+from types import SimpleNamespace
 
 import numpy as np
 from numpy.random import randn, random
@@ -11,6 +14,7 @@ from shapely.geometry import LinearRing, Point, MultiPoint, Polygon, LineString,
 from shapely.ops import unary_union
 from shapely.prepared import prep
 
+from env.global_guidance import SoftGlobalGuidance
 from env.vehicle import State
 from env.map_base import *
 from configs import *
@@ -18,6 +22,76 @@ from configs import *
 DEBUG = False
 if DEBUG:
     import matplotlib.pyplot as plt
+
+
+_scene_guidance_planner = None
+
+_DEFAULT_SCENE_POOL_SIZE = int(max(0, NAVIGATION_SCENE_POOL_SIZE))
+
+
+class _NavigationGenerationRetry(RuntimeError):
+    def __init__(self, reason: str):
+        super().__init__(str(reason))
+        self.reason = str(reason)
+
+
+def _get_scene_guidance_planner():
+    global _scene_guidance_planner
+    if _scene_guidance_planner is None:
+        _scene_guidance_planner = SoftGlobalGuidance(
+            grid_resolution=GUIDANCE_GRID_RESOLUTION,
+            obstacle_inflation=GUIDANCE_OBS_INFLATION,
+            map_margin=GUIDANCE_MAP_MARGIN,
+            lookahead_base=GUIDANCE_LOOKAHEAD_BASE,
+            lookahead_speed_gain=GUIDANCE_LOOKAHEAD_SPEED_GAIN,
+            lookahead_min=GUIDANCE_LOOKAHEAD_MIN,
+            lookahead_max=GUIDANCE_LOOKAHEAD_MAX,
+            progress_search_window=GUIDANCE_PROGRESS_WINDOW,
+            min_clearance_m=GUIDANCE_MIN_CLEARANCE_M,
+            full_clearance_m=GUIDANCE_FULL_CLEARANCE_M,
+            near_obs_dist_m=GUIDANCE_NEAR_OBS_DIST_M,
+            max_dense_ratio=GUIDANCE_MAX_DENSE_RATIO,
+        )
+    return _scene_guidance_planner
+
+
+def _plan_guidance_path_for_scene(
+    obstacles,
+    start_pose,
+    dest_pose,
+    occupancy_payload=None,
+    static_obstacles=None,
+    dynamic_obstacles=None,
+):
+    planner = _get_scene_guidance_planner()
+    planner.clear_path()
+
+    dest_state = State([dest_pose[0], dest_pose[1], dest_pose[2], 0, 0])
+    dest_front_box = dest_state.create_box()[0]
+    dest_center = np.mean(dest_front_box.coords[:-1], axis=0)
+
+    scene_map = SimpleNamespace(
+        xmin=-40.0,
+        xmax=40.0,
+        ymin=-40.0,
+        ymax=40.0,
+        obstacles=obstacles,
+        guidance_static_obstacles=list(static_obstacles or obstacles),
+        guidance_dynamic_obstacles=list(dynamic_obstacles or []),
+        guidance_occupancy_payload=occupancy_payload,
+    )
+    ok = planner.plan_path(
+        scene_map,
+        start_xy=(float(start_pose[0]), float(start_pose[1])),
+        goal_xy=(float(dest_center[0]), float(dest_center[1])),
+    )
+    if not ok or planner.path_points_world is None:
+        planner.clear_path()
+        return None, None
+    return (
+        np.array(planner.path_points_world, dtype=np.float64, copy=True),
+        planner.get_last_occupancy_payload(copy=True),
+    )
 
 # params for generating parking case
 prob_huge_obst = 0.0
@@ -42,7 +116,7 @@ def get_rand_pos(origin_x, origin_y, angle_min, angle_max, radius_min, radius_ma
 def generate_bay_parking_case(map_level):
     '''
     Generate the parameters that a bay parking case need.
-    
+
     Returns
     ----------
         `start` (list): [x, y, yaw]
@@ -61,12 +135,12 @@ def generate_bay_parking_case(map_level):
 
     generate_success = True
     # generate obstacle on back
-    obstacle_back = LinearRing(( 
+    obstacle_back = LinearRing((
         (origin[0]+bay_half_len, origin[1]),
-        (origin[0]+bay_half_len, origin[1]-3), 
-        (origin[0]-bay_half_len, origin[1]-3), 
+        (origin[0]+bay_half_len, origin[1]-3),
+        (origin[0]-bay_half_len, origin[1]-3),
         (origin[0]-bay_half_len, origin[1])))
-    
+
     if DEBUG:
         fig=plt.figure()
         ax=fig.add_subplot(111)
@@ -94,10 +168,10 @@ def generate_bay_parking_case(map_level):
         min_dist_to_obst = max_lateral_space/5*1
         left_obst_rf = get_rand_pos(*car_lf, pi*11/12, pi*13/12, min_dist_to_obst, max_dist_to_obst)
         left_obst_rb = get_rand_pos(*car_lb, pi*11/12, pi*13/12, min_dist_to_obst, max_dist_to_obst)
-        obstacle_left = LinearRing(( 
+        obstacle_left = LinearRing((
             left_obst_rf,
-            left_obst_rb, 
-            (origin[0]-bay_half_len, origin[1]), 
+            left_obst_rb,
+            (origin[0]-bay_half_len, origin[1]),
             (origin[0]-bay_half_len, left_obst_rf[1])))
     else: # generate another vehicle as obstacle on left
         max_dist_to_obst = max_lateral_space/5*4
@@ -126,10 +200,10 @@ def generate_bay_parking_case(map_level):
     if random()<prob_huge_obst: # generate simple obstacle
         right_obst_lf = get_rand_pos(*car_rf, -pi/12, pi/12, min_dist_to_obst, max_dist_to_obst)
         right_obst_lb = get_rand_pos(*car_rb, -pi/12, pi/12, min_dist_to_obst, max_dist_to_obst)
-        obstacle_right = LinearRing(( 
+        obstacle_right = LinearRing((
             (origin[0]+bay_half_len, right_obst_lf[1]),
-            (origin[0]+bay_half_len, origin[1]), 
-            right_obst_lb, 
+            (origin[0]+bay_half_len, origin[1]),
+            right_obst_lb,
             right_obst_lf))
     else: # generate another vehicle as obstacle on right
         right_car_x = origin[0] + (WIDTH + random_uniform_num(min_dist_to_obst, max_dist_to_obst))
@@ -138,7 +212,7 @@ def generate_bay_parking_case(map_level):
         min_right_car_y = -min(rb[1], lb[1]) + MIN_DIST_TO_OBST
         right_car_y = random_gaussian_num(min_right_car_y+0.4, 0.2, min_right_car_y, min_right_car_y+0.8)
         obstacle_right = State([right_car_x, right_car_y, right_car_yaw, 0, 0]).create_box()[0]
-        
+
         # generate other parking vehicle
         for _ in range(n_non_critical_car):
             right_car_x += (WIDTH + MIN_DIST_TO_OBST + random_uniform_num(min_dist_to_obst, max_dist_to_obst))
@@ -164,11 +238,11 @@ def generate_bay_parking_case(map_level):
     # generate obstacles out of start range
     max_obstacle_y = max([np.max(np.array(obs.coords)[:,1]) for obs in obstacles])+MIN_DIST_TO_OBST
     other_obstcales = []
-    
-    other_obstacle_range = LinearRing(( 
+
+    other_obstacle_range = LinearRing((
     (origin[0]-bay_half_len, bay_PARK_WALL_DIST+max_obstacle_y),
-    (origin[0]+bay_half_len, bay_PARK_WALL_DIST+max_obstacle_y), 
-    (origin[0]+bay_half_len, bay_PARK_WALL_DIST+max_obstacle_y+8), 
+    (origin[0]+bay_half_len, bay_PARK_WALL_DIST+max_obstacle_y),
+    (origin[0]+bay_half_len, bay_PARK_WALL_DIST+max_obstacle_y+8),
     (origin[0]-bay_half_len, bay_PARK_WALL_DIST+max_obstacle_y+8)))
     valid_obst_x_range = (origin[0]-bay_half_len+2, origin[0]+bay_half_len-2)
     valid_obst_y_range = (bay_PARK_WALL_DIST+max_obstacle_y+2, bay_PARK_WALL_DIST+max_obstacle_y+6)
@@ -196,11 +270,11 @@ def generate_bay_parking_case(map_level):
         for obs in obstacles:
             ax.add_patch(plt.Polygon(xy=list(obs.coords), color='gray'))
 
-    
+
     # generate start position
     start_box_valid = False
     valid_start_x_range = (origin[0]-bay_half_len/2, origin[0]+bay_half_len/2)
-    
+
     if map_level == 'Complex':
         valid_start_y_range = (max_obstacle_y+1, max_obstacle_y+1 + (bay_PARK_WALL_DIST-1)*0.6)
     elif map_level == 'Extrem':
@@ -212,7 +286,7 @@ def generate_bay_parking_case(map_level):
         start_box_valid = True
         start_x = random_uniform_num(*valid_start_x_range)
         start_y = random_uniform_num(*valid_start_y_range)
-        
+
         if map_level == 'Complex':
             base_yaw = dest_yaw - pi/2
             if random() < 0.5:
@@ -224,7 +298,7 @@ def generate_bay_parking_case(map_level):
         else:
             start_yaw = random_gaussian_num(0, pi/6, -pi/2, pi/2)
             start_yaw = start_yaw+pi if random()<0.5 else start_yaw
-        
+
         start_state = State([start_x, start_y, start_yaw, 0, 0])
         start_boxes = start_state.create_box()
         # check collision
@@ -236,7 +310,7 @@ def generate_bay_parking_case(map_level):
                     start_box_valid = False
                     break
             if not start_box_valid: break
-            
+
         # check overlap with dest box
         if start_box_valid:
             dest_state = State([dest_x, dest_y, dest_yaw, 0, 0])
@@ -254,7 +328,7 @@ def generate_bay_parking_case(map_level):
     for obs in obstacles:
         if random()<DROUP_OUT_OBST:
             obstacles.remove(obs)
-    
+
     if DEBUG:
         ax.add_patch(plt.Polygon(xy=list(State([start_x, start_y, start_yaw, 0, 0]).create_box()[0].coords), color='g'))
         print(generate_success)
@@ -264,7 +338,7 @@ def generate_bay_parking_case(map_level):
             fig = plt.gcf()
             fig.savefig(path+f'image_{num_files}.png')
         plt.clf()
-    
+
     if generate_success:
         return [start_x, start_y, start_yaw], [dest_x, dest_y, dest_yaw], obstacles
     else:
@@ -274,7 +348,7 @@ def generate_bay_parking_case(map_level):
 def generate_parallel_parking_case(map_level):
     '''
     Generate the parameters that a parallel parking case need.
-    
+
     Returns
     ----------
         `start` (list): [x, y, yaw]
@@ -293,12 +367,12 @@ def generate_parallel_parking_case(map_level):
 
     generate_success = True
     # generate obstacle on back
-    obstacle_back = LinearRing(( 
+    obstacle_back = LinearRing((
         (origin[0]+bay_half_len, origin[1]),
-        (origin[0]+bay_half_len, origin[1]-3), 
-        (origin[0]-bay_half_len, origin[1]-3), 
+        (origin[0]+bay_half_len, origin[1]-3),
+        (origin[0]-bay_half_len, origin[1]-3),
         (origin[0]-bay_half_len, origin[1])))
-    
+
     if DEBUG:
         fig=plt.figure()
         ax=fig.add_subplot(111)
@@ -326,10 +400,10 @@ def generate_parallel_parking_case(map_level):
         min_dist_to_obst = min_longitude_space/5*1
         left_obst_rf = get_rand_pos(*car_lb, pi*11/12, pi*13/12, min_dist_to_obst, max_dist_to_obst)
         left_obst_rb = get_rand_pos(*car_rb, pi*11/12, pi*13/12, min_dist_to_obst, max_dist_to_obst)
-        obstacle_left = LinearRing(( 
+        obstacle_left = LinearRing((
             left_obst_rf,
-            left_obst_rb, 
-            (origin[0]-bay_half_len, origin[1]), 
+            left_obst_rb,
+            (origin[0]-bay_half_len, origin[1]),
             (origin[0]-bay_half_len, left_obst_rf[1])))
     else: # generate another vehicle as obstacle on left
         max_dist_to_obst = max_longitude_space/5*4
@@ -357,10 +431,10 @@ def generate_parallel_parking_case(map_level):
     if random()<0.5: # generate simple obstacle
         right_obst_lf = get_rand_pos(*car_lf, -pi/12, pi/12, min_dist_to_obst, max_dist_to_obst)
         right_obst_lb = get_rand_pos(*car_rf, -pi/12, pi/12, min_dist_to_obst, max_dist_to_obst)
-        obstacle_right = LinearRing(( 
+        obstacle_right = LinearRing((
             (origin[0]+bay_half_len, right_obst_lf[1]),
-            (origin[0]+bay_half_len, origin[1]), 
-            right_obst_lb, 
+            (origin[0]+bay_half_len, origin[1]),
+            right_obst_lb,
             right_obst_lf))
     else: # generate another vehicle as obstacle on right
         right_car_x = origin[0] + (LENGTH + random_uniform_num(min_dist_to_obst, max_dist_to_obst))
@@ -397,11 +471,11 @@ def generate_parallel_parking_case(map_level):
     # generate obstacles out of start range
     max_obstacle_y = max([np.max(np.array(obs.coords)[:,1]) for obs in obstacles])+MIN_DIST_TO_OBST
     other_obstcales = []
-    
-    other_obstacle_range = LinearRing(( 
+
+    other_obstacle_range = LinearRing((
     (origin[0]-bay_half_len, para_PARK_WALL_DIST+max_obstacle_y),
-    (origin[0]+bay_half_len, para_PARK_WALL_DIST+max_obstacle_y), 
-    (origin[0]+bay_half_len, para_PARK_WALL_DIST+max_obstacle_y+8), 
+    (origin[0]+bay_half_len, para_PARK_WALL_DIST+max_obstacle_y),
+    (origin[0]+bay_half_len, para_PARK_WALL_DIST+max_obstacle_y+8),
     (origin[0]-bay_half_len, para_PARK_WALL_DIST+max_obstacle_y+8)))
     valid_obst_x_range = (origin[0]-bay_half_len+2, origin[0]+bay_half_len-2)
     valid_obst_y_range = (para_PARK_WALL_DIST+max_obstacle_y+2, para_PARK_WALL_DIST+max_obstacle_y+6)
@@ -429,11 +503,11 @@ def generate_parallel_parking_case(map_level):
         for obs in obstacles:
             ax.add_patch(plt.Polygon(xy=list(obs.coords), color='gray'))
 
-    
+
     # generate start position
     start_box_valid = False
     valid_start_x_range = (origin[0]-bay_half_len/2, origin[0]+bay_half_len/2)
-    
+
     if map_level == 'Complex':
         valid_start_y_range = (max_obstacle_y+1, max_obstacle_y+1 + (para_PARK_WALL_DIST-1)*0.6)
     elif map_level == 'Extrem':
@@ -445,7 +519,7 @@ def generate_parallel_parking_case(map_level):
         start_box_valid = True
         start_x = random_uniform_num(*valid_start_x_range)
         start_y = random_uniform_num(*valid_start_y_range)
-        
+
         if map_level == 'Complex':
             base_yaw = dest_yaw - pi/2
             if random() < 0.5:
@@ -457,7 +531,7 @@ def generate_parallel_parking_case(map_level):
         else:
             start_yaw = random_gaussian_num(0, pi/6, -pi/2, pi/2)
             start_yaw = start_yaw+pi if random()<0.5 else start_yaw
-        
+
         start_state = State([start_x, start_y, start_yaw, 0, 0])
         start_boxes = start_state.create_box()
         # check collision
@@ -469,7 +543,7 @@ def generate_parallel_parking_case(map_level):
                     start_box_valid = False
                     break
             if not start_box_valid: break
-            
+
         # check overlap with dest box
         if start_box_valid:
             dest_state = State([dest_x, dest_y, dest_yaw, 0, 0])
@@ -482,8 +556,8 @@ def generate_parallel_parking_case(map_level):
                         start_box_valid = False
                         break
                 if not start_box_valid: break
-    
-    
+
+
     # flip the dest box so that the orientation of start matches the dest
     if cos(start_yaw)<0:
         dest_box_center = np.mean(np.array(dest_box.coords[:-1]), axis=0)
@@ -495,18 +569,23 @@ def generate_parallel_parking_case(map_level):
     for obs in obstacles:
         if random()<DROUP_OUT_OBST:
             obstacles.remove(obs)
-    
+
     if DEBUG:
         ax.add_patch(plt.Polygon(xy=list(State([start_x, start_y, start_yaw, 0, 0]).create_box()[0].coords), color='g'))
         print(generate_success)
         plt.show()
-    
+
     if generate_success:
         return [start_x, start_y, start_yaw], [dest_x, dest_y, dest_yaw], obstacles
     else:
         return generate_parallel_parking_case(map_level)
 
-def generate_navigation_case(map_level, return_regions: bool = False):
+def _generate_navigation_case_once(
+    map_level,
+    return_regions: bool = False,
+    _retry_idx: int = 0,
+    _failure_counts=None,
+):
     """Generate a closed irregular plaza + 1-2 corridors navigation case.
 
     Spec implemented:
@@ -827,6 +906,219 @@ def generate_navigation_case(map_level, return_regions: bool = False):
 
         return False
 
+    def _retry_generation(reason: str):
+        if bool(NAVIGATION_ALLOW_LAST_RESORT):
+            return None
+        if _failure_counts is not None:
+            key = str(reason)
+            _failure_counts[key] = int(_failure_counts.get(key, 0)) + 1
+        raise _NavigationGenerationRetry(reason)
+
+    def _scene_filter_threshold(level_name: str, threshold_dict, default_value: float):
+        return float(threshold_dict.get(str(level_name), default_value))
+
+    def _grid_path_stats(region, clearance_region, start_xy, goal_xy, resolution: float = 0.6):
+        if region is None or region.is_empty or clearance_region is None or clearance_region.is_empty:
+            return None
+
+        try:
+            region_prep = prep(region)
+        except Exception:
+            region_prep = None
+
+        sx, sy = float(start_xy[0]), float(start_xy[1])
+        gx, gy = float(goal_xy[0]), float(goal_xy[1])
+        direct_distance = float(np.hypot(gx - sx, gy - sy))
+        if direct_distance <= 1e-6:
+            return None
+
+        if region_prep is not None:
+            if not region_prep.contains(Point(sx, sy)) or not region_prep.contains(Point(gx, gy)):
+                return None
+        else:
+            if not region.contains(Point(sx, sy)) or not region.contains(Point(gx, gy)):
+                return None
+
+        xmin, ymin, xmax, ymax = region.bounds
+        xmin = float(max(xmin, WORLD_MIN))
+        ymin = float(max(ymin, WORLD_MIN))
+        xmax = float(min(xmax, WORLD_MAX))
+        ymax = float(min(ymax, WORLD_MAX))
+        if xmax <= xmin or ymax <= ymin:
+            return None
+
+        nx = int(np.ceil((xmax - xmin) / resolution))
+        ny = int(np.ceil((ymax - ymin) / resolution))
+        if nx <= 1 or ny <= 1:
+            return None
+
+        def _to_idx(x, y):
+            ix = int(np.clip(np.floor((x - xmin) / resolution), 0, nx - 1))
+            iy = int(np.clip(np.floor((y - ymin) / resolution), 0, ny - 1))
+            return ix, iy
+
+        def _center(ix, iy):
+            return (xmin + (ix + 0.5) * resolution, ymin + (iy + 0.5) * resolution)
+
+        def _free(ix, iy):
+            cx, cy = _center(ix, iy)
+            pt = Point(float(cx), float(cy))
+            if region_prep is not None:
+                return bool(region_prep.contains(pt))
+            return bool(region.contains(pt))
+
+        start_idx = _to_idx(sx, sy)
+        goal_idx = _to_idx(gx, gy)
+        nbrs = [
+            (-1, 0, 1.0),
+            (1, 0, 1.0),
+            (0, -1, 1.0),
+            (0, 1, 1.0),
+            (-1, -1, np.sqrt(2.0)),
+            (-1, 1, np.sqrt(2.0)),
+            (1, -1, np.sqrt(2.0)),
+            (1, 1, np.sqrt(2.0)),
+        ]
+
+        if not _free(*start_idx) or not _free(*goal_idx):
+            return None
+
+        def _heuristic(a, b):
+            return float(np.hypot(float(a[0] - b[0]), float(a[1] - b[1])))
+
+        open_heap = []
+        heapq.heappush(open_heap, (_heuristic(start_idx, goal_idx), 0.0, start_idx))
+        parent = {start_idx: None}
+        g_cost = {start_idx: 0.0}
+        visits = 0
+
+        while open_heap:
+            _, g_now, cur = heapq.heappop(open_heap)
+            if cur == goal_idx:
+                path_idx = []
+                node = cur
+                while node is not None:
+                    path_idx.append(node)
+                    node = parent[node]
+                path_idx.reverse()
+
+                path_points = np.array([_center(ix, iy) for ix, iy in path_idx], dtype=np.float64)
+                if len(path_points) < 2:
+                    return None
+
+                seg = np.linalg.norm(path_points[1:] - path_points[:-1], axis=1)
+                path_length = float(np.sum(seg))
+                try:
+                    clearance_boundary = clearance_region.boundary
+                    min_clearance = min(
+                        float(Point(float(pt[0]), float(pt[1])).distance(clearance_boundary))
+                        for pt in path_points
+                    )
+                except Exception:
+                    min_clearance = 0.0
+
+                return {
+                    'path_length': path_length,
+                    'direct_distance': direct_distance,
+                    'path_ratio': path_length / max(direct_distance, 1e-6),
+                    'path_min_clearance': float(min_clearance),
+                }
+
+            if g_now > g_cost.get(cur, 1e18) + 1e-12:
+                continue
+
+            ix, iy = cur
+            for dx, dy, cost in nbrs:
+                jx = ix + dx
+                jy = iy + dy
+                if jx < 0 or jx >= nx or jy < 0 or jy >= ny:
+                    continue
+                nxt = (jx, jy)
+                if not _free(jx, jy):
+                    continue
+                ng = g_now + float(cost)
+                if ng + 1e-12 < g_cost.get(nxt, 1e18):
+                    g_cost[nxt] = ng
+                    parent[nxt] = cur
+                    heapq.heappush(open_heap, (ng + _heuristic(nxt, goal_idx), ng, nxt))
+                visits += 1
+                if visits >= 120000:
+                    return None
+
+        return None
+
+    def _pose_box_clearance(pose_xyz, blocking_poly) -> float:
+        try:
+            st = State([pose_xyz[0], pose_xyz[1], pose_xyz[2], 0, 0])
+            return float(min(float(box.distance(blocking_poly)) for box in st.create_box()))
+        except Exception:
+            return 0.0
+
+    def _scene_metrics_for_pair(level_name: str, free_region, nav_region, blocking_poly, s_pose, d_pose):
+        path_stats = _grid_path_stats(nav_region, free_region, (s_pose[0], s_pose[1]), (d_pose[0], d_pose[1]), resolution=0.6)
+        if path_stats is None:
+            return None
+
+        start_clearance = _pose_box_clearance(s_pose, blocking_poly)
+        dest_clearance = _pose_box_clearance(d_pose, blocking_poly)
+        heading_diff_deg = float(np.rad2deg(_abs_angle_diff(float(s_pose[2]), float(d_pose[2]))))
+
+        return {
+            'level': str(level_name),
+            'path_length': float(path_stats['path_length']),
+            'direct_distance': float(path_stats['direct_distance']),
+            'path_ratio': float(path_stats['path_ratio']),
+            'path_min_clearance': float(path_stats['path_min_clearance']),
+            'bottleneck_width': float(2.0 * path_stats['path_min_clearance']),
+            'heading_diff_deg': heading_diff_deg,
+            'start_endpoint_clearance': float(start_clearance),
+            'dest_endpoint_clearance': float(dest_clearance),
+            'min_endpoint_clearance': float(min(start_clearance, dest_clearance)),
+        }
+
+    def _scene_metrics_pass(level_name: str, metrics) -> bool:
+        if metrics is None:
+            return False
+
+        max_path_ratio = _scene_filter_threshold(
+            level_name,
+            NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL,
+            3.0,
+        )
+        min_path_clearance = _scene_filter_threshold(
+            level_name,
+            NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL,
+            1.2,
+        )
+        min_endpoint_clearance = _scene_filter_threshold(
+            level_name,
+            NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
+            0.7,
+        )
+        tight_turn_heading = _scene_filter_threshold(
+            level_name,
+            NAVIGATION_TIGHT_TURN_HEADING_DEG_BY_LEVEL,
+            140.0,
+        )
+        tight_turn_endpoint_clearance = _scene_filter_threshold(
+            level_name,
+            NAVIGATION_TIGHT_TURN_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
+            0.9,
+        )
+
+        if float(metrics['path_ratio']) > max_path_ratio:
+            return False
+        if float(metrics['path_min_clearance']) < min_path_clearance:
+            return False
+        if float(metrics['min_endpoint_clearance']) < min_endpoint_clearance:
+            return False
+        if (
+            float(metrics['heading_diff_deg']) >= tight_turn_heading
+            and float(metrics['min_endpoint_clearance']) < tight_turn_endpoint_clearance
+        ):
+            return False
+        return True
+
     def _sample_pose_near_edge(poly: Polygon, avoid_poly: Polygon = None, head_dist: float = 1.0, max_tries: int = 2000):
         """Sample a pose inside poly, close to an edge.
 
@@ -865,6 +1157,123 @@ def generate_navigation_case(map_level, return_regions: bool = False):
             return [float(loc[0]), float(loc[1]), heading]
 
         raise RuntimeError("Failed to sample pose near edge")
+
+    def _sample_pose_on_edge(
+        poly: Polygon,
+        edge_info: dict,
+        avoid_poly: Polygon = None,
+        head_dist: float = 1.0,
+        max_tries: int = 300,
+        blocking_poly=None,
+        require_blocking: bool = False,
+    ):
+        """Sample a pose near a specified edge instead of re-picking a random edge."""
+        poly = _as_polygon(poly)
+        if poly is None or poly.is_empty:
+            raise RuntimeError("poly is empty")
+        if edge_info is None:
+            raise RuntimeError("edge_info is empty")
+
+        p1 = np.array(edge_info["p1"], dtype=float)
+        p2 = np.array(edge_info["p2"], dtype=float)
+        outward = _unit(np.array(edge_info["outward"], dtype=float))
+        inward = _unit(np.array(edge_info["inward"], dtype=float))
+
+        for _ in range(int(max_tries)):
+            t = float(random_uniform_num(0.2, 0.8))
+            boundary_pt = (1.0 - t) * p1 + t * p2
+
+            if require_blocking:
+                if blocking_poly is None:
+                    raise RuntimeError("blocking_poly is required when require_blocking=True")
+                probe = Point(float(boundary_pt[0] + outward[0] * 0.4), float(boundary_pt[1] + outward[1] * 0.4))
+                try:
+                    if (not blocking_poly.contains(probe)) and (not blocking_poly.intersects(probe)):
+                        continue
+                except Exception:
+                    continue
+
+            heading = float(np.arctan2(outward[1], outward[0]))
+            loc = boundary_pt - outward * float(head_dist + FRONT_HANG + 0.2)
+            pt_loc = Point(float(loc[0]), float(loc[1]))
+            if not poly.contains(pt_loc):
+                continue
+            if avoid_poly is not None and avoid_poly.contains(pt_loc):
+                continue
+
+            # Use inward only to validate the cached edge normal remains consistent.
+            inward_probe = Point(float(boundary_pt[0] + inward[0] * 0.25), float(boundary_pt[1] + inward[1] * 0.25))
+            try:
+                if not poly.buffer(1e-9).contains(inward_probe):
+                    continue
+            except Exception:
+                continue
+
+            return [float(loc[0]), float(loc[1]), heading]
+
+        raise RuntimeError("Failed to sample pose on edge")
+
+    def _collect_blocking_edge_candidates(
+        poly: Polygon,
+        blocking_poly,
+        min_edge_len: float = None,
+        max_tries_per_edge: int = 4,
+    ):
+        """Enumerate boundary edges that can host a near-wall pose facing a blocking wall.
+
+        For plaza sampling, this filters out corridor-mouth edges while keeping the scene geometry unchanged.
+        """
+        poly = _as_polygon(poly)
+        if poly is None or poly.is_empty:
+            return []
+
+        if min_edge_len is None:
+            min_edge_len = float(max(3.0, WIDTH + 0.8))
+
+        coords = list(poly.exterior.coords)
+        edges = []
+        for i in range(max(0, len(coords) - 1)):
+            p1 = np.array(coords[i], dtype=float)
+            p2 = np.array(coords[i + 1], dtype=float)
+            seg = p2 - p1
+            seg_len = float(np.linalg.norm(seg))
+            if seg_len < float(min_edge_len):
+                continue
+
+            inward, outward = _edge_normals(poly, p1, p2)
+            edge_info = {
+                'edge_id': int(i),
+                'p1': p1,
+                'p2': p2,
+                'length': seg_len,
+                'inward': inward,
+                'outward': outward,
+                'poly_label': 'plaza',
+                'poly_index': 0,
+            }
+
+            is_valid = False
+            for t in np.linspace(0.25, 0.75, int(max(2, max_tries_per_edge))):
+                boundary_pt = (1.0 - float(t)) * p1 + float(t) * p2
+                probe = Point(float(boundary_pt[0] + outward[0] * 0.4), float(boundary_pt[1] + outward[1] * 0.4))
+                try:
+                    if (not blocking_poly.contains(probe)) and (not blocking_poly.intersects(probe)):
+                        continue
+                except Exception:
+                    continue
+
+                loc = boundary_pt - outward * float(1.0 + FRONT_HANG + 0.2)
+                try:
+                    if poly.contains(Point(float(loc[0]), float(loc[1]))):
+                        is_valid = True
+                        break
+                except Exception:
+                    continue
+
+            if is_valid:
+                edges.append(edge_info)
+
+        return edges
 
     def _sample_pose_near_edge_facing_blocking(
         poly: Polygon,
@@ -1209,9 +1618,21 @@ def generate_navigation_case(map_level, return_regions: bool = False):
     except Exception:
         mouth_exclusion = None
 
-    def _sample_in_plaza():
+    def _sample_in_plaza(edge_catalog=None, return_edge: bool = False):
         for _ in range(2000):
-            pose = _sample_pose_near_edge(plaza, avoid_poly=None, head_dist=1.0)
+            edge_info = None
+            if edge_catalog:
+                edge_info = edge_catalog[int(np.random.randint(0, len(edge_catalog)))]
+                pose = _sample_pose_on_edge(
+                    plaza,
+                    edge_info,
+                    avoid_poly=None,
+                    head_dist=1.0,
+                    blocking_poly=blocking,
+                    require_blocking=True,
+                )
+            else:
+                pose = _sample_pose_near_edge(plaza, avoid_poly=None, head_dist=1.0)
             # Prevent plaza slots from being generated at corridor mouths.
             if mouth_exclusion is not None and (not mouth_exclusion.is_empty):
                 try:
@@ -1220,8 +1641,41 @@ def generate_navigation_case(map_level, return_regions: bool = False):
                 except Exception:
                     pass
             if _pose_is_collision_free(pose):
+                if return_edge:
+                    return pose, edge_info
                 return pose
         raise RuntimeError("Failed to sample collision-free plaza pose")
+
+    def _sample_normal_pair(edge_catalog=None):
+        if not edge_catalog:
+            s = _sample_in_plaza()
+            d = _sample_in_plaza()
+            return s, None, d, None
+
+        n_edges = len(edge_catalog)
+        start_order = list(np.random.permutation(n_edges))
+        for s_idx in start_order:
+            s_edge = edge_catalog[int(s_idx)]
+            try:
+                s, _ = _sample_in_plaza(edge_catalog=[s_edge], return_edge=True)
+            except Exception:
+                continue
+
+            diff_dest_order = [int(idx) for idx in np.random.permutation(n_edges) if int(idx) != int(s_idx)]
+            same_dest_order = [int(s_idx)]
+            dest_order = diff_dest_order + same_dest_order
+            for d_idx in dest_order:
+                d_edge = edge_catalog[int(d_idx)]
+                for _ in range(8):
+                    try:
+                        d, _ = _sample_in_plaza(edge_catalog=[d_edge], return_edge=True)
+                    except Exception:
+                        break
+
+                    if _pair_satisfy_constraints(s, d):
+                        return s, s_edge, d, d_edge
+
+        raise RuntimeError("Failed to sample Normal pair from plaza edges")
 
     def _sample_in_corridor():
         if len(corridors) == 0:
@@ -1299,9 +1753,9 @@ def generate_navigation_case(map_level, return_regions: bool = False):
     def _difficulty_constraints(level: str):
         # Match `src/debug/check_navigation_difficulty.py`
         if level == "Normal":
-            return (0.0, 30.0), (0.0, 45.0)
+            return (0.0, 60.0), (0.0, 180.0)
         if level == "Complex":
-            return (30.0, 50.0), (45.0, 90.0)
+            return (30.0, 70.0), (0.0, 180.0)
         if level == "Extrem":
             return (50.0, None), (60.0, 180.0)
         # Default: no constraints
@@ -1330,6 +1784,10 @@ def generate_navigation_case(map_level, return_regions: bool = False):
     # Approximate clearance for reachability checks (vehicle width + tiny margin)
     reach_clearance = float(WIDTH / 2.0 + 0.2)
 
+    start_support_edge_meta = None
+    dest_support_edge_meta = None
+    scene_metrics = None
+
     for _wall_attempt in range(36):
         # Resample walls (fixed count)
         inner_walls = _sample_inner_walls(plaza, [])
@@ -1353,14 +1811,17 @@ def generate_navigation_case(map_level, return_regions: bool = False):
             start, dest = None, None
             continue
 
+        normal_plaza_edges = None
+        if map_level == 'Normal':
+            normal_plaza_edges = _collect_blocking_edge_candidates(plaza, blocking)
+
         # Sample poses with updated collision constraints.
         # Enforce difficulty constraints by resampling start/dest until satisfied.
         start, dest = None, None
         for _pose_attempt in range(500):
             try:
                 if map_level == 'Normal':
-                    s = _sample_in_plaza()
-                    d = _sample_in_plaza()
+                    s, s_edge_meta, d, d_edge_meta = _sample_normal_pair(edge_catalog=normal_plaza_edges)
                 elif map_level == 'Complex':
                     if random() < 0.5:
                         s = _sample_in_plaza()
@@ -1369,20 +1830,21 @@ def generate_navigation_case(map_level, return_regions: bool = False):
                         s = _sample_in_corridor()
                         d = _sample_in_plaza()
                 else:  # Extrem
-                    if random() < 0.5:
-                        s = _sample_in_plaza()
-                        d = _sample_in_corridor()
-                    else:
-                        s = _sample_in_corridor()
-                        d = _sample_in_plaza()
+                    s = _sample_in_corridor()
+                    d = _sample_in_corridor()
             except Exception:
                 continue
 
             if not _pair_satisfy_constraints(s, d):
                 continue
 
-            if _grid_reachable(nav_region, (s[0], s[1]), (d[0], d[1]), resolution=0.6):
+            candidate_metrics = _scene_metrics_for_pair(str(map_level), free_region, nav_region, blocking, s, d)
+            if _scene_metrics_pass(str(map_level), candidate_metrics):
                 start, dest = s, d
+                scene_metrics = candidate_metrics
+                if map_level == 'Normal':
+                    start_support_edge_meta = s_edge_meta
+                    dest_support_edge_meta = d_edge_meta
                 break
 
         if start is not None and dest is not None:
@@ -1402,8 +1864,8 @@ def generate_navigation_case(map_level, return_regions: bool = False):
         for _pose_attempt in range(700):
             try:
                 if map_level == 'Normal':
-                    s = _sample_in_plaza()
-                    d = _sample_in_plaza()
+                    normal_plaza_edges = _collect_blocking_edge_candidates(plaza, blocking)
+                    s, s_edge_meta, d, d_edge_meta = _sample_normal_pair(edge_catalog=normal_plaza_edges)
                 elif map_level == 'Complex':
                     if random() < 0.5:
                         s = _sample_in_plaza()
@@ -1412,42 +1874,27 @@ def generate_navigation_case(map_level, return_regions: bool = False):
                         s = _sample_in_corridor()
                         d = _sample_in_plaza()
                 else:
-                    if random() < 0.5:
-                        s = _sample_in_plaza()
-                        d = _sample_in_corridor()
-                    else:
-                        s = _sample_in_corridor()
-                        d = _sample_in_plaza()
+                    s = _sample_in_corridor()
+                    d = _sample_in_corridor()
             except Exception:
                 continue
 
             if not _pair_satisfy_constraints(s, d):
                 continue
 
-            if nav_region is None or nav_region.is_empty or _grid_reachable(nav_region, (s[0], s[1]), (d[0], d[1]), resolution=0.6):
+            candidate_metrics = _scene_metrics_for_pair(str(map_level), free_region, nav_region, blocking, s, d)
+            if _scene_metrics_pass(str(map_level), candidate_metrics):
                 start, dest = s, d
+                scene_metrics = candidate_metrics
+                if map_level == 'Normal':
+                    start_support_edge_meta = s_edge_meta
+                    dest_support_edge_meta = d_edge_meta
                 break
 
         if start is None or dest is None:
-            # Absolute last resort: return a pair even if constraints can't be met.
-            # (Should be extremely rare; mainly prevents hard failures in production.)
-            if map_level == 'Normal':
-                start = _sample_in_plaza()
-                dest = _sample_in_plaza()
-            elif map_level == 'Complex':
-                if random() < 0.5:
-                    start = _sample_in_plaza()
-                    dest = _sample_in_corridor()
-                else:
-                    start = _sample_in_corridor()
-                    dest = _sample_in_plaza()
-            else:
-                if random() < 0.5:
-                    start = _sample_in_plaza()
-                    dest = _sample_in_corridor()
-                else:
-                    start = _sample_in_corridor()
-                    dest = _sample_in_plaza()
+            retried = _retry_generation("pair sampling exhausted after dropping inner walls")
+            if retried is not None:
+                return retried
 
     # Build slot-like divider walls near start/dest.
     # Divider walls are perpendicular to the nearby straight wall edge,
@@ -1486,10 +1933,10 @@ def generate_navigation_case(map_level, return_regions: bool = False):
         if best_hit is None:
             return None
 
-        boundary_polys = [plaza] + [c for c in corridors]
+        boundary_polys = [('plaza', 0, plaza)] + [('corridor', idx, c) for idx, c in enumerate(corridors)]
         best = None
         best_dist = None
-        for poly_raw in boundary_polys:
+        for poly_label, poly_index, poly_raw in boundary_polys:
             poly = _as_polygon(poly_raw)
             if poly is None or poly.is_empty:
                 continue
@@ -1513,6 +1960,9 @@ def generate_navigation_case(map_level, return_regions: bool = False):
                         's': s,
                         'len': seg_len,
                         'inward': inward,
+                        'edge_id': int(i),
+                        'poly_label': poly_label,
+                        'poly_index': int(poly_index),
                     }
                     best_dist = d
         return best
@@ -1535,9 +1985,9 @@ def generate_navigation_case(map_level, return_regions: bool = False):
         if map_level == 'Normal':
             divider_depth = float(LENGTH / 2.0)
         elif map_level == 'Complex':
-            divider_depth = float(3.0 * LENGTH / 4.0)
+            divider_depth = float(LENGTH / 2.0 )
         else:  # Extrem
-            divider_depth = float(1.2 * LENGTH)
+            divider_depth = float(max(WIDTH + 1.0, 0.6 * LENGTH))
         max_per_side = 4
 
         s_values = []
@@ -1554,41 +2004,61 @@ def generate_navigation_case(map_level, return_regions: bool = False):
         s_values = sorted(set([round(v, 3) for v in s_values]), key=lambda x: abs(float(x) - s0))
         divider_pairs = []
 
-        for s in s_values:
-            q = p1 + t * float(s)
-            q2 = q + inward * divider_depth
+        def _try_make_divider(s_along: float, depth: float):
+            q = p1 + t * float(s_along)
+            q2 = q + inward * float(depth)
             w = _segment_wall_poly(q, q2, INNER_WALL_THICKNESS)
             if w is None or w.is_empty:
-                continue
+                return None
             try:
                 w = w.intersection(drivable).buffer(0)
             except Exception:
-                continue
+                return None
             if w.is_empty or float(w.area) < 0.3:
-                continue
+                return None
 
-            # Keep start/dest collision free.
-            invalid = False
             for box in occupied_boxes:
                 try:
                     if w.intersects(box):
-                        invalid = True
-                        break
+                        return None
                 except Exception:
-                    invalid = True
-                    break
-            if invalid:
-                continue
+                    return None
 
             if len(divider_pairs) > 0:
                 try:
                     u = unary_union([it[1] for it in divider_pairs]).buffer(0)
                     if float(w.intersection(u).area) > 0.25 * float(w.area):
-                        continue
+                        return None
                 except Exception:
                     pass
+            return w
 
-            divider_pairs.append((abs(float(s) - s0), w))
+        for s in s_values:
+            w = _try_make_divider(float(s), divider_depth)
+            if w is not None:
+                divider_pairs.append((abs(float(s) - s0), w))
+
+        if len(divider_pairs) == 0:
+            relaxed_pitch = float(max(WIDTH + 0.65, slot_pitch * 0.72))
+            relaxed_margin = float(max(0.4, edge_margin * 0.5))
+            relaxed_depths = [
+                divider_depth,
+                float(max(WIDTH + 0.8, divider_depth * 0.8)),
+                float(max(WIDTH + 0.6, divider_depth * 0.6)),
+            ]
+            fallback_s = []
+            for sign in (-1.0, 1.0):
+                target_s = float(np.clip(s0 + sign * relaxed_pitch, relaxed_margin, seg_len - relaxed_margin))
+                if relaxed_margin <= target_s <= (seg_len - relaxed_margin):
+                    fallback_s.append(target_s)
+
+            for depth in relaxed_depths:
+                for s in fallback_s:
+                    w = _try_make_divider(float(s), depth)
+                    if w is not None:
+                        divider_pairs.append((abs(float(s) - s0), w))
+                if len(divider_pairs) > 0:
+                    break
 
         divider_pairs.sort(key=lambda x: x[0])
         return [it[1] for it in divider_pairs]
@@ -1596,48 +2066,50 @@ def generate_navigation_case(map_level, return_regions: bool = False):
     pose_boxes = _build_pose_boxes(start) + _build_pose_boxes(dest)
     start_slot_walls = _build_divider_walls_for_pose(start, pose_boxes)
     dest_slot_walls = _build_divider_walls_for_pose(dest, pose_boxes)
-    slot_walls = list(start_slot_walls) + list(dest_slot_walls)
 
     # Global minimum gap between divider walls to avoid over-narrow parking slots.
     min_wall_gap = float(max(1.8, WIDTH - 0.1))
-    filtered_slot_walls = []
-    for w in slot_walls:
-        too_close = False
-        for ww in filtered_slot_walls:
-            try:
-                if float(w.distance(ww)) < min_wall_gap:
-                    too_close = True
-                    break
-            except Exception:
-                continue
-        if not too_close:
-            filtered_slot_walls.append(w)
-    slot_walls = filtered_slot_walls
+    def _filter_divider_walls(walls_in: list):
+        filtered = []
+        for w in walls_in:
+            too_close = False
+            for ww in filtered:
+                try:
+                    if float(w.distance(ww)) < min_wall_gap:
+                        too_close = True
+                        break
+                except Exception:
+                    continue
+            if not too_close:
+                filtered.append(w)
+        return filtered
 
-    if len(slot_walls) > 0:
-        # Try full walls first, then relaxed set (nearest pair for each pose), then none.
-        candidate_sets = [
-            slot_walls,
-            list(start_slot_walls[:2]) + list(dest_slot_walls[:2]),
-            [],
-        ]
-        inner_walls = []
-        for cand in candidate_sets:
-            try:
-                trial_nav = drivable
-                if len(cand) > 0:
-                    trial_nav = trial_nav.difference(unary_union(cand)).buffer(0)
-                trial_nav = trial_nav.buffer(-reach_clearance).buffer(0)
-            except Exception:
-                continue
+    start_slot_walls = _filter_divider_walls(list(start_slot_walls))
+    dest_slot_walls = _filter_divider_walls(list(dest_slot_walls))
+    slot_walls = list(start_slot_walls) + list(dest_slot_walls)
 
-            if trial_nav is None or trial_nav.is_empty:
-                continue
-            if _grid_reachable(trial_nav, (start[0], start[1]), (dest[0], dest[1]), resolution=0.6):
-                inner_walls = list(cand)
-                break
-    else:
-        inner_walls = []
+    # Divider walls are mandatory for all scene levels.
+    # If either side cannot keep its dividers after filtering, regenerate the whole scene.
+    if len(start_slot_walls) == 0 or len(dest_slot_walls) == 0:
+        retried = _retry_generation("divider walls degenerated for start/dest")
+        if retried is not None:
+            return retried
+
+    inner_walls = list(slot_walls)
+    try:
+        trial_free = drivable.difference(unary_union(inner_walls)).buffer(0)
+        trial_nav = trial_free.buffer(-reach_clearance).buffer(0)
+        trial_blocking = unary_union(walls + [solid_fill] + list(inner_walls)).buffer(0)
+    except Exception:
+        trial_free = None
+        trial_nav = None
+        trial_blocking = None
+
+    trial_metrics = _scene_metrics_for_pair(str(map_level), trial_free, trial_nav, trial_blocking, start, dest)
+    if trial_metrics is None:
+        retried = _retry_generation("divider walls make scene unreachable")
+        if retried is not None:
+            return retried
 
     try:
         blocking = unary_union(walls + [solid_fill] + list(inner_walls)).buffer(0)
@@ -1645,19 +2117,123 @@ def generate_navigation_case(map_level, return_regions: bool = False):
         blocking = unary_union(walls + [solid_fill]).buffer(0)
         inner_walls = []
 
+    try:
+        final_free_region = drivable
+        if len(inner_walls) > 0:
+            final_free_region = final_free_region.difference(unary_union(inner_walls)).buffer(0)
+        final_nav_region = final_free_region.buffer(-reach_clearance).buffer(0)
+    except Exception:
+        final_free_region = None
+        final_nav_region = None
+
+    final_metrics = _scene_metrics_for_pair(
+        str(map_level),
+        final_free_region,
+        final_nav_region,
+        blocking,
+        start,
+        dest,
+    )
+    if final_metrics is None:
+        retried = _retry_generation("final scene with divider walls is unreachable")
+        if retried is not None:
+            return retried
+
     # Return obstacles list (shapely geometries): walls + solid fill + inner walls.
-    obstacles = walls + [solid_fill] + list(inner_walls)
+    static_obstacles = walls + [solid_fill]
+    dynamic_obstacles = list(inner_walls)
+    obstacles = static_obstacles + dynamic_obstacles
+    guidance_path_points = None
+    guidance_occupancy_payload = None
+    if return_regions and ENABLE_GLOBAL_SOFT_GUIDANCE and bool(NAVIGATION_REQUIRE_GUIDANCE_SUCCESS):
+        guidance_path_points, guidance_occupancy_payload = _plan_guidance_path_for_scene(
+            obstacles,
+            start,
+            dest,
+            static_obstacles=static_obstacles,
+            dynamic_obstacles=dynamic_obstacles,
+        )
+        if guidance_path_points is None:
+            retried = _retry_generation("exact guidance planner rejected final scene")
+            if retried is not None:
+                return retried
+
+    if start_support_edge_meta is None and start is not None:
+        start_support_edge_meta = _find_pose_support_edge(start)
+    if dest_support_edge_meta is None and dest is not None:
+        dest_support_edge_meta = _find_pose_support_edge(dest)
     if return_regions:
         return start, dest, obstacles, {
             'plaza': plaza,
             'corridors': corridors,
             'drivable': drivable,
+            'start_support_edge': start_support_edge_meta,
+            'dest_support_edge': dest_support_edge_meta,
+            'scene_metrics': scene_metrics,
+            'divider_scene_metrics': final_metrics,
+            'guidance_path_points': guidance_path_points,
+            'guidance_occupancy_payload': guidance_occupancy_payload,
+            'guidance_static_obstacles': list(static_obstacles),
+            'guidance_dynamic_obstacles': list(dynamic_obstacles),
+            'guidance_static_obstacle_signature': (
+                None if guidance_occupancy_payload is None else guidance_occupancy_payload.get('static_obstacle_signature')
+            ),
+            'guidance_dynamic_obstacle_signature': (
+                None if guidance_occupancy_payload is None else guidance_occupancy_payload.get('dynamic_obstacle_signature')
+            ),
+            'start_divider_wall_count': len(start_slot_walls),
+            'dest_divider_wall_count': len(dest_slot_walls),
+            'divider_wall_count': len(inner_walls),
+            'generation_attempt_index': int(_retry_idx),
+            'generation_attempts_used': int(_retry_idx) + 1,
+            'generation_retry_count': int(_retry_idx),
+            'generation_retry_reasons': dict(_failure_counts or {}),
         }
     return start, dest, obstacles
 
 
+def generate_navigation_case(map_level, return_regions: bool = False, _retry_idx: int = 0):
+    max_attempts = int(max(1, NAVIGATION_GENERATION_MAX_SCENE_ATTEMPTS))
+    start_attempt = int(max(0, _retry_idx))
+    failure_counts = {}
+    last_reason = None
+
+    for attempt_idx in range(start_attempt, max_attempts):
+        try:
+            return _generate_navigation_case_once(
+                map_level,
+                return_regions=return_regions,
+                _retry_idx=attempt_idx,
+                _failure_counts=failure_counts,
+            )
+        except _NavigationGenerationRetry as exc:
+            last_reason = exc.reason
+            continue
+
+    if bool(NAVIGATION_ALLOW_LAST_RESORT):
+        return _generate_navigation_case_once(
+            map_level,
+            return_regions=return_regions,
+            _retry_idx=max_attempts - 1,
+            _failure_counts=failure_counts,
+        )
+
+    detail = f" retry_stats={failure_counts}" if failure_counts else ""
+    raise RuntimeError(
+        f"Failed to generate a filtered navigation scene for {map_level}: {last_reason or 'unknown reason'}{detail}"
+    )
+
+
 class ParkingMapNormal(object):
-    def __init__(self, map_level=MAP_LEVEL):
+    def __init__(
+        self,
+        map_level=MAP_LEVEL,
+        enable_scene_pool: bool = NAVIGATION_SCENE_POOL_ENABLE,
+        scene_pool_size: int = _DEFAULT_SCENE_POOL_SIZE,
+        prefill_on_init: bool = NAVIGATION_SCENE_POOL_PREFILL_ON_INIT,
+        refill_low_watermark: int = NAVIGATION_SCENE_POOL_LOW_WATERMARK,
+        refill_batch_size: int = NAVIGATION_SCENE_POOL_REFILL_BATCH_SIZE,
+    ):
 
         self.case_id:int = None
         self.map_level = map_level
@@ -1669,37 +2245,161 @@ class ParkingMapNormal(object):
         self.ymin, self.ymax = 0, 0
         self.n_obstacle = 0
         self.obstacles:List[Area] = []
+        self.scene_regions = None
+        self.scene_metrics = None
+        self.guidance_path_points = None
+        self.guidance_occupancy_payload = None
+        self.guidance_static_obstacles = None
+        self.guidance_dynamic_obstacles = None
+        self.guidance_static_obstacle_signature = None
+        self.guidance_dynamic_obstacle_signature = None
+        self.enable_scene_pool = bool(enable_scene_pool)
+        self.scene_pool_size = int(max(0, scene_pool_size))
+        self.prefill_on_init = bool(prefill_on_init)
+        self.refill_low_watermark = int(max(-1, refill_low_watermark))
+        self.refill_batch_size = int(max(1, refill_batch_size))
+        self._scene_pool = deque()
+        self._scene_pool_stats = {
+            'pool_hits': 0,
+            'pool_misses': 0,
+            'refills': 0,
+            'prefill_refills': 0,
+            'top_up_refills': 0,
+            'generated_scenes': 0,
+            'prefill_generated': 0,
+            'top_up_generated': 0,
+            'consumed_scenes': 0,
+            'direct_generations': 0,
+        }
+
+        if self._scene_pool_enabled() and self.prefill_on_init:
+            self._fill_scene_pool(self.scene_pool_size, reason='prefill')
+
+    def _scene_pool_enabled(self) -> bool:
+        return bool(self.enable_scene_pool) and int(self.scene_pool_size) > 0
+
+    def _generate_scene_snapshot(self):
+        start, dest, obstacles, scene_meta = generate_navigation_case(self.map_level, return_regions=True)
+        return {
+            'start': list(start),
+            'dest': list(dest),
+            'obstacles': list(obstacles),
+            'scene_meta': scene_meta,
+        }
+
+    def _scene_pool_target_size(self, reason: str = 'miss', explicit_target: int = None) -> int:
+        if explicit_target is not None:
+            return int(max(0, explicit_target))
+        if reason == 'top_up':
+            return int(max(0, min(self.scene_pool_size, len(self._scene_pool) + self.refill_batch_size)))
+        return int(max(0, self.scene_pool_size))
+
+    def _should_top_up_scene_pool(self) -> bool:
+        if not self._scene_pool_enabled():
+            return False
+        if int(self.refill_low_watermark) < 0:
+            return False
+        return len(self._scene_pool) <= int(self.refill_low_watermark)
+
+    def _fill_scene_pool(self, target_size: int = None, reason: str = 'miss'):
+        if not self._scene_pool_enabled():
+            return
+
+        target_size = self._scene_pool_target_size(reason=reason, explicit_target=target_size)
+        if len(self._scene_pool) >= target_size:
+            return
+
+        self._scene_pool_stats['refills'] += 1
+        if reason == 'prefill':
+            self._scene_pool_stats['prefill_refills'] += 1
+        elif reason == 'top_up':
+            self._scene_pool_stats['top_up_refills'] += 1
+
+        generated_now = 0
+        while len(self._scene_pool) < target_size:
+            self._scene_pool.append(self._generate_scene_snapshot())
+            self._scene_pool_stats['generated_scenes'] += 1
+            generated_now += 1
+
+        if reason == 'prefill':
+            self._scene_pool_stats['prefill_generated'] += generated_now
+        elif reason == 'top_up':
+            self._scene_pool_stats['top_up_generated'] += generated_now
+
+    def _top_up_scene_pool_if_needed(self):
+        if not self._should_top_up_scene_pool():
+            return
+        self._fill_scene_pool(reason='top_up')
+
+    def _acquire_scene_snapshot(self):
+        if not self._scene_pool_enabled():
+            self._scene_pool_stats['direct_generations'] += 1
+            self._scene_pool_stats['generated_scenes'] += 1
+            return self._generate_scene_snapshot()
+
+        if len(self._scene_pool) == 0:
+            self._scene_pool_stats['pool_misses'] += 1
+            self._fill_scene_pool(self.scene_pool_size, reason='miss')
+        else:
+            self._scene_pool_stats['pool_hits'] += 1
+
+        snapshot = self._scene_pool.popleft()
+        self._scene_pool_stats['consumed_scenes'] += 1
+        self._top_up_scene_pool_if_needed()
+        return snapshot
+
+    def get_scene_pool_stats(self):
+        stats = dict(self._scene_pool_stats)
+        stats['enabled'] = self._scene_pool_enabled()
+        stats['configured_size'] = int(self.scene_pool_size)
+        stats['prefill_on_init'] = bool(self.prefill_on_init)
+        stats['refill_low_watermark'] = int(self.refill_low_watermark)
+        stats['refill_batch_size'] = int(self.refill_batch_size)
+        stats['current_size'] = int(len(self._scene_pool))
+        return stats
 
     def reset(self, case_id: int = None, path: str = None) -> State:
         # Always use navigation case for the new task
-        start, dest, obstacles = generate_navigation_case(self.map_level)
+        snapshot = self._acquire_scene_snapshot()
+        start = snapshot['start']
+        dest = snapshot['dest']
+        obstacles = snapshot['obstacles']
+        scene_meta = snapshot['scene_meta']
         self.case_id = 2
-        
+        self.scene_regions = scene_meta
+        self.scene_metrics = scene_meta.get('divider_scene_metrics')
+        self.guidance_path_points = scene_meta.get('guidance_path_points')
+        self.guidance_occupancy_payload = scene_meta.get('guidance_occupancy_payload')
+        self.guidance_static_obstacles = scene_meta.get('guidance_static_obstacles')
+        self.guidance_dynamic_obstacles = scene_meta.get('guidance_dynamic_obstacles')
+        self.guidance_static_obstacle_signature = scene_meta.get('guidance_static_obstacle_signature')
+        self.guidance_dynamic_obstacle_signature = scene_meta.get('guidance_dynamic_obstacle_signature')
+
         # Add random articulation angle to initial state (critical for training!)
         # Previously always 0, causing state_norm std=0 issue
         start_articulation = random_uniform_num(np.radians(-10), np.radians(10))
         start_rear_heading = start[2] - start_articulation  # rear_heading = front_heading - articulation
         self.start = State(start+[0,0,start_rear_heading])
         self.start_box = self.start.create_box()[0]
-        
+
         # Dest should also have articulation possibility
         dest_articulation = random_uniform_num(np.radians(-10), np.radians(10))
         dest_rear_heading = dest[2] - dest_articulation
         self.dest = State(dest+[0,0,dest_rear_heading])
         self.dest_box = self.dest.create_box()[0]
-        
+
         # Keep the full scene strictly inside 80m x 80m
         self.xmin = -40.0
         self.xmax = 40.0
         self.ymin = -40.0
         self.ymax = 40.0
-        
+
         self.obstacles = list([Area(shape=obs, subtype="obstacle", \
             color=(150, 150, 150, 255)) for obs in obstacles])
         self.n_obstacle = len(self.obstacles)
 
         return self.start
-    
+
     def _flip_box_orientation(self, target_state:State):
         x, y, heading = target_state.get_pos()
         center = np.mean(target_state.create_box()[0].coords[:-1], axis=0)
@@ -1707,7 +2407,7 @@ class ParkingMapNormal(object):
         new_y = 2*center[1] - y
         heading = heading + np.pi
         return State([new_x, new_y, heading])
-    
+
     def flip_dest_orientation(self,):
         print('before:', self.dest.get_pos())
         self.dest = self._flip_box_orientation(self.dest)

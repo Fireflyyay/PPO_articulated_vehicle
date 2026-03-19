@@ -1,8 +1,11 @@
+import hashlib
 import heapq
 import math
-from typing import List, Optional, Sequence, Tuple
+from collections import OrderedDict
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+from shapely import intersects_xy
 from shapely.geometry import LinearRing, Point, Polygon, box
 from shapely.prepared import prep
 
@@ -59,6 +62,63 @@ class SoftGlobalGuidance:
         # Grid cache for occupancy construction (same bounds/resolution).
         self._grid_cache_key = None
         self._grid_cell_boxes = None
+        self._occupancy_cache: "OrderedDict[Tuple[float, ...], Dict[str, object]]" = OrderedDict()
+        self._static_occupancy_cache: "OrderedDict[Tuple[float, ...], np.ndarray]" = OrderedDict()
+        self._dynamic_occupancy_cache: "OrderedDict[Tuple[float, ...], np.ndarray]" = OrderedDict()
+        self._occupancy_cache_limit = 32
+        self._last_occupancy_payload = None
+        self._last_occupancy_cache_status = "miss"
+        self._last_occupancy_cache_details = {
+            "combined": "miss",
+            "static": "miss",
+            "dynamic": "miss",
+            "combined_builder": "unknown",
+            "static_builder": "unknown",
+            "dynamic_builder": "unknown",
+        }
+
+    def clear_path(self) -> None:
+        self.path_points_world = None
+        self.path_s = None
+        self.progress_idx = 0
+
+    def clear_occupancy_cache(self, keep_layer_caches: bool = False) -> None:
+        self._occupancy_cache.clear()
+        self._last_occupancy_payload = None
+        self._last_occupancy_cache_status = "miss"
+        self._last_occupancy_cache_details = {
+            "combined": "miss",
+            "static": "miss",
+            "dynamic": "miss",
+            "combined_builder": "unknown",
+            "static_builder": "unknown",
+            "dynamic_builder": "unknown",
+        }
+        if not keep_layer_caches:
+            self._static_occupancy_cache.clear()
+            self._dynamic_occupancy_cache.clear()
+
+    def set_precomputed_path(self, path_points: Sequence[Sequence[float]]) -> bool:
+        pts = np.asarray(path_points, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] != 2:
+            self.clear_path()
+            return False
+
+        self.path_points_world = np.array(pts, dtype=np.float64, copy=True)
+        self.path_s = self._polyline_arc_length(self.path_points_world)
+        self.progress_idx = 0
+        return True
+
+    def get_last_occupancy_payload(self, copy: bool = True):
+        if self._last_occupancy_payload is None:
+            return None
+        return self._copy_occupancy_payload(self._last_occupancy_payload, copy=copy)
+
+    def get_last_occupancy_cache_status(self) -> str:
+        return str(self._last_occupancy_cache_status)
+
+    def get_last_occupancy_cache_details(self):
+        return dict(self._last_occupancy_cache_details)
 
     def _make_grid_cache_key(self, bounds, nx: int, ny: int):
         xmin, xmax, ymin, ymax = bounds
@@ -68,9 +128,286 @@ class SoftGlobalGuidance:
             float(ymin),
             float(ymax),
             float(self.grid_resolution),
+            float(self.obstacle_inflation),
             int(nx),
             int(ny),
         )
+
+    def _make_layer_cache_key(self, bounds, nx: int, ny: int, layer_name: str, obstacle_signature: str):
+        return self._make_grid_cache_key(bounds, nx, ny) + (str(layer_name), str(obstacle_signature))
+
+    def _combine_obstacle_signatures(self, static_signature: str, dynamic_signature: str) -> str:
+        return f"{static_signature}|{dynamic_signature}"
+
+    def _make_obstacle_signature(self, obstacles) -> str:
+        hasher = hashlib.blake2b(digest_size=16)
+        for obst in obstacles:
+            geom = _to_polygon(getattr(obst, "shape", obst))
+            if geom is None:
+                continue
+            try:
+                hasher.update(geom.wkb)
+            except Exception:
+                fallback = (
+                    getattr(geom, "geom_type", type(geom).__name__),
+                    tuple(round(float(v), 4) for v in getattr(geom, "bounds", ())),
+                )
+                hasher.update(repr(fallback).encode("utf-8"))
+        return hasher.hexdigest()
+
+    def _make_occupancy_cache_key(self, bounds, nx: int, ny: int, obstacle_signature: str):
+        return self._make_grid_cache_key(bounds, nx, ny) + (str(obstacle_signature),)
+
+    def _copy_occupancy_payload(self, payload, copy: bool = True):
+        cloned = dict(payload)
+        occ = np.asarray(cloned.get("occ"), dtype=np.uint8)
+        cloned["occ"] = np.array(occ, copy=copy)
+        static_occ = cloned.get("static_occ")
+        dynamic_occ = cloned.get("dynamic_occ")
+        if static_occ is not None:
+            cloned["static_occ"] = np.array(np.asarray(static_occ, dtype=np.uint8), copy=copy)
+        if dynamic_occ is not None:
+            cloned["dynamic_occ"] = np.array(np.asarray(dynamic_occ, dtype=np.uint8), copy=copy)
+        cloned["bounds"] = tuple(float(v) for v in cloned.get("bounds", ()))
+        cloned["cache_key"] = tuple(cloned.get("cache_key", ()))
+        cloned["static_cache_key"] = tuple(cloned.get("static_cache_key", ()))
+        cloned["dynamic_cache_key"] = tuple(cloned.get("dynamic_cache_key", ()))
+        cloned["obstacle_signature"] = str(cloned.get("obstacle_signature", ""))
+        cloned["static_obstacle_signature"] = str(cloned.get("static_obstacle_signature", ""))
+        cloned["dynamic_obstacle_signature"] = str(cloned.get("dynamic_obstacle_signature", ""))
+        return cloned
+
+    def _normalize_occupancy_payload(
+        self,
+        payload,
+        cache_key,
+        bounds,
+        nx: int,
+        ny: int,
+        static_cache_key=None,
+        dynamic_cache_key=None,
+    ):
+        if not isinstance(payload, dict):
+            return None
+
+        payload_key = tuple(payload.get("cache_key", ()))
+        payload_bounds = tuple(float(v) for v in payload.get("bounds", ()))
+        if payload_key != tuple(cache_key):
+            return None
+        if payload_bounds != tuple(float(v) for v in bounds):
+            return None
+
+        occ = np.asarray(payload.get("occ"), dtype=np.uint8)
+        if occ.shape != (nx, ny):
+            return None
+
+        static_occ = payload.get("static_occ")
+        if static_occ is None:
+            static_occ = np.array(occ, copy=True)
+        static_occ = np.asarray(static_occ, dtype=np.uint8)
+        if static_occ.shape != (nx, ny):
+            return None
+
+        dynamic_occ = payload.get("dynamic_occ")
+        if dynamic_occ is None:
+            dynamic_occ = np.zeros((nx, ny), dtype=np.uint8)
+        dynamic_occ = np.asarray(dynamic_occ, dtype=np.uint8)
+        if dynamic_occ.shape != (nx, ny):
+            return None
+
+        normalized_static_cache_key = tuple(payload.get("static_cache_key", static_cache_key or ()))
+        normalized_dynamic_cache_key = tuple(payload.get("dynamic_cache_key", dynamic_cache_key or ()))
+        if static_cache_key is not None and normalized_static_cache_key != tuple(static_cache_key):
+            return None
+        if dynamic_cache_key is not None and normalized_dynamic_cache_key != tuple(dynamic_cache_key):
+            return None
+
+        return {
+            "cache_key": tuple(cache_key),
+            "bounds": payload_bounds,
+            "occ": np.array(occ, copy=True),
+            "static_occ": np.array(static_occ, copy=True),
+            "dynamic_occ": np.array(dynamic_occ, copy=True),
+            "obstacle_signature": str(payload.get("obstacle_signature", "")),
+            "static_cache_key": normalized_static_cache_key,
+            "dynamic_cache_key": normalized_dynamic_cache_key,
+            "static_obstacle_signature": str(payload.get("static_obstacle_signature", "")),
+            "dynamic_obstacle_signature": str(payload.get("dynamic_obstacle_signature", "")),
+        }
+
+    def _build_occupancy_payload(
+        self,
+        cache_key,
+        bounds,
+        occ: np.ndarray,
+        obstacle_signature: str,
+        static_occ: np.ndarray,
+        dynamic_occ: np.ndarray,
+        static_cache_key,
+        dynamic_cache_key,
+        static_signature: str,
+        dynamic_signature: str,
+    ):
+        return {
+            "cache_key": tuple(cache_key),
+            "bounds": tuple(float(v) for v in bounds),
+            "occ": np.array(occ, copy=True),
+            "static_occ": np.array(static_occ, copy=True),
+            "dynamic_occ": np.array(dynamic_occ, copy=True),
+            "obstacle_signature": str(obstacle_signature),
+            "static_cache_key": tuple(static_cache_key),
+            "dynamic_cache_key": tuple(dynamic_cache_key),
+            "static_obstacle_signature": str(static_signature),
+            "dynamic_obstacle_signature": str(dynamic_signature),
+        }
+
+    def _cache_occupancy_payload(self, payload) -> None:
+        cache_key = tuple(payload["cache_key"])
+        if cache_key in self._occupancy_cache:
+            self._occupancy_cache.pop(cache_key)
+        self._occupancy_cache[cache_key] = self._copy_occupancy_payload(payload, copy=True)
+        while len(self._occupancy_cache) > int(self._occupancy_cache_limit):
+            self._occupancy_cache.popitem(last=False)
+
+    def _cache_layer_occupancy(self, cache_store, cache_key, occ: np.ndarray) -> None:
+        cache_key = tuple(cache_key)
+        if cache_key in cache_store:
+            cache_store.pop(cache_key)
+        cache_store[cache_key] = np.array(occ, dtype=np.uint8, copy=True)
+        while len(cache_store) > int(self._occupancy_cache_limit):
+            cache_store.popitem(last=False)
+
+    def _inflate_obstacle_geometry(self, obstacle):
+        geom = _to_polygon(getattr(obstacle, "shape", obstacle))
+        if geom is None:
+            return None
+        if self.obstacle_inflation > 1e-9:
+            geom = geom.buffer(self.obstacle_inflation)
+        if geom.is_empty:
+            return None
+        return geom
+
+    def _expand_geometry_for_grid_fill(self, geom):
+        half_res = 0.5 * float(self.grid_resolution)
+        if half_res <= 1e-9:
+            return geom
+        half_diag = math.sqrt(2.0) * half_res
+        expanded = geom.buffer(half_diag + 1e-9)
+        if expanded.is_empty:
+            return geom
+        return expanded
+
+    def _world_to_grid_bounds(self, geom_bounds, bounds, nx: int, ny: int, padding_cells: int = 0):
+        if nx <= 0 or ny <= 0:
+            return None
+
+        xmin, _, ymin, _ = bounds
+        gxmin, gymin, gxmax, gymax = geom_bounds
+        res = float(self.grid_resolution)
+
+        i0 = int(math.floor((gxmin - xmin) / res)) - int(padding_cells)
+        i1 = int(math.ceil((gxmax - xmin) / res)) + int(padding_cells)
+        j0 = int(math.floor((gymin - ymin) / res)) - int(padding_cells)
+        j1 = int(math.ceil((gymax - ymin) / res)) + int(padding_cells)
+
+        i0 = max(0, i0)
+        i1 = min(nx - 1, i1)
+        j0 = max(0, j0)
+        j1 = min(ny - 1, j1)
+        if i0 > i1 or j0 > j1:
+            return None
+        return i0, i1, j0, j1
+
+    def _grid_index_to_world_center(self, indices: np.ndarray, origin: float) -> np.ndarray:
+        return float(origin) + np.asarray(indices, dtype=np.float64) * float(self.grid_resolution)
+
+    def _rasterize_obstacle_to_grid(self, occ: np.ndarray, bounds, obstacle) -> None:
+        if occ.size == 0:
+            return
+
+        inflated = self._inflate_obstacle_geometry(obstacle)
+        if inflated is None:
+            return
+
+        coverage_geom = self._expand_geometry_for_grid_fill(inflated)
+        nx, ny = occ.shape
+        grid_bounds = self._world_to_grid_bounds(coverage_geom.bounds, bounds, nx, ny)
+        if grid_bounds is None:
+            return
+
+        i0, i1, j0, j1 = grid_bounds
+        xmin, _, ymin, _ = bounds
+
+        x_idx = np.arange(i0, i1 + 1, dtype=np.int32)
+        y_idx = np.arange(j0, j1 + 1, dtype=np.int32)
+        x_coords = self._grid_index_to_world_center(x_idx, xmin)
+        y_coords = self._grid_index_to_world_center(y_idx, ymin)
+        grid_x, grid_y = np.meshgrid(x_coords, y_coords, indexing="ij")
+        mask = np.asarray(intersects_xy(coverage_geom, grid_x, grid_y), dtype=bool)
+        if not np.any(mask):
+            return
+
+        occ_slice = occ[i0 : i1 + 1, j0 : j1 + 1]
+        occ_slice[mask] = 1
+
+    def _build_occupancy_rasterized(self, bounds, nx: int, ny: int, obstacles) -> np.ndarray:
+        occ = np.zeros((nx, ny), dtype=np.uint8)
+        if occ.size == 0 or len(obstacles) == 0:
+            return occ
+
+        for obstacle in obstacles:
+            self._rasterize_obstacle_to_grid(occ, bounds, obstacle)
+        return occ
+
+    def _build_occupancy_intersects(self, bounds, nx: int, ny: int, obstacles) -> np.ndarray:
+        occ = np.zeros((nx, ny), dtype=np.uint8)
+        if occ.size == 0 or len(obstacles) == 0:
+            return occ
+
+        self._ensure_grid_cell_boxes(bounds, nx, ny)
+        cell_boxes = self._grid_cell_boxes
+
+        for obstacle in obstacles:
+            geom = self._inflate_obstacle_geometry(obstacle)
+            if geom is None:
+                continue
+
+            pg = prep(geom)
+            grid_bounds = self._world_to_grid_bounds(geom.bounds, bounds, nx, ny)
+            if grid_bounds is None:
+                continue
+
+            i0, i1, j0, j1 = grid_bounds
+            for i in range(i0, i1 + 1):
+                for j in range(j0, j1 + 1):
+                    if pg.intersects(cell_boxes[i][j]):
+                        occ[i, j] = 1
+        return occ
+
+    def _build_layer_occupancy(self, bounds, nx: int, ny: int, obstacles, cache_store, cache_key):
+        if len(obstacles) == 0:
+            return np.zeros((nx, ny), dtype=np.uint8), "empty", "empty"
+
+        cached = cache_store.get(tuple(cache_key))
+        if cached is not None:
+            cache_store.move_to_end(tuple(cache_key))
+            return np.array(cached, copy=True), "hit", "cache"
+
+        builder_mode = "raster"
+        try:
+            occ = self._build_occupancy_rasterized(bounds, nx, ny, obstacles)
+        except Exception:
+            occ = self._build_occupancy_intersects(bounds, nx, ny, obstacles)
+            builder_mode = "intersects"
+        self._cache_layer_occupancy(cache_store, cache_key, occ)
+        return occ, "miss", builder_mode
+
+    def _split_guidance_obstacles(self, world_map):
+        static_obstacles = getattr(world_map, "guidance_static_obstacles", None)
+        dynamic_obstacles = getattr(world_map, "guidance_dynamic_obstacles", None)
+        if static_obstacles is None and dynamic_obstacles is None:
+            return list(getattr(world_map, "obstacles", []) or []), []
+        return list(static_obstacles or []), list(dynamic_obstacles or [])
 
     def _ensure_grid_cell_boxes(self, bounds, nx: int, ny: int):
         key = self._make_grid_cache_key(bounds, nx, ny)
@@ -102,34 +439,151 @@ class SoftGlobalGuidance:
         res = self.grid_resolution
         nx = int(math.ceil((xmax - xmin) / res)) + 1
         ny = int(math.ceil((ymax - ymin) / res)) + 1
-        occ = np.zeros((nx, ny), dtype=np.uint8)
         bounds = (xmin, xmax, ymin, ymax)
+        has_layer_split = hasattr(world_map, "guidance_static_obstacles") or hasattr(world_map, "guidance_dynamic_obstacles")
+        static_obstacles, dynamic_obstacles = self._split_guidance_obstacles(world_map)
+        raw_payload = getattr(world_map, "guidance_occupancy_payload", None)
+        obstacle_signature = getattr(world_map, "guidance_obstacle_signature", None)
+        static_signature = getattr(world_map, "guidance_static_obstacle_signature", None)
+        dynamic_signature = getattr(world_map, "guidance_dynamic_obstacle_signature", None)
+        if (not has_layer_split) and (not obstacle_signature) and isinstance(raw_payload, dict):
+            obstacle_signature = raw_payload.get("obstacle_signature")
+        if not static_signature:
+            static_signature = self._make_obstacle_signature(static_obstacles)
+        if not dynamic_signature:
+            dynamic_signature = self._make_obstacle_signature(dynamic_obstacles)
+        if not obstacle_signature:
+            obstacle_signature = self._combine_obstacle_signatures(static_signature, dynamic_signature)
+        static_cache_key = self._make_layer_cache_key(bounds, nx, ny, "static", static_signature)
+        dynamic_cache_key = self._make_layer_cache_key(bounds, nx, ny, "dynamic", dynamic_signature)
+        cache_key = self._make_occupancy_cache_key(bounds, nx, ny, obstacle_signature)
 
-        self._ensure_grid_cell_boxes(bounds, nx, ny)
-        cell_boxes = self._grid_cell_boxes
+        self._last_occupancy_cache_details = {
+            "combined": "miss",
+            "static": "miss",
+            "dynamic": "miss",
+            "combined_builder": "unknown",
+            "static_builder": "unknown",
+            "dynamic_builder": "unknown",
+        }
 
-        obstacles = getattr(world_map, "obstacles", []) or []
-        for obst in obstacles:
-            g = _to_polygon(getattr(obst, "shape", obst))
-            if g is None:
-                continue
-            if self.obstacle_inflation > 1e-9:
-                g = g.buffer(self.obstacle_inflation)
-            if g.is_empty:
-                continue
+        payload = self._normalize_occupancy_payload(
+            raw_payload,
+            cache_key,
+            bounds,
+            nx,
+            ny,
+            static_cache_key=static_cache_key if has_layer_split else None,
+            dynamic_cache_key=dynamic_cache_key if has_layer_split else None,
+        )
+        if payload is not None:
+            self._last_occupancy_cache_status = "payload_hit"
+            self._last_occupancy_cache_details = {
+                "combined": "payload_hit",
+                "static": "payload",
+                "dynamic": "payload",
+                "combined_builder": "payload",
+                "static_builder": "payload",
+                "dynamic_builder": "payload",
+            }
+            self._last_occupancy_payload = self._copy_occupancy_payload(payload, copy=True)
+            self._cache_occupancy_payload(payload)
+            self._cache_layer_occupancy(self._static_occupancy_cache, static_cache_key, payload["static_occ"])
+            self._cache_layer_occupancy(self._dynamic_occupancy_cache, dynamic_cache_key, payload["dynamic_occ"])
+            try:
+                setattr(world_map, "guidance_occupancy_payload", self._copy_occupancy_payload(payload, copy=True))
+                setattr(world_map, "guidance_obstacle_signature", str(payload.get("obstacle_signature", obstacle_signature)))
+                setattr(
+                    world_map,
+                    "guidance_static_obstacle_signature",
+                    str(payload.get("static_obstacle_signature", static_signature)),
+                )
+                setattr(
+                    world_map,
+                    "guidance_dynamic_obstacle_signature",
+                    str(payload.get("dynamic_obstacle_signature", dynamic_signature)),
+                )
+            except Exception:
+                pass
+            return np.array(payload["occ"], copy=True), bounds
 
-            pg = prep(g)
-            gxmin, gymin, gxmax, gymax = g.bounds
-            i0 = max(0, int(math.floor((gxmin - xmin) / res)))
-            i1 = min(nx - 1, int(math.ceil((gxmax - xmin) / res)))
-            j0 = max(0, int(math.floor((gymin - ymin) / res)))
-            j1 = min(ny - 1, int(math.ceil((gymax - ymin) / res)))
+        cached = self._occupancy_cache.get(cache_key)
+        if cached is not None:
+            self._occupancy_cache.move_to_end(cache_key)
+            self._last_occupancy_cache_status = "instance_hit"
+            self._last_occupancy_cache_details = {
+                "combined": "instance_hit",
+                "static": "instance",
+                "dynamic": "instance",
+                "combined_builder": "instance",
+                "static_builder": "instance",
+                "dynamic_builder": "instance",
+            }
+            self._last_occupancy_payload = self._copy_occupancy_payload(cached, copy=True)
+            return np.array(cached["occ"], copy=True), bounds
 
-            for i in range(i0, i1 + 1):
-                for j in range(j0, j1 + 1):
-                    cbox = cell_boxes[i][j]
-                    if pg.intersects(cbox):
-                        occ[i, j] = 1
+        static_occ, static_status, static_builder = self._build_layer_occupancy(
+            bounds,
+            nx,
+            ny,
+            static_obstacles,
+            self._static_occupancy_cache,
+            static_cache_key,
+        )
+        dynamic_occ, dynamic_status, dynamic_builder = self._build_layer_occupancy(
+            bounds,
+            nx,
+            ny,
+            dynamic_obstacles,
+            self._dynamic_occupancy_cache,
+            dynamic_cache_key,
+        )
+        occ = np.maximum(static_occ, dynamic_occ)
+
+        if static_status == "miss" and dynamic_status in ("miss", "empty"):
+            combined_status = "miss"
+        else:
+            combined_status = "layered_hit"
+
+        if static_builder == "intersects" or dynamic_builder == "intersects":
+            combined_builder = "intersects"
+        elif static_builder == "raster" or dynamic_builder == "raster":
+            combined_builder = "raster"
+        elif static_builder == "cache" or dynamic_builder == "cache":
+            combined_builder = "cache"
+        else:
+            combined_builder = static_builder
+
+        payload = self._build_occupancy_payload(
+            cache_key,
+            bounds,
+            occ,
+            obstacle_signature,
+            static_occ,
+            dynamic_occ,
+            static_cache_key,
+            dynamic_cache_key,
+            static_signature,
+            dynamic_signature,
+        )
+        self._last_occupancy_cache_status = combined_status
+        self._last_occupancy_cache_details = {
+            "combined": combined_status,
+            "static": static_status,
+            "dynamic": dynamic_status,
+            "combined_builder": combined_builder,
+            "static_builder": static_builder,
+            "dynamic_builder": dynamic_builder,
+        }
+        self._last_occupancy_payload = self._copy_occupancy_payload(payload, copy=True)
+        self._cache_occupancy_payload(payload)
+        try:
+            setattr(world_map, "guidance_occupancy_payload", self._copy_occupancy_payload(payload, copy=True))
+            setattr(world_map, "guidance_obstacle_signature", str(obstacle_signature))
+            setattr(world_map, "guidance_static_obstacle_signature", str(static_signature))
+            setattr(world_map, "guidance_dynamic_obstacle_signature", str(dynamic_signature))
+        except Exception:
+            pass
 
         return occ, bounds
 
@@ -251,9 +705,7 @@ class SoftGlobalGuidance:
         start = self._world_to_cell(float(start_xy[0]), float(start_xy[1]), bounds, occ.shape)
         goal = self._world_to_cell(float(goal_xy[0]), float(goal_xy[1]), bounds, occ.shape)
         if start is None or goal is None:
-            self.path_points_world = None
-            self.path_s = None
-            self.progress_idx = 0
+            self.clear_path()
             return False
 
         occ[start[0], start[1]] = 0
@@ -261,9 +713,7 @@ class SoftGlobalGuidance:
 
         cell_path = self._astar(occ, start, goal)
         if cell_path is None or len(cell_path) == 0:
-            self.path_points_world = None
-            self.path_s = None
-            self.progress_idx = 0
+            self.clear_path()
             return False
 
         pts = np.array([self._cell_to_world(i, j, bounds) for i, j in cell_path], dtype=np.float64)

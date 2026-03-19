@@ -19,6 +19,7 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 import configs as cfg
+from train.lr_schedule import build_scaled_learning_rates, compute_post_expand_restore_scale
 
 from model.agent.ppo_agent import PPOAgent as PPO
 from model.agent.parking_agent import ParkingAgent, PrimitivePlanner
@@ -170,6 +171,19 @@ def _collect_rollouts_for_mining(env, parking_agent, n_episodes: int, scene_sche
         )
     return episodes
 
+
+def _apply_learning_rate_scale(parking_agent, base_actor_lr: float, base_critic_lr: float, scale: float):
+    actor_lr, critic_lr = build_scaled_learning_rates(base_actor_lr, base_critic_lr, scale)
+    return parking_agent.agent.set_learning_rates(actor_lr, critic_lr)
+
+
+def _log_learning_rate_state(writer, episode_idx: int, parking_agent, scale: float, restore_progress: float):
+    actor_lr, critic_lr = parking_agent.agent.get_learning_rates()
+    writer.add_scalar("lr/actor", float(actor_lr), episode_idx)
+    writer.add_scalar("lr/critic", float(critic_lr), episode_idx)
+    writer.add_scalar("lr/post_expand_scale", float(scale), episode_idx)
+    writer.add_scalar("lr/post_expand_restore_progress", float(restore_progress), episode_idx)
+
 class SceneChoose:
     """Failure-driven curriculum sampler (ported from HOPE).
 
@@ -196,14 +210,18 @@ class SceneChoose:
         # curriculum parameters
         self.history_horizon = 200
         self.recent_window = 250
+        self.extrem_success_band = tuple(float(x) for x in EXTREM_SUCCESS_BAND)
+        self.extrem_focus_prob = float(EXTREM_SUCCESS_BAND_FOCUS_PROB)
+        self.extrem_bridge_prob = float(EXTREM_SUCCESS_BAND_BRIDGE_PROB)
 
     def choose_case(self):
         if len(self.scene_record) < self.history_horizon:
             scene_id = self._choose_case_uniform()
         else:
-            if np.random.random() > 0.5:
+            scene_id = self._choose_case_success_band()
+            if scene_id is None and np.random.random() > 0.5:
                 scene_id = self._choose_case_worst_perform()
-            else:
+            elif scene_id is None:
                 scene_id = self._choose_case_uniform()
 
         self.scene_record.append(int(scene_id))
@@ -236,10 +254,35 @@ class SceneChoose:
         fail_rate = fail_rate / np.sum(fail_rate)
         return int(np.random.choice(np.arange(len(fail_rate)), p=fail_rate))
 
+    def _recent_success_rate(self, sid: int) -> float:
+        rec = self.success_record[int(sid)]
+        if len(rec) == 0:
+            return 0.0
+        recent = rec[-min(self.recent_window, len(rec)) :]
+        return float(np.mean(recent)) if len(recent) > 0 else 0.0
+
+    def _choose_case_success_band(self):
+        extrem_sid = 2
+        complex_sid = 1
+        extrem_sr = self._recent_success_rate(extrem_sid)
+        low, high = self.extrem_success_band
+
+        if extrem_sr < low:
+            if np.random.random() < self.extrem_bridge_prob:
+                return int(complex_sid)
+            return None
+
+        if extrem_sr <= high:
+            if np.random.random() < self.extrem_focus_prob:
+                return int(extrem_sid)
+            return None
+
+        return None
+
 if __name__=="__main__":
-    
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--agent_ckpt', type=str, default=None) 
+    parser.add_argument('--agent_ckpt', type=str, default=None)
     parser.add_argument('--train_episode', type=int, default=100000)
     parser.add_argument('--eval_episode', type=int, default=100)
     parser.add_argument('--verbose', type=bool, default=True)
@@ -252,7 +295,7 @@ if __name__=="__main__":
         base_env = CarParking(fps=100, verbose=verbose,)
     else:
         base_env = CarParking(fps=100, verbose=verbose, render_mode='rgb_array')
-    
+
     # Use Motion Primitives Wrapper
     env = base_env
     if USE_MOTION_PRIMITIVES:
@@ -266,10 +309,10 @@ if __name__=="__main__":
         src_dir = os.path.dirname(current_dir) # src
         root_dir = os.path.dirname(src_dir) # root
         project_root = root_dir
-        
+
         # In configs.py, path is "../data/..." relative to configs.py location (src/)
         # So it points to root/data/...
-        
+
         # Let's resolve relative to src_dir
         lib_full_path = os.path.normpath(os.path.join(src_dir, PRIMITIVE_LIBRARY_PATH))
 
@@ -297,7 +340,7 @@ if __name__=="__main__":
     current_time = time.localtime()
     timestamp = time.strftime("%Y%m%d_%H%M%S", current_time)
     save_path = os.path.join(log_exp_dir, 'ppo_%s/' % timestamp)
-    
+
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     writer = SummaryWriter(save_path)
@@ -306,19 +349,19 @@ if __name__=="__main__":
         copyfile('./src/configs.py', save_path+'configs.txt')
     elif os.path.exists('./configs.py'):
         copyfile('./configs.py', save_path+'configs.txt')
-    
+
     # More robust tensorboard command for Python 3.8 environments
     print(f"You can track the training process with:\n  python -m tensorboard --logdir {os.path.abspath(save_path)}\nThen open http://localhost:6006 in your browser.")
-    
+
     seed = SEED
     # env.seed(seed)
-    
+
     # Fix for gym seeding
-    # env.action_space.seed(seed) 
+    # env.action_space.seed(seed)
     # Wrapper might not forward logic or attribute
     if hasattr(env.action_space, 'seed'):
         env.action_space.seed(seed)
-    
+
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -335,14 +378,14 @@ if __name__=="__main__":
     else:
         actor_params['output_size'] = env.action_space.shape[0]
         actor_params['use_tanh_output'] = True
-    
+
     configs = {
         "discrete": USE_MOTION_PRIMITIVES,
         "observation_shape": env.observation_shape if hasattr(env, 'observation_shape') else base_env.observation_shape,
-        # env.observation_shape might not be exposed by wrapper. 
-        # CarParking has observation_shape attribute. 
+        # env.observation_shape might not be exposed by wrapper.
+        # CarParking has observation_shape attribute.
         # Gym Wrapper forwards getattr usually, but let's be safe.
-        
+
         "action_dim": env.action_space.n if USE_MOTION_PRIMITIVES else env.action_space.shape[0],
         "hidden_size": 64,
         "activation": "tanh",
@@ -351,8 +394,13 @@ if __name__=="__main__":
         "actor_layers": actor_params,
         "critic_layers": critic_params,
         "action_std_init": 1.5, # Increased from 0.6
-        "action_std_decay_rate": 0.0003, # Decreased from 0.001 to slow down decay
+        "action_std_decay_rate": 0.001, # Decreased from 0.001 to slow down decay
         "min_action_std": 0.1,
+        "use_imitation_loss": bool(USE_MOTION_PRIMITIVES and USE_TAKEOVER_EXPERT_SUPERVISION),
+        "imitation_buffer_size": int(IMITATION_BUFFER_SIZE),
+        "imitation_batch_size": int(IMITATION_BATCH_SIZE),
+        "imitation_min_buffer": int(IMITATION_MIN_BUFFER),
+        "imitation_loss_weight": float(IMITATION_LOSS_WEIGHT),
         # Ensure gamma is consistent with macro-action horizon
         "gamma": (GAMMA_BASE ** primitive_h) if USE_MOTION_PRIMITIVES else GAMMA,
     }
@@ -413,8 +461,12 @@ if __name__=="__main__":
 
         old_version = ap_lib_mgr.active_version_id
         old_lib_size = int(env.action_space.n)
-        old_lr = float(parking_agent.agent.actor_optimizer.param_groups[0].get('lr', parking_agent.agent.configs.lr_actor))
-        post_expand_lr_restore = old_lr
+        old_actor_lr, old_critic_lr = parking_agent.agent.get_learning_rates()
+        post_expand_lr_restore = {
+            "actor_lr": float(old_actor_lr),
+            "critic_lr": float(old_critic_lr),
+            "restore_start_episode": None,
+        }
 
         # Save rollback checkpoint
         ckpt_before = os.path.join(save_path, "adaptive_primitives", f"before_round_{ap_round_id}.pt")
@@ -460,6 +512,9 @@ if __name__=="__main__":
         add_list = c_feas[:k_add]
 
         if k_add <= 0 or len(add_list) == 0:
+            if ap_scheduler is not None:
+                ap_scheduler.state.post_expand_freeze_remaining = 0
+            post_expand_lr_restore = None
             writer.add_scalar("adaptive/added_count", 0.0, ep_idx)
             writer.add_scalar("adaptive/library_size", float(old_lib_size), ep_idx)
             return
@@ -496,7 +551,7 @@ if __name__=="__main__":
         # Post-expansion stabilization: lower LR + freeze backbone + logit bias for new actions
         try:
             lr_scale = float(AP_POST_EXPAND_LR_SCALE)
-            parking_agent.agent.actor_optimizer.param_groups[0]['lr'] = old_lr * lr_scale
+            _apply_learning_rate_scale(parking_agent, old_actor_lr, old_critic_lr, lr_scale)
         except Exception:
             pass
         try:
@@ -569,9 +624,12 @@ if __name__=="__main__":
             try:
                 parking_agent.agent.freeze_actor_backbone(False)
                 parking_agent.agent.clear_action_logit_bias()
-                parking_agent.agent.actor_optimizer.param_groups[0]['lr'] = old_lr
+                parking_agent.agent.set_learning_rates(old_actor_lr, old_critic_lr)
             except Exception:
                 pass
+            if ap_scheduler is not None:
+                ap_scheduler.state.post_expand_freeze_remaining = 0
+            post_expand_lr_restore = None
         else:
             writer.add_scalar("adaptive/rollback", 0.0, ep_idx)
             ap_last_good_version = ap_lib_mgr.active_version_id
@@ -590,7 +648,7 @@ if __name__=="__main__":
         scene_chosen = scene_chooser.choose_case()
         obs, _ = env.reset(options={'level': scene_chosen})
         parking_agent.reset()
-        
+
         done = False
         total_reward = 0
         step_num = 0
@@ -611,20 +669,29 @@ if __name__=="__main__":
         ep_plan_ms = []
         ep_prune_ms = []
         ep_score_ms = []
+        ep_imitation_samples = 0
         # action distributions
         n_actions = env.action_space.n if USE_MOTION_PRIMITIVES else None
         ep_action_counts = np.zeros((n_actions,), dtype=np.int64) if n_actions is not None else None
         ep_takeover_action_counts = np.zeros((n_actions,), dtype=np.int64) if n_actions is not None else None
-        
+
         while not done:
             step_num += 1
             ep_obs_trace.append(np.asarray(obs, dtype=np.float64))
             action_mask = None
             if USE_MOTION_PRIMITIVES and USE_ACTION_MASK and hasattr(env, 'get_action_mask'):
                 action_mask = env.get_action_mask(obs)
+            planner_executing = bool(USE_MOTION_PRIMITIVES and parking_agent.executing_plan)
             action, log_prob = parking_agent.choose_action(obs, action_mask=action_mask)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+
+            if planner_executing and bool(USE_MOTION_PRIMITIVES and USE_TAKEOVER_EXPERT_SUPERVISION):
+                try:
+                    parking_agent.agent.push_imitation_memory(obs, int(action), action_mask=action_mask)
+                    ep_imitation_samples += 1
+                except Exception:
+                    pass
 
             # weak shaping reward from discovered primitives (optional)
             shaping_r = 0.0
@@ -662,13 +729,13 @@ if __name__=="__main__":
                         ep_takeover_action_counts[pid] += 1
                 except Exception:
                     pass
-            
+
             if 'reward_info' in info:
                 ri = info.get('reward_info', {})
                 if isinstance(ri, dict):
                     row = [_to_scalar(ri.get(k, 0.0), 0.0) for k in REWARD_WEIGHT.keys()]
                     reward_info.append(row)
-            
+
             total_reward += reward
             reward_per_state_list.append(reward)
 
@@ -688,7 +755,7 @@ if __name__=="__main__":
             ep_rewards_trace.append(float(reward))
             ep_dones_trace.append(bool(done))
             ep_infos_trace.append(info if isinstance(info, dict) else {})
-            
+
             # Store transition in memory
             # obs, action, reward, done, log_prob, next_obs
             # Optional: skip takeover transitions to reduce teacher bias.
@@ -702,24 +769,27 @@ if __name__=="__main__":
                     parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs, action_mask))
                 else:
                     parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs))
-            
+
             obs = next_obs
-            
+
             # Update agent
             if len(parking_agent.agent.memory) % parking_agent.agent.configs.batch_size == 0 and len(parking_agent.agent.memory) >= parking_agent.agent.configs.batch_size:
                 if verbose and i % 10 == 0 and step_num == 1: # Print less frequently
                     print("Updating the agent.")
                 actor_loss, critic_loss = parking_agent.agent.update()
-                
+
                 # Decay action std
                 parking_agent.agent.decay_action_std(
-                    parking_agent.agent.configs.action_std_decay_rate, 
+                    parking_agent.agent.configs.action_std_decay_rate,
                     parking_agent.agent.configs.min_action_std
                 )
-                
+
                 writer.add_scalar("actor_loss", actor_loss, i)
                 writer.add_scalar("critic_loss", critic_loss, i)
-            
+                if bool(USE_MOTION_PRIMITIVES and USE_TAKEOVER_EXPERT_SUPERVISION):
+                    writer.add_scalar("imitation/loss", float(getattr(parking_agent.agent, "last_imitation_loss", 0.0)), i)
+                    writer.add_scalar("imitation/buffer_size", float(parking_agent.agent.imitation_buffer_size()), i)
+
             if done:
                 if info['status'] == Status.ARRIVED:
                     succ_record.append(1)
@@ -735,7 +805,7 @@ if __name__=="__main__":
         writer.add_scalar("total_reward", total_reward, i)
         if len(reward_per_state_list) > 0:
             writer.add_scalar("avg_reward", np.mean(reward_per_state_list[-1000:]), i)
-        
+
         # Log std
         writer.add_scalar("action_std", parking_agent.agent.action_std, i)
 
@@ -754,6 +824,8 @@ if __name__=="__main__":
 
             success = 1.0 if (len(succ_record) > 0 and succ_record[-1] == 1) else 0.0
             writer.add_scalar("takeover/success_when_used", success if ep_takeover_used else 0.0, i)
+            if bool(USE_TAKEOVER_EXPERT_SUPERVISION):
+                writer.add_scalar("imitation/samples_per_episode", float(ep_imitation_samples), i)
 
             # policy vs planner distribution divergence (episode-level KL)
             if ep_action_counts is not None and ep_takeover_action_counts is not None:
@@ -762,7 +834,7 @@ if __name__=="__main__":
                     q = (ep_action_counts + 1e-6) / float(ep_action_counts.sum() + 1e-6 * ep_action_counts.size)
                     kl = float(np.sum(p * (np.log(p) - np.log(q))))
                     writer.add_scalar("takeover/action_KL", kl, i)
-        
+
         for type_id, scene_name in scene_chooser.scene_types.items():
             rec = scene_chooser.success_record[int(type_id)]
             if len(rec) > 0:
@@ -771,10 +843,10 @@ if __name__=="__main__":
                     float(np.mean(rec[-100:])),
                     i,
                 )
-        
+
         writer.add_scalar("step_num", step_num, i)
         reward_list.append(total_reward)
-        
+
         if len(reward_info) > 0:
             reward_info_arr = np.array(reward_info, dtype=np.float64)
             reward_info_sum = np.round(np.sum(reward_info_arr, axis=0), 4)
@@ -823,7 +895,7 @@ if __name__=="__main__":
                 parking_agent.agent.save("%s/PPO_best.pt" % (save_path), params_only=True)
                 with open(save_path + 'best.txt', 'w') as f_best_log:
                     f_best_log.write('epoch: %s, success rate: %s' % (i + 1, success_rates))
-        
+
         if (i+1) % 2000 == 0:
             parking_agent.agent.save("%s/PPO2_%s.pt" % (save_path, i),params_only=True)
 
@@ -838,7 +910,7 @@ if __name__=="__main__":
             plt.title(f'Training Reward (Episode {i})')
             plt.savefig('%s/reward.png'%save_path)
             plt.close()
-            
+
             # Print progress
             print(f"Episode {i}/{args.train_episode} | Reward: {total_reward:.2f} | Steps: {step_num} | Success Rate: {np.mean(succ_record[-100:]):.2f}")
             sys.stdout.flush()
@@ -919,6 +991,8 @@ if __name__=="__main__":
 
         # ---- Post-expansion bias decay / unfreeze ----
         if adaptive_enabled and ap_scheduler is not None:
+            lr_scale = 1.0
+            restore_progress = 1.0
             try:
                 remaining = ap_scheduler.tick_post_expand_freeze()
                 writer.add_scalar("adaptive/post_expand_freeze_remaining", float(remaining), i)
@@ -936,17 +1010,40 @@ if __name__=="__main__":
                             parking_agent.agent.set_action_logit_bias(b)
 
                 # restore lr/unfreeze when freeze window ends
-                if remaining <= 0:
-                    try:
-                        parking_agent.agent.freeze_actor_backbone(False)
-                    except Exception:
-                        pass
-                    if post_expand_lr_restore is not None:
+                if post_expand_lr_restore is not None:
+                    base_actor_lr = float(post_expand_lr_restore["actor_lr"])
+                    base_critic_lr = float(post_expand_lr_restore["critic_lr"])
+                    if remaining > 0:
+                        lr_scale = float(AP_POST_EXPAND_LR_SCALE)
+                        restore_progress = 0.0
+                        _apply_learning_rate_scale(parking_agent, base_actor_lr, base_critic_lr, lr_scale)
+                    else:
                         try:
-                            parking_agent.agent.actor_optimizer.param_groups[0]['lr'] = float(post_expand_lr_restore)
+                            parking_agent.agent.freeze_actor_backbone(False)
                         except Exception:
                             pass
-                        post_expand_lr_restore = None
+
+                        if post_expand_lr_restore.get("restore_start_episode") is None:
+                            post_expand_lr_restore["restore_start_episode"] = int(i)
+
+                        if bool(AP_POST_EXPAND_LR_WARMUP):
+                            lr_scale, restore_progress = compute_post_expand_restore_scale(
+                                current_episode=int(i),
+                                restore_start_episode=int(post_expand_lr_restore["restore_start_episode"]),
+                                restore_episodes=int(AP_POST_EXPAND_LR_RESTORE_EPISODES),
+                                start_scale=float(AP_POST_EXPAND_LR_SCALE),
+                            )
+                        else:
+                            lr_scale, restore_progress = 1.0, 1.0
+
+                        _apply_learning_rate_scale(parking_agent, base_actor_lr, base_critic_lr, lr_scale)
+
+                        if restore_progress >= 1.0:
+                            post_expand_lr_restore = None
             except Exception:
                 pass
+
+            _log_learning_rate_state(writer, i, parking_agent, lr_scale, restore_progress)
+        else:
+            _log_learning_rate_state(writer, i, parking_agent, 1.0, 1.0)
 

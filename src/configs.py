@@ -20,21 +20,21 @@ LENGTH = FRONT_HANG + WHEEL_BASE + REAR_HANG  # total length
 
 from shapely.geometry import LinearRing
 VehicleBox = LinearRing([
-    (-REAR_HANG, -WIDTH/2), 
-    (FRONT_HANG + WHEEL_BASE, -WIDTH/2), 
+    (-REAR_HANG, -WIDTH/2),
+    (FRONT_HANG + WHEEL_BASE, -WIDTH/2),
     (FRONT_HANG + WHEEL_BASE,  WIDTH/2),
     (-REAR_HANG,  WIDTH/2)])
 
 # Defined based on vehicle dimensions for articulated vehicle
 FrontVehicleBox = LinearRing([
-    (-HITCH_OFFSET, -WIDTH/2), 
-    (FRONT_HANG, -WIDTH/2), 
+    (-HITCH_OFFSET, -WIDTH/2),
+    (FRONT_HANG, -WIDTH/2),
     (FRONT_HANG,  WIDTH/2),
     (-HITCH_OFFSET,  WIDTH/2)])
 
 RearVehicleBox = LinearRing([
-    (-REAR_HANG, -WIDTH/2), 
-    (TRAILER_LENGTH, -WIDTH/2), 
+    (-REAR_HANG, -WIDTH/2),
+    (TRAILER_LENGTH, -WIDTH/2),
     (TRAILER_LENGTH,  WIDTH/2),
     (-REAR_HANG,  WIDTH/2)])
 
@@ -131,11 +131,61 @@ GUIDANCE_FULL_CLEARANCE_M = 4.0
 GUIDANCE_NEAR_OBS_DIST_M = 2.0
 GUIDANCE_MAX_DENSE_RATIO = 0.35
 
+# -----------------------------
+# Navigation scene filtering / retry policy
+# Keep only hard-but-solvable scenes and reject pathological Extrem cases.
+# -----------------------------
+NAVIGATION_GENERATION_MAX_SCENE_ATTEMPTS = 10
+NAVIGATION_RESET_MAX_SCENE_RETRIES = 6
+NAVIGATION_REQUIRE_GUIDANCE_SUCCESS = True
+NAVIGATION_ALLOW_LAST_RESORT = False
+
+# -----------------------------
+# Navigation scene pool policy
+# -----------------------------
+NAVIGATION_SCENE_POOL_ENABLE = True
+NAVIGATION_SCENE_POOL_SIZE = 4
+NAVIGATION_SCENE_POOL_PREFILL_ON_INIT = True
+NAVIGATION_SCENE_POOL_LOW_WATERMARK = -1
+NAVIGATION_SCENE_POOL_REFILL_BATCH_SIZE = 1
+NAVIGATION_PRELOAD_ALL_LEVEL_MAPS = True
+
+NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL = {
+    'Normal': 2.2,
+    'Complex': 2.8,
+    'Extrem': 3.2,
+}
+NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL = {
+    'Normal': 1.55,
+    'Complex': 1.40,
+    'Extrem': 1.30,
+}
+NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL = {
+    'Normal': 0.95,
+    'Complex': 0.80,
+    'Extrem': 0.70,
+}
+NAVIGATION_TIGHT_TURN_HEADING_DEG_BY_LEVEL = {
+    'Normal': 110.0,
+    'Complex': 125.0,
+    'Extrem': 140.0,
+}
+NAVIGATION_TIGHT_TURN_MIN_ENDPOINT_CLEARANCE_BY_LEVEL = {
+    'Normal': 1.15,
+    'Complex': 1.00,
+    'Extrem': 0.90,
+}
+
+# Success-band teacher for Extrem: keep training near the learnable band.
+EXTREM_SUCCESS_BAND = (0.20, 0.60)
+EXTREM_SUCCESS_BAND_FOCUS_PROB = 0.65
+EXTREM_SUCCESS_BAND_BRIDGE_PROB = 0.75
+
 FPS = 100
 TOLERANT_TIME = 1000 # Increased from 200 to 1000 to match finer control frequency (0.2s * 1000 = 200s total duration)
 USE_LIDAR = True
 USE_IMG = False # Disabled as requested
-USE_ACTION_MASK = True # Disabled as requested
+USE_ACTION_MASK = False # Disabled as requested
 # Increased for longer navigation scenarios (was 200, now supports up to 150m)
 MAX_DIST_TO_DEST = 70.0
 K = 4.0 # the render scale adjusted for smaller map (480px / 120m -> 4)
@@ -147,7 +197,7 @@ RENDER_TRAJ = True
 # - fast_only: only use grid-index fast prune result as mask (fastest)
 # - hybrid: fast prune + precise simulation on candidates (default)
 # - full: precise simulation on all actions (slowest, most conservative)
-ACTION_MASK_MODE = "fast_only"
+ACTION_MASK_MODE = "hyrbid"
 # Recompute action mask every K macro-steps; reuse last mask in between.
 ACTION_MASK_UPDATE_EVERY_K = 2
 
@@ -174,6 +224,9 @@ PRIMITIVE_LIBRARY_PATH = "../data/primitives_articulated_H4_S11.npz"
 # -----------------------------
 # Terminal Takeover (Paper-style RHP planner)
 # -----------------------------
+# Master switch. False disables all takeover logic while keeping motion primitives enabled.
+TAKEOVER_ENABLE = False
+
 # Enable the receding-horizon takeover planner that uses an offline grid index
 # for fast online pruning (no per-primitive rollout in takeover stage).
 TAKEOVER_USE_RHP = True
@@ -183,6 +236,11 @@ TAKEOVER_DIST_BASE = 10.0
 TAKEOVER_DIST_HYSTERESIS = 2.0
 TAKEOVER_DIST_SPEED_GAIN = 0.0  # meters per (m/s) of |v|
 TAKEOVER_DIST_OBS_DENSITY_GAIN = 0.0  # meters per obstacle-density (0..1)
+
+# Only allow takeover once the vehicle is near the goal. Outside this gate,
+# takeover remains inactive even if heading/articulation/clearance looks bad.
+TAKEOVER_NEAR_GOAL_ONLY = True
+TAKEOVER_NEAR_GOAL_DIST = 8.0
 
 # Early takeover difficulty triggers
 TAKEOVER_EARLY_HEADING_ERR = float(np.deg2rad(35))
@@ -212,7 +270,16 @@ TAKEOVER_FALLBACK_OLD_PLANNER = False
 # Training consistency switch
 # True: takeover transitions are still pushed into PPO buffer (imitation-like on-policy shaping)
 # False: skip storing takeover transitions to reduce bias toward hand-coded planner.
-TAKEOVER_TEACHER_FORCING = True
+TAKEOVER_TEACHER_FORCING = False
+
+# Planner-as-teacher supervision. When the planner actually executes a primitive,
+# store that state-action pair in a small imitation buffer and add a low-weight
+# supervised loss during PPO updates.
+USE_TAKEOVER_EXPERT_SUPERVISION =  False
+IMITATION_BUFFER_SIZE = 8192
+IMITATION_BATCH_SIZE = 256
+IMITATION_MIN_BUFFER = 128
+IMITATION_LOSS_WEIGHT = 0.05
 
 # Profiling switch (planner/wrapper will emit timing in info['takeover_debug'])
 TAKEOVER_PROFILE = True
@@ -393,6 +460,8 @@ DP_MAX_CENTROIDS = 64
 # ===== Post-expansion stabilization =====
 AP_POST_EXPAND_FREEZE_EPISODES = 100
 AP_POST_EXPAND_LR_SCALE = 0.3
+AP_POST_EXPAND_LR_WARMUP = False
+AP_POST_EXPAND_LR_RESTORE_EPISODES = 300
 AP_NEW_ACTION_LOGIT_BIAS_INIT = 1.5
 AP_NEW_ACTION_LOGIT_BIAS_DECAY_EPISODES = 200
 

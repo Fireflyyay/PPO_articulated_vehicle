@@ -37,7 +37,7 @@ def _abs_angle_diff(a: float, b: float) -> float:
 
 def _constraints(level: str):
     if level == "Normal":
-        return (0.0, 30.0), (0.0, 45.0)
+        return (0.0, 36.0), (0.0, 80.0)
     if level == "Complex":
         return (30.0, 50.0), (45.0, 90.0)
     if level == "Extrem":
