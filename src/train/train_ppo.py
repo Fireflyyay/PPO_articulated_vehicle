@@ -184,6 +184,59 @@ def _log_learning_rate_state(writer, episode_idx: int, parking_agent, scale: flo
     writer.add_scalar("lr/post_expand_scale", float(scale), episode_idx)
     writer.add_scalar("lr/post_expand_restore_progress", float(restore_progress), episode_idx)
 
+def _get_current_library_size(env, ap_lib_mgr=None) -> int:
+    if ap_lib_mgr is not None:
+        try:
+            return int(ap_lib_mgr.library_size)
+        except Exception:
+            pass
+    try:
+        return int(env.action_space.n)
+    except Exception:
+        return 0
+
+
+def _log_adaptive_library_state(writer, episode_idx: int, env, ap_lib_mgr=None, base_size: int = None, max_size: int = None):
+    current_size = _get_current_library_size(env, ap_lib_mgr=ap_lib_mgr)
+    writer.add_scalar("adaptive/library_size", float(current_size), episode_idx)
+    writer.add_scalar("adaptive/library_size_absolute", float(current_size), episode_idx)
+
+    if base_size is not None:
+        growth = max(0, int(current_size) - int(base_size))
+        writer.add_scalar("adaptive/library_size_from_base", float(growth), episode_idx)
+
+    if max_size is not None and int(max_size) > 0:
+        writer.add_scalar(
+            "adaptive/library_capacity_utilization",
+            float(current_size) / float(max_size),
+            episode_idx,
+        )
+
+
+def _log_adaptive_round_uplift(
+    writer,
+    episode_idx: int,
+    before_metrics: dict,
+    after_metrics: dict,
+    old_library_size: int,
+    new_library_size: int,
+):
+    success_gain = float(after_metrics.get("success", 0.0) - before_metrics.get("success", 0.0))
+    extreme_success_gain = float(
+        after_metrics.get("success_extreme", 0.0) - before_metrics.get("success_extreme", 0.0)
+    )
+    added = max(0, int(new_library_size) - int(old_library_size))
+    denom = float(max(1, added))
+
+    writer.add_scalar("adaptive/validation_success_gain", success_gain, episode_idx)
+    writer.add_scalar("adaptive/validation_extreme_success_gain", extreme_success_gain, episode_idx)
+    writer.add_scalar("adaptive/validation_success_gain_per_added_primitive", success_gain / denom, episode_idx)
+    writer.add_scalar(
+        "adaptive/validation_extreme_success_gain_per_added_primitive",
+        extreme_success_gain / denom,
+        episode_idx,
+    )
+
 class SceneChoose:
     """Failure-driven curriculum sampler (ported from HOPE).
 
@@ -424,6 +477,8 @@ if __name__=="__main__":
     ap_round_id = 0
     ap_last_good_ckpt = None
     ap_last_good_version = None
+    ap_base_library_size = _get_current_library_size(env)
+    ap_last_expand_baseline = None
     post_expand_lr_restore = None
 
     # mining buffer
@@ -442,14 +497,15 @@ if __name__=="__main__":
             ap_pruner = PrimitivePruner(verbose=True)
             ap_shaping = DiscoveredPrimitiveShaping(cfg) if DiscoveredPrimitiveShaping is not None else None
             ap_last_good_version = ap_lib_mgr.active_version_id
+            ap_base_library_size = _get_current_library_size(env, ap_lib_mgr=ap_lib_mgr)
             ap_last_good_ckpt = os.path.join(save_path, "adaptive_primitives", "last_good_agent.pt")
             parking_agent.agent.save(ap_last_good_ckpt, params_only=True)
 
             print(f"[adaptive] enabled. base_version={ap_last_good_version}, lib_size={ap_lib_mgr.library_size}")
 
-    def run_adaptive_primitive_round(ep_idx: int):
+    def run_adaptive_primitive_round(ep_idx: int, trigger_stats: dict = None):
         global env, primitive_lib, primitive_h
-        global ap_round_id, ap_last_good_ckpt, ap_last_good_version, post_expand_lr_restore
+        global ap_round_id, ap_last_good_ckpt, ap_last_good_version, ap_last_expand_baseline, post_expand_lr_restore
 
         if not adaptive_enabled:
             return
@@ -461,6 +517,14 @@ if __name__=="__main__":
 
         old_version = ap_lib_mgr.active_version_id
         old_lib_size = int(env.action_space.n)
+        _log_adaptive_library_state(
+            writer,
+            ep_idx,
+            env,
+            ap_lib_mgr=ap_lib_mgr,
+            base_size=ap_base_library_size,
+            max_size=int(AP_MAX_LIBRARY_SIZE),
+        )
         old_actor_lr, old_critic_lr = parking_agent.agent.get_learning_rates()
         post_expand_lr_restore = {
             "actor_lr": float(old_actor_lr),
@@ -516,7 +580,14 @@ if __name__=="__main__":
                 ap_scheduler.state.post_expand_freeze_remaining = 0
             post_expand_lr_restore = None
             writer.add_scalar("adaptive/added_count", 0.0, ep_idx)
-            writer.add_scalar("adaptive/library_size", float(old_lib_size), ep_idx)
+            _log_adaptive_library_state(
+                writer,
+                ep_idx,
+                env,
+                ap_lib_mgr=ap_lib_mgr,
+                base_size=ap_base_library_size,
+                max_size=int(AP_MAX_LIBRARY_SIZE),
+            )
             return
 
         # Add to manager and persist a new version
@@ -525,7 +596,14 @@ if __name__=="__main__":
         new_lib = ap_lib_mgr.get_active_library()
 
         writer.add_scalar("adaptive/added_count", float(added), ep_idx)
-        writer.add_scalar("adaptive/library_size", float(new_lib.size), ep_idx)
+        _log_adaptive_library_state(
+            writer,
+            ep_idx,
+            env,
+            ap_lib_mgr=ap_lib_mgr,
+            base_size=ap_base_library_size,
+            max_size=int(AP_MAX_LIBRARY_SIZE),
+        )
 
         writer.add_scalar(
             "adaptive/avg_complexity_added",
@@ -591,6 +669,14 @@ if __name__=="__main__":
         val_after = _run_eval_episodes(env, parking_agent, int(AP_VALIDATION_EPISODES), val_schedule, deterministic=True)
         writer.add_scalar("adaptive/validation_success_after", float(val_after["success"]), ep_idx)
         writer.add_scalar("adaptive/validation_extreme_success_after", float(val_after["success_extreme"]), ep_idx)
+        _log_adaptive_round_uplift(
+            writer,
+            ep_idx,
+            before_metrics=val_before,
+            after_metrics=val_after,
+            old_library_size=old_lib_size,
+            new_library_size=int(new_lib.size),
+        )
 
         # Rollback if regressed
         rollback = False
@@ -627,12 +713,27 @@ if __name__=="__main__":
                 parking_agent.agent.set_learning_rates(old_actor_lr, old_critic_lr)
             except Exception:
                 pass
+            _log_adaptive_library_state(
+                writer,
+                ep_idx,
+                env,
+                ap_lib_mgr=ap_lib_mgr,
+                base_size=ap_base_library_size,
+                max_size=int(AP_MAX_LIBRARY_SIZE),
+            )
             if ap_scheduler is not None:
                 ap_scheduler.state.post_expand_freeze_remaining = 0
             post_expand_lr_restore = None
+            ap_last_expand_baseline = None
         else:
             writer.add_scalar("adaptive/rollback", 0.0, ep_idx)
             ap_last_good_version = ap_lib_mgr.active_version_id
+            ap_last_expand_baseline = {
+                "episode": int(ep_idx),
+                "success_rate_recent": float((trigger_stats or {}).get("success_rate_recent", 0.0)),
+                "hard_success_rate_recent": float((trigger_stats or {}).get("hard_success_rate_recent", 0.0)),
+                "library_size": int(old_lib_size),
+            }
             try:
                 parking_agent.agent.save(ap_last_good_ckpt, params_only=True)
             except Exception:
@@ -959,6 +1060,14 @@ if __name__=="__main__":
 
         # ---- Trigger adaptive round between episodes ----
         if adaptive_enabled:
+            _log_adaptive_library_state(
+                writer,
+                i,
+                env,
+                ap_lib_mgr=ap_lib_mgr,
+                base_size=ap_base_library_size,
+                max_size=int(AP_MAX_LIBRARY_SIZE),
+            )
             try:
                 # recent success rates
                 w = int(AP_TRIGGER_WINDOW)
@@ -982,8 +1091,28 @@ if __name__=="__main__":
                 writer.add_scalar("adaptive/success_rate_recent", float(sr_recent), i)
                 writer.add_scalar("adaptive/hard_success_rate_recent", float(sr_hard), i)
 
+                if ap_last_expand_baseline is not None:
+                    base_recent = float(ap_last_expand_baseline.get("success_rate_recent", 0.0))
+                    base_hard = float(ap_last_expand_baseline.get("hard_success_rate_recent", 0.0))
+                    base_size = int(ap_last_expand_baseline.get("library_size", ap_base_library_size))
+                    current_size = _get_current_library_size(env, ap_lib_mgr=ap_lib_mgr)
+                    size_gain = max(0, int(current_size) - int(base_size))
+                    writer.add_scalar("adaptive/post_expand_success_uplift_recent", float(sr_recent - base_recent), i)
+                    writer.add_scalar("adaptive/post_expand_hard_success_uplift_recent", float(sr_hard - base_hard), i)
+                    writer.add_scalar("adaptive/post_expand_episode_delta", float(i - int(ap_last_expand_baseline.get("episode", i))), i)
+                    writer.add_scalar(
+                        "adaptive/post_expand_success_uplift_per_added_primitive_recent",
+                        float(sr_recent - base_recent) / float(max(1, size_gain)),
+                        i,
+                    )
+                    writer.add_scalar(
+                        "adaptive/post_expand_hard_success_uplift_per_added_primitive_recent",
+                        float(sr_hard - base_hard) / float(max(1, size_gain)),
+                        i,
+                    )
+
                 if ap_scheduler.should_trigger(stats, episode_idx=int(i)):
-                    run_adaptive_primitive_round(ep_idx=int(i))
+                    run_adaptive_primitive_round(ep_idx=int(i), trigger_stats=stats)
             except Exception as e:
                 writer.add_scalar("adaptive/triggered", 0.0, i)
                 if verbose:

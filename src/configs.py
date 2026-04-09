@@ -185,7 +185,7 @@ FPS = 100
 TOLERANT_TIME = 1000 # Increased from 200 to 1000 to match finer control frequency (0.2s * 1000 = 200s total duration)
 USE_LIDAR = True
 USE_IMG = False # Disabled as requested
-USE_ACTION_MASK = False # Disabled as requested
+USE_ACTION_MASK = True # Disabled as requested
 # Increased for longer navigation scenarios (was 200, now supports up to 150m)
 MAX_DIST_TO_DEST = 70.0
 K = 4.0 # the render scale adjusted for smaller map (480px / 120m -> 4)
@@ -336,20 +336,20 @@ from collections import OrderedDict
 REWARD_WEIGHT = OrderedDict({
     'time_cost': 1,
     'rs_dist_reward': 0,
-    'dist_reward': 5,
+    'dist_reward': 10,
     # Angle-1: agent heading vs slot heading
     'angle_reward': 0,
     # Angle-2: (agent->slot direction) vs slot heading
-    'approach_angle_reward': 2,
+    'approach_angle_reward': 1.0,
     'box_union_reward': 10,
 })
 
 # Time-cost ramp (used by CarParking._get_reward_info)
 # Keep disabled by default to preserve legacy constant time penalty (-1.0).
 TIME_COST_RAMP_ENABLE = False
-TIME_COST_RAMP_RATIO = 0.25
-TIME_COST_INIT_SCALE = 0.2
-TIME_COST_FINAL_SCALE = 1.0
+TIME_COST_RAMP_RATIO = 0.15
+TIME_COST_INIT_SCALE = 0.35
+TIME_COST_FINAL_SCALE = 0.35
 
 # Distance gate for angle rewards (both angle_reward and approach_angle_reward)
 # Goal: avoid frequent micro-adjustment near slot center while keeping alignment useful in mid-range.
