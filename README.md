@@ -1,12 +1,14 @@
 # PPO articulated vehicle (PPO + Motion Primitives)
 
-该项目基于 Gymnasium 自定义环境训练一个铰接车（牵引车-挂车）智能体，核心算法为 PPO。与“直接输出连续控制”不同，本仓库默认启用 **Motion Primitives（离散宏动作）**，并带有 **terminal takeover（末端接管规划器，RHP 快速裁剪）** 与 **自适应 primitive 扩展（可选/默认开启，见配置）**。
+该项目基于 Gymnasium 自定义环境训练一个铰接车（牵引车-挂车）智能体，核心算法为 PPO。与“直接输出连续控制”不同，本仓库默认启用 **Motion Primitives（离散宏动作）**，并结合 **全局软引导**、**action mask**、**Extrem teacher success band** 与 **自适应 primitive 扩展** 等机制提升训练稳定性与难场景表现。仓库中仍保留 **terminal takeover（末端接管规划器，RHP 快速裁剪）** 的相关实现文件，但当前默认配置下该机制处于禁用状态，不能作为现行可用功能使用。
 
 ## 依赖
 
-- Python 3.8+
+- Python 3.8
 - 依赖安装：
   ```bash
+  conda create-n PPOMP python=3.8
+  conda activate PPOMP
   pip install -r requirements.txt
   ```
 
@@ -74,25 +76,55 @@ python src/evaluation/visualize_path.py --episodes 5 --level Complex
 
 仓库已提供 data/ 下的 primitive 库文件。
 
-## Terminal takeover（末端接管 / RHP 规划器）
+## 训练增强机制
 
-当启用 Motion Primitives 时，MacroActionWrapper 可能在“接近目标”或“困难状态”自动触发接管，使用 src/terminal_takeover_rhp.py 的 RecedingHorizonTakeoverPlanner 进行在线短视距规划。
+除了 primitive 宏动作外，当前默认训练链路还依赖以下几个机制：
 
-触发逻辑（简述，具体以代码为准）：
+### 1) 全局软引导（Soft Global Guidance）
 
-- 距离触发：dist <= TAKEOVER_DIST_BASE（带 hysteresis 与可选速度/障碍密度增益）
-- 困难触发：相对航向误差、铰接角偏差、最小 lidar 距离等超过阈值
+全局引导由 [src/env/global_guidance.py](src/env/global_guidance.py) 提供，默认开启。其思路是：
 
-关键开关位于 src/configs.py：
+- reset 时先做一次粗网格 A*，生成一条全局参考路径
+- step 时从参考路径中提取局部方向提示，而不是强制跟踪硬路点
+- 引导特征会并入观测向量，当前默认维度为 4：方向、横向误差和提示强度等
 
-- TAKEOVER_ENABLE：总开关，设为 False 可完全禁用 takeover
-- TAKEOVER_USE_RHP：是否启用 RHP 接管规划器
-- TAKEOVER_DIST_BASE / TAKEOVER_DIST_HYSTERESIS / TAKEOVER_EARLY_*：触发阈值
-- OCCUPANCY_INFLATION_RADIUS / TAKEOVER_SCORE_WEIGHTS：碰撞裁剪与打分权重
+这套机制是“建议式”而不是“硬约束式”的，主要用于减少探索早期在大场景中的无效游走。与此同时，场景采样阶段还会结合 guidance 成功性过滤掉部分明显不可学的导航样本。
+
+### 2) Extrem teacher success band
+
+针对 Extrem 难度，训练脚本中加入了 teacher success band 机制，用来把训练重心维持在“有挑战但仍可学习”的成功率区间附近。默认配置位于 [src/configs.py](src/configs.py#L180)：
+
+- EXTREM_SUCCESS_BAND = (0.20, 0.60)
+- EXTREM_SUCCESS_BAND_FOCUS_PROB = 0.65
+- EXTREM_SUCCESS_BAND_BRIDGE_PROB = 0.75
+
+它的目标不是一味采样最难场景，而是优先把样本分布控制在 agent 还能持续获得改进信号的 band 内，从而避免 Extrem 训练过早退化成纯失败数据。
+
+### 3) Action mask
+
+默认配置下 USE_ACTION_MASK = True。训练、评估和可视化在选择 primitive 前，会先通过 env.get_action_mask(obs) 过滤掉当前状态下明显不可行的宏动作，再把 mask 传给 PPO 的离散策略分布。
+
+当前实现位于 [src/env/wrappers/macro_action_wrapper.py](src/env/wrappers/macro_action_wrapper.py#L992) 与 [src/model/agent/ppo_agent.py](src/model/agent/ppo_agent.py#L245)，核心思路是：
+
+- 先根据 primitive 库索引做快速候选筛选
+- 再按配置选择 fast_only / hybrid / full 三种模式进行不同强度的可行性检查
+- 对被判定为不可行的 primitive，在策略 logits 上直接置为极小值，不参与采样
+
+其中 action mask 的总体思路参考了 HOPE 项目：<https://github.com/jiamiya/HOPE>。更准确地说，本仓库借鉴的是“在离散路径规划动作空间中先做动作可行性筛选，再交给策略网络决策”的方法，但具体实现已经结合当前 primitive 库、索引结构和 PPO 训练流程做了本地化修改。
+
+### 4) Primitive refinement
+
+除上述机制外，仓库当前实际可用的末端改进能力主要来自 primitive refinement，而不是 RHP takeover。refinement 会在 primitive 计划执行前后做连续细化与 terminal polishing，以改善最终停靠质量。
+
+## Terminal takeover（末端接管 / RHP 规划器，当前不可用）
+
+仓库中保留了 [src/terminal_takeover_rhp.py](src/terminal_takeover_rhp.py) 与 wrapper 内的接管相关代码，但 **当前默认配置下 RHP 接管机制不可用**。直接原因是 [src/configs.py](src/configs.py#L310) 中默认设置了 TAKEOVER_ENABLE=False，因此默认训练、评估和可视化流程里不会实际触发 takeover，相关统计保持为 0 属于预期行为。
+
+如果你只是阅读代码，可将 RHP 部分理解为保留中的实验实现，而不是当前主流程能力。
 
 ## Primitive 离线网格索引（.grid_index.npz）
 
-RHP 接管规划器支持读取“离线网格索引”以加速在线碰撞裁剪。PrimitiveLibrary 会自动尝试加载与 primitive 同名的索引文件：
+离线网格索引最初用于支持 RHP 接管规划器，也可用于当前 action mask / primitive 候选筛选相关逻辑。PrimitiveLibrary 会自动尝试加载与 primitive 同名的索引文件：
 
 - <library>.grid_index.npz（例如 data/primitives_articulated_H4_S11.grid_index.npz）
 
@@ -117,19 +149,22 @@ src/configs.py 中 USE_ADAPTIVE_PRIMITIVE_EXPANSION 默认开启，会在训练�
 
 ## 代码结构
 
-- src/configs.py：全局配置（车辆参数/环境参数/PPO 超参/primitive 与 takeover 设置）
+- src/configs.py：全局配置（车辆参数/环境参数/PPO 超参/primitive、guidance、action mask、refinement 与 takeover 开关）
 - src/env/：环境与车辆模型
   - env/car_parking_base.py：主环境
+  - env/global_guidance.py：全局软引导（粗网格 A* + step 级方向提示）
   - env/vehicle.py：铰接车运动学与状态
-  - env/wrappers/macro_action_wrapper.py：宏动作（primitive）包装 + 接管逻辑
+  - env/wrappers/macro_action_wrapper.py：宏动作（primitive）包装、action mask 与保留中的 takeover 分支
 - src/model/：PPO agent 与网络
-  - model/agent/ppo_agent.py：PPO 算法
+  - model/agent/ppo_agent.py：PPO 算法（支持离散 primitive policy 的 action mask）
   - model/agent/parking_agent.py：宏动作队列执行器（PrimitivePlanner）
 - src/primitives/：primitive 库与索引
   - primitives/library.py：加载 .npz primitive 库（自动尝试加载 .grid_index.npz）
   - primitives/primitive_index.py：网格索引结构与加载
-- src/train/train_ppo.py：训练入口（日志/保存/可选自适应扩展）
+- src/primitives/primitive_refinement.py：primitive plan 的连续细化/终端 polishing
+- src/train/train_ppo.py：训练入口（包含 teacher success band、日志、保存与可选自适应扩展）
 - src/evaluation/visualize_path.py：可视化与保存轨迹图到 src/img/
+- src/terminal_takeover_rhp.py：RHP 接管规划器实现文件，当前默认流程不启用
 - scripts/build_primitive_grid_index.py：离线构建 .grid_index.npz
 
 ## 测试
