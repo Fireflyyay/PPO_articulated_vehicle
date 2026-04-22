@@ -2,8 +2,6 @@
 import argparse
 import os
 import sys
-from collections import defaultdict
-from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -13,8 +11,11 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.append(SRC)
 
-from env.vehicle import Vehicle, State
-from primitives.primitive_index import Cell
+from primitives.primitive_index import (
+    build_approx_index_from_deltas,
+    build_mask_index_from_library,
+    primitive_grid_index_to_payload,
+)
 
 
 def build_index(
@@ -28,71 +29,33 @@ def build_index(
     sample_stride: int,
     num_step: int,
     group_prefix_steps: int,
+    index_mode: str = "swept_cells",
 ):
-    n, h, _ = actions.shape
-
-    def world_to_cell(x: float, y: float):
-        if x < x_min or x > x_max or y < y_min or y > y_max:
-            return None
-        ix = int(np.floor((x - x_min) / grid_resolution))
-        iy = int(np.floor((y - y_min) / grid_resolution))
-        return (ix, iy)
-
-    primitive_to_cells: List[np.ndarray] = []
-    cell_to_prims: Dict[Cell, List[int]] = defaultdict(list)
-
-    # Approximate control-group: speed bin (paper uses control groups; here we cluster by speed value)
-    speeds = actions[:, 0, 1]
-    uniq = sorted(list({float(np.round(v, 3)) for v in speeds}))
-    speed_to_gid = {v: i for i, v in enumerate(uniq)}
-    primitive_to_group_id = np.array([speed_to_gid[float(np.round(v, 3))] for v in speeds], dtype=np.int64)
-
-    group_to_primitive_ids: List[List[int]] = [[] for _ in range(len(uniq))]
-    for pid, gid in enumerate(primitive_to_group_id.tolist()):
-        group_to_primitive_ids[gid].append(pid)
-
-    # simulate trajectories in canonical ego frame
-    for pid in range(n):
-        init_state = State([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        vehicle = Vehicle(articulated=True)
-        vehicle.reset(init_state)
-
-        visited = set()
-        for t in range(0, h, max(1, int(sample_stride))):
-            a = actions[pid, t]
-            vehicle.step(a, step_time=int(num_step))
-            x = float(vehicle.state.loc.x)
-            y = float(vehicle.state.loc.y)
-            c = world_to_cell(x, y)
-            if c is not None:
-                visited.add(c)
-
-        if len(visited) == 0:
-            arr = np.zeros((0, 2), dtype=np.int64)
-        else:
-            arr = np.array(sorted(list(visited)), dtype=np.int64)
-
-        primitive_to_cells.append(arr)
-        for cell in visited:
-            cell_to_prims[cell].append(pid)
-
-    cell_to_primitives = {k: np.array(v, dtype=np.int64) for k, v in cell_to_prims.items()}
-    group_to_primitive_ids_arr = [np.array(v, dtype=np.int64) for v in group_to_primitive_ids]
-    group_prefix_steps_arr = np.full((len(group_to_primitive_ids_arr),), int(group_prefix_steps), dtype=np.int64)
-
-    payload = dict(
-        grid_resolution=float(grid_resolution),
-        x_min=float(x_min),
-        x_max=float(x_max),
-        y_min=float(y_min),
-        y_max=float(y_max),
-        primitive_to_cells=np.array(primitive_to_cells, dtype=object),
-        cell_to_primitives=np.array(cell_to_primitives, dtype=object),
-        primitive_to_group_id=primitive_to_group_id,
-        group_to_primitive_ids=np.array(group_to_primitive_ids_arr, dtype=object),
-        group_prefix_steps=group_prefix_steps_arr,
-    )
-    return payload
+    mode = str(index_mode).strip().lower()
+    if mode == "approx_centerline":
+        index = build_approx_index_from_deltas(
+            actions=actions,
+            deltas=deltas,
+            grid_resolution=grid_resolution,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            group_prefix_steps=group_prefix_steps,
+        )
+    else:
+        index = build_mask_index_from_library(
+            actions=actions,
+            grid_resolution=grid_resolution,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            sample_stride=sample_stride,
+            num_step=num_step,
+            group_prefix_steps=group_prefix_steps,
+        )
+    return primitive_grid_index_to_payload(index)
 
 
 def main():
@@ -110,13 +73,21 @@ def main():
     parser.add_argument("--num_step", type=int, default=None, help="Physics substeps per env step (NUM_STEP). Default: use src.configs.NUM_STEP")
     parser.add_argument("--group_prefix_steps", type=int, default=None, help="Shared prefix steps for all groups")
     parser.add_argument("--group_prefix_ratio", type=float, default=0.3, help="If group_prefix_steps not set, use int(H*ratio)")
+    parser.add_argument(
+        "--index_mode",
+        type=str,
+        default="swept_cells",
+        choices=("swept_cells", "approx_centerline"),
+        help="Offline index type: conservative swept-cells mask or approximate centerline fallback",
+    )
 
     args = parser.parse_args()
 
     lib_path = os.path.abspath(args.library)
     if args.out is None:
         base, _ = os.path.splitext(lib_path)
-        out_path = base + ".grid_index.npz"
+        suffix = ".mask_index.npz" if args.index_mode == "swept_cells" else ".grid_index.npz"
+        out_path = base + suffix
     else:
         out_path = os.path.abspath(args.out)
 
@@ -152,6 +123,7 @@ def main():
         sample_stride=int(args.sample_stride),
         num_step=num_step,
         group_prefix_steps=group_prefix_steps,
+        index_mode=str(args.index_mode),
     )
 
     os.makedirs(os.path.dirname(out_path), exist_ok=True)

@@ -5,17 +5,15 @@ import matplotlib.pyplot as plt
 import torch
 import copy
 from shapely.geometry import LinearRing, Polygon, MultiPolygon
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 import argparse
 import glob
 
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from env.car_parking_base import CarParking
 from env.vehicle import Status
-from model.agent.ppo_agent import PPOAgent as PPO
-from configs import *
+import configs as cfg
 
 
 def _normalize_status(status_obj) -> Optional[Status]:
@@ -145,11 +143,11 @@ def _find_matching_primitive_library(src_dir: str, expected_size: int, preferred
             candidates.append(p)
 
     # Default configured library first
-    cfg_lib = os.path.normpath(os.path.join(src_dir, PRIMITIVE_LIBRARY_PATH))
+    cfg_lib = os.path.normpath(os.path.join(src_dir, cfg.PRIMITIVE_LIBRARY_PATH))
     if os.path.exists(cfg_lib):
         candidates.append(cfg_lib)
-    elif os.path.exists(PRIMITIVE_LIBRARY_PATH):
-        candidates.append(PRIMITIVE_LIBRARY_PATH)
+    elif os.path.exists(cfg.PRIMITIVE_LIBRARY_PATH):
+        candidates.append(cfg.PRIMITIVE_LIBRARY_PATH)
 
     # Search experiment outputs where adaptive versions are stored.
     for p in glob.glob(os.path.join(src_dir, 'log', 'exp', '**', 'adaptive_primitives', 'versions', '*.npz'), recursive=True):
@@ -203,15 +201,71 @@ def _infer_actor_output_size(checkpoint: object) -> Optional[int]:
         return None
     return int(weight_tensors[-1].shape[0])
 
+
+def _resolve_visualization_mode(use_macro_actions: bool, refinement_enabled: bool) -> Tuple[str, str]:
+    if not bool(use_macro_actions):
+        return "continuous", "Continuous Policy"
+    if bool(refinement_enabled):
+        return "refined", "Refined Primitive Execution"
+    return "raw", "Raw Primitive Execution"
+
+
+def _get_visualization_mode(use_macro_actions: bool) -> dict:
+    refinement_enabled = bool(getattr(cfg, 'USE_PRIMITIVE_REFINEMENT', False))
+    mode_slug, mode_label = _resolve_visualization_mode(use_macro_actions, refinement_enabled)
+    return {
+        "slug": mode_slug,
+        "label": mode_label,
+        "policy_label": "macro-actions" if bool(use_macro_actions) else "continuous",
+        "refinement_enabled": refinement_enabled,
+        "refinement_applicable": bool(use_macro_actions),
+    }
+
+
+def _build_output_filename(episode_index: int, mode_slug: str) -> str:
+    return f"path_planning_{mode_slug}_{int(episode_index)}.png"
+
+
+def _build_figure_title(episode_index: int, mode_label: str) -> str:
+    return f"Articulated Vehicle Path Planning - Episode {int(episode_index)} | {mode_label}"
+
+
+def _count_takeover_triggers(step_infos: List[dict]) -> int:
+    return int(sum(1 for info in step_infos if isinstance(info, dict) and bool(info.get('takeover_triggered', False))))
+
+
+def _build_run_summary_lines(
+    mode_info: dict,
+    checkpoint_path: str,
+    primitive_library_path: Optional[str],
+    level: Optional[str],
+    takeover_trigger_count: int,
+) -> List[str]:
+    refinement_text = "n/a"
+    if bool(mode_info.get('refinement_applicable', False)):
+        refinement_text = "on" if bool(mode_info.get('refinement_enabled', False)) else "off"
+
+    lines = [
+        f"mode={mode_info.get('slug', 'unknown')}",
+        f"policy={mode_info.get('policy_label', 'unknown')}",
+        f"refinement={refinement_text}",
+        f"level={level if level is not None else getattr(cfg, 'MAP_LEVEL', 'unknown')}",
+        f"takeover_triggers={int(takeover_trigger_count)}",
+        f"ckpt={os.path.basename(checkpoint_path)}",
+    ]
+    if primitive_library_path:
+        lines.append(f"library={os.path.basename(primitive_library_path)}")
+    return lines
+
 def plot_vehicle(ax, state, alpha=0.3, is_final=False):
     front_box, rear_box = state.create_box()
-    
+
     # Plot front box
     x, y = front_box.xy
     color_front = 'blue' if not is_final else 'darkblue'
     ax.plot(x, y, color=color_front, alpha=alpha, linewidth=1)
     ax.fill(x, y, color=color_front, alpha=alpha/2)
-    
+
     # Plot rear box
     x, y = rear_box.xy
     color_rear = 'red' if not is_final else 'darkred'
@@ -219,9 +273,12 @@ def plot_vehicle(ax, state, alpha=0.3, is_final=False):
     ax.fill(x, y, color=color_rear, alpha=alpha/2)
 
 def visualize(episodes: int = 10, level: Optional[str] = None):
+    from env.car_parking_base import CarParking
+    from model.agent.ppo_agent import PPOAgent as PPO
+
     # Setup base environment
     base_env = CarParking(render_mode='rgb_array')
-    
+
     # Locate checkpoint
     default_ckpt = os.path.abspath(os.path.join(os.path.dirname(__file__), '../ckpt/PPO_best.pt'))
     checkpoint_path = _find_checkpoint(default_ckpt)
@@ -239,7 +296,8 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
     use_macro_actions = (inferred_actor_out is not None and inferred_actor_out > 2)
 
     env = base_env
-    primitive_h = PRIMITIVE_H
+    primitive_h = cfg.PRIMITIVE_H
+    primitive_library_path = None
     if use_macro_actions:
         from primitives.library import load_library
         from env.wrappers.macro_action_wrapper import MacroActionWrapper
@@ -259,12 +317,13 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
             lib_full_path = _find_matching_primitive_library(src_dir, expected_action_dim, preferred_dir=preferred_dir)
 
         if lib_full_path is None:
-            lib_full_path = os.path.normpath(os.path.join(src_dir, PRIMITIVE_LIBRARY_PATH))
-            if not os.path.exists(lib_full_path) and os.path.exists(PRIMITIVE_LIBRARY_PATH):
-                lib_full_path = PRIMITIVE_LIBRARY_PATH
+            lib_full_path = os.path.normpath(os.path.join(src_dir, cfg.PRIMITIVE_LIBRARY_PATH))
+            if not os.path.exists(lib_full_path) and os.path.exists(cfg.PRIMITIVE_LIBRARY_PATH):
+                lib_full_path = cfg.PRIMITIVE_LIBRARY_PATH
 
         primitive_lib = load_library(lib_full_path)
-        primitive_h = getattr(primitive_lib, 'horizon', PRIMITIVE_H)
+        primitive_h = getattr(primitive_lib, 'horizon', cfg.PRIMITIVE_H)
+        primitive_library_path = lib_full_path
         env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
         print(f"Using MacroActionWrapper: action_space.n={env.action_space.n}, H={primitive_h}, lib={lib_full_path}")
 
@@ -276,10 +335,17 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
 
     # For plotting/trajectory access, always use the underlying base env.
     plot_env = base_env
+    mode_info = _get_visualization_mode(use_macro_actions)
+    print(
+        "Visualization mode: "
+        f"{mode_info['label']} "
+        f"(refinement={'on' if mode_info['refinement_enabled'] else 'off'}, "
+        f"applicable={'yes' if mode_info['refinement_applicable'] else 'no'})"
+    )
 
     # Setup agent (match training-time logic)
-    actor_params = dict(ckpt_cfg.get('actor_layers', ACTOR_CONFIGS))
-    critic_params = dict(ckpt_cfg.get('critic_layers', CRITIC_CONFIGS))
+    actor_params = dict(ckpt_cfg.get('actor_layers', cfg.ACTOR_CONFIGS))
+    critic_params = dict(ckpt_cfg.get('critic_layers', cfg.CRITIC_CONFIGS))
     obs_shape = env.observation_shape if hasattr(env, 'observation_shape') else base_env.observation_shape
     actor_params['input_dim'] = int(obs_shape[0])
     critic_params['input_dim'] = int(obs_shape[0])
@@ -301,7 +367,7 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
         "actor_layers": actor_params,
         "critic_layers": critic_params,
         "load_params": True,
-        "gamma": float(ckpt_cfg.get('gamma', (GAMMA_BASE ** primitive_h) if use_macro_actions else GAMMA)),
+        "gamma": float(ckpt_cfg.get('gamma', (cfg.GAMMA_BASE ** primitive_h) if use_macro_actions else cfg.GAMMA)),
     }
 
     agent = PPO(configs, discrete=use_macro_actions, load_params=True)
@@ -313,7 +379,7 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
         os.makedirs(img_dir)
 
     if level is None:
-        print(f"Scene level: {MAP_LEVEL}")
+        print(f"Scene level: {cfg.MAP_LEVEL}")
     else:
         print(f"Scene level (override): {level}")
 
@@ -327,24 +393,38 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
         last_terminated = False
         last_truncated = False
         forced_break_reason = None
-        
+        step_infos = []
+
         # Run episode
         while not done:
             action, _ = agent.choose_action(obs, deterministic=True)
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             last_info = info
+            step_infos.append(info if isinstance(info, dict) else {})
             last_terminated = bool(terminated)
             last_truncated = bool(truncated)
             if len(plot_env.vehicle.trajectory) > 2000: # Safety break
                 forced_break_reason = "max steps reached"
                 break
-        
+
         states = plot_env.vehicle.trajectory
-        
+        if len(states) == 0:
+            print(f"Episode {i + 1}: empty trajectory, skipping figure generation.")
+            continue
+
+        takeover_trigger_count = _count_takeover_triggers(step_infos)
+        summary_lines = _build_run_summary_lines(
+            mode_info=mode_info,
+            checkpoint_path=checkpoint_path,
+            primitive_library_path=primitive_library_path,
+            level=level,
+            takeover_trigger_count=takeover_trigger_count,
+        )
+
         # Plotting
         fig, ax = plt.subplots(figsize=(12, 12))
-        
+
         # Plot obstacles (support LinearRing / Polygon / MultiPolygon)
         for area in plot_env.map.obstacles:
             geom = area.shape
@@ -370,36 +450,36 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
                         xi, yi = interior.xy
                         ax.plot(xi, yi, color='black', linewidth=1, alpha=0.7)
                         ax.fill(xi, yi, color='white', alpha=1.0)
-            
+
         # Plot target (destination)
         dest_front, dest_rear = plot_env.map.dest.create_box()
         xf, yf = dest_front.xy
         ax.plot(xf, yf, color='green', linestyle='--', linewidth=2, label='Target Front')
         xr, yr = dest_rear.xy
         ax.plot(xr, yr, color='darkgreen', linestyle='--', linewidth=2, label='Target Rear')
-        
+
         # Plot path (trajectory of the front center)
         path_x = [s.loc.x for s in states]
         path_y = [s.loc.y for s in states]
         ax.plot(path_x, path_y, color='cyan', linestyle='-', alpha=0.6, linewidth=1, label='Path')
-        
+
         # Plot vehicle at intervals
         # We want to show about 10 intermediate states
         num_intermediate = 10
         interval = max(1, len(states) // num_intermediate)
         for j in range(0, len(states), interval):
             plot_vehicle(ax, states[j], alpha=0.2)
-        
+
         # Plot start state
         plot_vehicle(ax, states[0], alpha=0.5)
-        
+
         # Plot final state
         plot_vehicle(ax, states[-1], alpha=1.0, is_final=True)
-        
+
         ax.set_aspect('equal')
         ax.set_xlim(plot_env.map.xmin, plot_env.map.xmax)
         ax.set_ylim(plot_env.map.ymin, plot_env.map.ymax)
-        ax.set_title(f"Articulated Vehicle Path Planning - Episode {i+1}")
+        ax.set_title(_build_figure_title(i + 1, mode_info['label']))
 
         # Annotate success / failure (and reason in English)
         success, label = _episode_result_label(
@@ -421,9 +501,20 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
             color=label_color,
             bbox=dict(facecolor='white', edgecolor=label_color, alpha=0.9, boxstyle='round,pad=0.3'),
         )
+        ax.text(
+            0.02,
+            0.02,
+            " | ".join(summary_lines),
+            transform=ax.transAxes,
+            ha='left',
+            va='bottom',
+            fontsize=9,
+            color='black',
+            bbox=dict(facecolor='white', edgecolor='gray', alpha=0.85, boxstyle='round,pad=0.25'),
+        )
         ax.grid(True, linestyle=':', alpha=0.5)
-        
-        save_path = os.path.join(img_dir, f"path_planning_{i+1}.png")
+
+        save_path = os.path.join(img_dir, _build_output_filename(i + 1, mode_info['slug']))
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         print(f"Saved {save_path}")

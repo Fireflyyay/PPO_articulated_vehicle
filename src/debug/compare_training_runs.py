@@ -10,7 +10,11 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from tensorboard.backend.event_processing import event_accumulator
+
+try:
+    from tensorboard.backend.event_processing import event_accumulator
+except ModuleNotFoundError:
+    event_accumulator = None
 
 
 SELECTED_TAGS = [
@@ -29,15 +33,45 @@ SELECTED_TAGS = [
     "takeover/score_ms_mean",
     "takeover/success_when_used",
     "takeover/action_KL",
+    "refinement/enabled",
+    "refinement/triggered",
+    "refinement/plan_count",
+    "refinement/plan_rate",
+    "refinement/applied_plan_ratio",
+    "refinement/feasible_plan_ratio",
+    "refinement/plan_length_mean",
+    "refinement/attempted_steps",
+    "refinement/applied_steps",
+    "refinement/attempted_ratio",
+    "refinement/applied_ratio",
+    "refinement/feasible_ratio",
+    "refinement/cost_delta_mean",
+    "refinement/cost_delta_sum",
+    "refinement/prefix_shrink_ratio",
+    "refinement/prefix_shrink_steps_mean",
+    "refinement/runtime_ms_mean",
+    "refinement/terminal_scale_mean",
     "adaptive/triggered",
     "adaptive/library_size",
+    "adaptive/library_size_absolute",
+    "adaptive/library_size_from_base",
+    "adaptive/library_capacity_utilization",
     "adaptive/post_expand_freeze_remaining",
     "adaptive/validation_success_before",
     "adaptive/validation_success_after",
     "adaptive/validation_extreme_success_before",
     "adaptive/validation_extreme_success_after",
+    "adaptive/validation_success_gain",
+    "adaptive/validation_extreme_success_gain",
+    "adaptive/validation_success_gain_per_added_primitive",
+    "adaptive/validation_extreme_success_gain_per_added_primitive",
     "adaptive/success_rate_recent",
     "adaptive/hard_success_rate_recent",
+    "adaptive/post_expand_success_uplift_recent",
+    "adaptive/post_expand_hard_success_uplift_recent",
+    "adaptive/post_expand_success_uplift_per_added_primitive_recent",
+    "adaptive/post_expand_hard_success_uplift_per_added_primitive_recent",
+    "adaptive/post_expand_episode_delta",
     "lr/actor",
     "lr/critic",
     "lr/post_expand_scale",
@@ -65,11 +99,39 @@ PLOT_GROUPS = {
         "takeover/success_when_used",
         "takeover/action_KL",
     ],
+    "refinement": [
+        "refinement/triggered",
+        "refinement/plan_count",
+        "refinement/plan_rate",
+        "refinement/applied_plan_ratio",
+        "refinement/feasible_plan_ratio",
+        "refinement/plan_length_mean",
+        "refinement/attempted_ratio",
+        "refinement/applied_ratio",
+        "refinement/feasible_ratio",
+        "refinement/cost_delta_mean",
+        "refinement/prefix_shrink_ratio",
+        "refinement/runtime_ms_mean",
+    ],
     "adaptive": [
         "adaptive/library_size",
+        "adaptive/library_size_absolute",
+        "adaptive/library_size_from_base",
+        "adaptive/library_capacity_utilization",
         "adaptive/post_expand_freeze_remaining",
         "adaptive/success_rate_recent",
         "adaptive/hard_success_rate_recent",
+    ],
+    "adaptive_uplift": [
+        "adaptive/validation_success_gain",
+        "adaptive/validation_extreme_success_gain",
+        "adaptive/validation_success_gain_per_added_primitive",
+        "adaptive/validation_extreme_success_gain_per_added_primitive",
+        "adaptive/post_expand_success_uplift_recent",
+        "adaptive/post_expand_hard_success_uplift_recent",
+        "adaptive/post_expand_success_uplift_per_added_primitive_recent",
+        "adaptive/post_expand_hard_success_uplift_per_added_primitive_recent",
+        "adaptive/post_expand_episode_delta",
     ],
     "learning_rate": [
         "lr/actor",
@@ -95,10 +157,44 @@ TAG_TITLES = {
     "takeover/score_ms_mean": "Takeover scoring latency",
     "takeover/success_when_used": "Success when takeover used",
     "takeover/action_KL": "Policy vs takeover action KL",
+    "refinement/enabled": "Primitive refinement enabled",
+    "refinement/triggered": "Primitive plan refinement triggered",
+    "refinement/plan_count": "Primitive plan refinement count",
+    "refinement/plan_rate": "Primitive plan refinement rate",
+    "refinement/applied_plan_ratio": "Primitive plan refinement applied ratio",
+    "refinement/feasible_plan_ratio": "Primitive plan refinement feasible ratio",
+    "refinement/plan_length_mean": "Primitive plan refinement mean plan length",
+    "refinement/attempted_steps": "Primitive refinement attempted steps",
+    "refinement/applied_steps": "Primitive refinement applied steps",
+    "refinement/attempted_ratio": "Primitive refinement attempted ratio",
+    "refinement/applied_ratio": "Primitive refinement applied ratio",
+    "refinement/feasible_ratio": "Primitive refinement feasible ratio",
+    "refinement/cost_delta_mean": "Primitive refinement mean cost drop",
+    "refinement/cost_delta_sum": "Primitive refinement total cost drop",
+    "refinement/prefix_shrink_ratio": "Primitive refinement prefix shrink ratio",
+    "refinement/prefix_shrink_steps_mean": "Primitive refinement mean prefix shrink steps",
+    "refinement/runtime_ms_mean": "Primitive refinement latency",
+    "refinement/terminal_scale_mean": "Primitive refinement terminal scale",
     "adaptive/library_size": "Adaptive library size",
+    "adaptive/library_size_absolute": "Adaptive library size (absolute)",
+    "adaptive/library_size_from_base": "Adaptive library growth from base",
+    "adaptive/library_capacity_utilization": "Adaptive library capacity utilization",
     "adaptive/post_expand_freeze_remaining": "Freeze episodes remaining",
+    "adaptive/validation_success_before": "Validation success before expansion",
+    "adaptive/validation_success_after": "Validation success after expansion",
+    "adaptive/validation_extreme_success_before": "Validation extreme success before expansion",
+    "adaptive/validation_extreme_success_after": "Validation extreme success after expansion",
+    "adaptive/validation_success_gain": "Validation success gain",
+    "adaptive/validation_extreme_success_gain": "Validation extreme success gain",
+    "adaptive/validation_success_gain_per_added_primitive": "Validation success gain per added primitive",
+    "adaptive/validation_extreme_success_gain_per_added_primitive": "Validation extreme gain per added primitive",
     "adaptive/success_rate_recent": "Recent success rate",
     "adaptive/hard_success_rate_recent": "Recent hard-scene success rate",
+    "adaptive/post_expand_success_uplift_recent": "Post-expand recent success uplift",
+    "adaptive/post_expand_hard_success_uplift_recent": "Post-expand hard-scene success uplift",
+    "adaptive/post_expand_success_uplift_per_added_primitive_recent": "Post-expand success uplift per added primitive",
+    "adaptive/post_expand_hard_success_uplift_per_added_primitive_recent": "Post-expand hard uplift per added primitive",
+    "adaptive/post_expand_episode_delta": "Episodes since latest expansion",
     "lr/actor": "Actor learning rate",
     "lr/critic": "Critic learning rate",
     "lr/post_expand_scale": "Post-expand LR scale",
@@ -167,6 +263,10 @@ def parse_best_txt(run_dir: str):
 
 
 def load_scalars(event_file: str) -> Tuple[Dict, List[str]]:
+    if event_accumulator is None:
+        raise ModuleNotFoundError(
+            "tensorboard is required to read event files. Install it with `pip install tensorboard`."
+        )
     acc = event_accumulator.EventAccumulator(
         event_file,
         size_guidance={event_accumulator.SCALARS: 0},
@@ -382,6 +482,11 @@ def summarize_adaptive_rounds(run: RunData) -> List[Dict]:
     ext_before = run.tags.get("adaptive/validation_extreme_success_before")
     ext_after = run.tags.get("adaptive/validation_extreme_success_after")
     lib_size = run.tags.get("adaptive/library_size")
+    lib_size_abs = run.tags.get("adaptive/library_size_absolute")
+    success_gain = run.tags.get("adaptive/validation_success_gain")
+    extreme_gain = run.tags.get("adaptive/validation_extreme_success_gain")
+    success_gain_per_added = run.tags.get("adaptive/validation_success_gain_per_added_primitive")
+    extreme_gain_per_added = run.tags.get("adaptive/validation_extreme_success_gain_per_added_primitive")
     rounds = []
     for idx, step in enumerate(triggers):
         item = {"index": idx + 1, "step": int(step)}
@@ -393,10 +498,19 @@ def summarize_adaptive_rounds(run: RunData) -> List[Dict]:
             item["val_extreme_before"] = float(ext_before["values"][idx])
         if ext_after and idx < len(ext_after["values"]):
             item["val_extreme_after"] = float(ext_after["values"][idx])
-        if lib_size:
+        if success_gain and idx < len(success_gain["values"]):
+            item["val_success_gain"] = float(success_gain["values"][idx])
+        if extreme_gain and idx < len(extreme_gain["values"]):
+            item["val_extreme_gain"] = float(extreme_gain["values"][idx])
+        if success_gain_per_added and idx < len(success_gain_per_added["values"]):
+            item["val_success_gain_per_added"] = float(success_gain_per_added["values"][idx])
+        if extreme_gain_per_added and idx < len(extreme_gain_per_added["values"]):
+            item["val_extreme_gain_per_added"] = float(extreme_gain_per_added["values"][idx])
+        lib_series = lib_size_abs or lib_size
+        if lib_series:
             size_step = None
             size_value = None
-            for ls, lv in zip(lib_size["steps"], lib_size["values"]):
+            for ls, lv in zip(lib_series["steps"], lib_series["values"]):
                 if int(ls) == int(step):
                     size_step = int(ls)
                     size_value = float(lv)
@@ -405,6 +519,24 @@ def summarize_adaptive_rounds(run: RunData) -> List[Dict]:
                 item["library_size"] = size_value
         rounds.append(item)
     return rounds
+
+
+def summarize_adaptive_uplift(run: RunData) -> Dict:
+    result = {}
+    for tag in [
+        "adaptive/validation_success_gain",
+        "adaptive/validation_extreme_success_gain",
+        "adaptive/validation_success_gain_per_added_primitive",
+        "adaptive/validation_extreme_success_gain_per_added_primitive",
+        "adaptive/post_expand_success_uplift_recent",
+        "adaptive/post_expand_hard_success_uplift_recent",
+        "adaptive/post_expand_success_uplift_per_added_primitive_recent",
+        "adaptive/post_expand_hard_success_uplift_per_added_primitive_recent",
+    ]:
+        stats = summarize_series(run, tag)
+        if stats is not None:
+            result[tag] = stats
+    return result
 
 
 def save_json(path: str, payload):
@@ -497,6 +629,8 @@ def build_interpretation(
     takeover_a: Dict,
     takeover_b: Dict,
     config_diffs: List[Dict],
+    uplift_a: Dict,
+    uplift_b: Dict,
 ) -> List[str]:
     notes = []
     complex_row = next((row for row in best_rows if row["scene"] == "Complex"), None)
@@ -568,6 +702,20 @@ def build_interpretation(
                 f"{run_b.label} 在 {regressions}/{len(rounds_b)} 次 adaptive round 后，validation_success_after 低于 validation_success_before，说明扩展后并非每次都立即带来收益。"
             )
 
+    gain_a = uplift_a.get("adaptive/validation_success_gain", {}).get("tail_mean")
+    gain_b = uplift_b.get("adaptive/validation_success_gain", {}).get("tail_mean")
+    if gain_a is not None or gain_b is not None:
+        notes.append(
+            f"轮次级扩容收益可直接从 validation_success_gain 观察：{run_a.label} 的尾段均值为 {format_float(gain_a)}，{run_b.label} 为 {format_float(gain_b)}。"
+        )
+
+    per_added_a = uplift_a.get("adaptive/validation_success_gain_per_added_primitive", {}).get("tail_mean")
+    per_added_b = uplift_b.get("adaptive/validation_success_gain_per_added_primitive", {}).get("tail_mean")
+    if per_added_a is not None or per_added_b is not None:
+        notes.append(
+            f"按新增基元归一化后，validation_success_gain_per_added_primitive 更适合比较扩库效率：{run_a.label} 为 {format_float(per_added_a)}，{run_b.label} 为 {format_float(per_added_b)}。"
+        )
+
     scale_stats = lr_b.get("lr/post_expand_scale")
     if scale_stats is not None:
         notes.append(
@@ -602,6 +750,7 @@ def write_report(path: str, run_a: RunData, run_b: RunData, summary: dict):
     config_diffs = summary["config_diffs"]
     critical_diffs = summary["critical_config_diffs"]
     takeover_summary = summary["takeover"]
+    adaptive_uplift = summary["adaptive_uplift"]
     lines = []
     lines.append("# PPO training run comparison")
     lines.append("")
@@ -628,6 +777,8 @@ def write_report(path: str, run_a: RunData, run_b: RunData, summary: dict):
     lines.append(f"- {run_b.label} has LR tags: {'yes' if 'lr/actor' in run_b.tags else 'no'}")
     lines.append(f"- {run_a.label} has takeover tags: {'yes' if takeover_summary[run_a.label].get('has_takeover_logging') else 'no'}")
     lines.append(f"- {run_b.label} has takeover tags: {'yes' if takeover_summary[run_b.label].get('has_takeover_logging') else 'no'}")
+    lines.append(f"- {run_a.label} has adaptive uplift tags: {'yes' if bool(adaptive_uplift[run_a.label]) else 'no'}")
+    lines.append(f"- {run_b.label} has adaptive uplift tags: {'yes' if bool(adaptive_uplift[run_b.label]) else 'no'}")
     lines.append("")
     lines.append("## Critical config differences")
     lines.append("")
@@ -669,21 +820,35 @@ def write_report(path: str, run_a: RunData, run_b: RunData, summary: dict):
             lines.append("")
             continue
         lines.append("")
-        lines.append("| Round | Episode | Val before | Val after | Extreme before | Extreme after | Library size |")
-        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        lines.append("| Round | Episode | Val before | Val after | Gain | Gain/add | Extreme before | Extreme after | Extreme gain | Extreme gain/add | Library size |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
         for row in rounds:
             lines.append(
-                "| {index} | {step} | {before} | {after} | {ext_before} | {ext_after} | {size} |".format(
+                "| {index} | {step} | {before} | {after} | {gain} | {gain_per_added} | {ext_before} | {ext_after} | {ext_gain} | {ext_gain_per_added} | {size} |".format(
                     index=row.get("index", "N/A"),
                     step=row.get("step", "N/A"),
                     before=format_float(row.get("val_success_before")),
                     after=format_float(row.get("val_success_after")),
+                    gain=format_float(row.get("val_success_gain")),
+                    gain_per_added=format_float(row.get("val_success_gain_per_added")),
                     ext_before=format_float(row.get("val_extreme_before")),
                     ext_after=format_float(row.get("val_extreme_after")),
+                    ext_gain=format_float(row.get("val_extreme_gain")),
+                    ext_gain_per_added=format_float(row.get("val_extreme_gain_per_added")),
                     size=format_float(row.get("library_size")),
                 )
             )
         lines.append("")
+    lines.append("## Adaptive uplift summary")
+    lines.append("")
+    lines.append("| Metric | Run | Last | Tail mean | Best | Best step |")
+    lines.append("| --- | --- | ---: | ---: | ---: | ---: |")
+    for label in (run_a.label, run_b.label):
+        for tag, stats in adaptive_uplift[label].items():
+            lines.append(
+                f"| {tag} | {label} | {format_float(stats.get('last_value'))} | {format_float(stats.get('tail_mean'))} | {format_float(stats.get('best_value'))} | {format_float(stats.get('best_step'))} |"
+            )
+    lines.append("")
     lines.append("## Key metric summaries")
     lines.append("")
     for tag in SELECTED_TAGS:
@@ -750,6 +915,8 @@ def main():
     rounds_b = summarize_adaptive_rounds(run_b)
     takeover_a = summarize_takeover(run_a)
     takeover_b = summarize_takeover(run_b)
+    uplift_a = summarize_adaptive_uplift(run_a)
+    uplift_b = summarize_adaptive_uplift(run_b)
     config_diffs = diff_configs(run_a, run_b)
     critical_config_diffs = select_config_diffs(
         config_diffs,
@@ -790,6 +957,10 @@ def main():
             run_a.label: rounds_a,
             run_b.label: rounds_b,
         },
+        "adaptive_uplift": {
+            run_a.label: uplift_a,
+            run_b.label: uplift_b,
+        },
         "figures": figures,
     }
     summary["interpretation"] = build_interpretation(
@@ -803,6 +974,8 @@ def main():
         takeover_a,
         takeover_b,
         config_diffs,
+        uplift_a,
+        uplift_b,
     )
 
     save_json(os.path.join(args.output_dir, "summary.json"), summary)

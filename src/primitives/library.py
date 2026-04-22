@@ -15,18 +15,25 @@ class PrimitiveLibrary:
             except Exception:
                 self.meta = {}
 
-        # Optional offline grid index (for fast terminal takeover pruning).
+        # Optional offline mask/grid index (for fast terminal takeover pruning and action-mask prefiltering).
         # Best-effort load; training should still run without it.
         self.grid_index = None
+        self.mask_index = None
         try:
             from primitives.primitive_index import try_load_index_for_library
 
             explicit = None
             if isinstance(self.meta, dict):
-                explicit = self.meta.get('index_path', None)
+                explicit = (
+                    self.meta.get('mask_index_path', None)
+                    or self.meta.get('index_path', None)
+                    or self.meta.get('grid_index_path', None)
+                )
             self.grid_index = try_load_index_for_library(self.npz_path, explicit_index_path=explicit)
+            self.mask_index = self.grid_index
         except Exception:
             self.grid_index = None
+            self.mask_index = None
         
     @property
     def size(self):

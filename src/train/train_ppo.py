@@ -237,6 +237,96 @@ def _log_adaptive_round_uplift(
         episode_idx,
     )
 
+
+def _new_refinement_episode_stats() -> dict:
+    return {
+        "plan_count": 0,
+        "applied_plans": 0,
+        "feasible_plans": 0,
+        "cost_deltas": [],
+        "runtime_ms": [],
+        "terminal_scales": [],
+        "plan_lengths": [],
+        "terminal_window_cost_after": [],
+        "final_barrier_cost_after": [],
+        "final_position_error_before": [],
+        "final_position_error_after": [],
+        "final_heading_error_deg_before": [],
+        "final_heading_error_deg_after": [],
+        "final_mean_overlap_before": [],
+        "final_mean_overlap_after": [],
+        "final_front_overlap_after": [],
+        "final_rear_overlap_after": [],
+    }
+
+
+def _update_refinement_episode_stats(stats: dict, debug_info) -> None:
+    if not isinstance(debug_info, dict):
+        return
+
+    stats["plan_count"] += 1
+    if bool(debug_info.get("applied", False)):
+        stats["applied_plans"] += 1
+    if bool(debug_info.get("feasible", False)):
+        stats["feasible_plans"] += 1
+
+    cost_before = _to_scalar(debug_info.get("cost_before", 0.0), 0.0)
+    cost_after = _to_scalar(debug_info.get("cost_after", 0.0), 0.0)
+    stats["cost_deltas"].append(float(max(0.0, cost_before - cost_after)))
+
+    runtime_ms = _to_scalar(debug_info.get("elapsed_ms", 0.0), 0.0)
+    terminal_scale = _to_scalar(debug_info.get("terminal_scale", 1.0), 1.0)
+    plan_length = _to_scalar(debug_info.get("plan_length", 0.0), 0.0)
+
+    stats["runtime_ms"].append(float(max(0.0, runtime_ms)))
+    stats["terminal_scales"].append(float(max(0.0, terminal_scale)))
+    stats["plan_lengths"].append(float(max(0.0, plan_length)))
+    stats["terminal_window_cost_after"].append(_to_scalar(debug_info.get("terminal_window_cost_after", 0.0), 0.0))
+    stats["final_barrier_cost_after"].append(_to_scalar(debug_info.get("final_barrier_cost_after", 0.0), 0.0))
+    stats["final_position_error_before"].append(_to_scalar(debug_info.get("final_position_error_before", 0.0), 0.0))
+    stats["final_position_error_after"].append(_to_scalar(debug_info.get("final_position_error_after", 0.0), 0.0))
+    stats["final_heading_error_deg_before"].append(_to_scalar(debug_info.get("final_heading_error_deg_before", 0.0), 0.0))
+    stats["final_heading_error_deg_after"].append(_to_scalar(debug_info.get("final_heading_error_deg_after", 0.0), 0.0))
+    stats["final_mean_overlap_before"].append(_to_scalar(debug_info.get("final_mean_overlap_before", 0.0), 0.0))
+    stats["final_mean_overlap_after"].append(_to_scalar(debug_info.get("final_mean_overlap_after", 0.0), 0.0))
+    stats["final_front_overlap_after"].append(_to_scalar(debug_info.get("final_front_overlap_after", 0.0), 0.0))
+    stats["final_rear_overlap_after"].append(_to_scalar(debug_info.get("final_rear_overlap_after", 0.0), 0.0))
+
+
+def _log_refinement_episode_stats(writer, episode_idx: int, step_num: int, enabled: bool, stats: dict) -> None:
+    plan_count = int(stats.get("plan_count", 0))
+    applied_plans = int(stats.get("applied_plans", 0))
+    feasible_plans = int(stats.get("feasible_plans", 0))
+
+    writer.add_scalar("refinement/enabled", float(bool(enabled)), episode_idx)
+    writer.add_scalar("refinement/triggered", float(plan_count > 0), episode_idx)
+    writer.add_scalar("refinement/plan_count", float(plan_count), episode_idx)
+    writer.add_scalar("refinement/plan_rate", float(plan_count) / float(max(1, step_num)), episode_idx)
+    writer.add_scalar("refinement/attempted_steps", float(plan_count), episode_idx)
+    writer.add_scalar("refinement/applied_steps", float(applied_plans), episode_idx)
+    writer.add_scalar("refinement/attempted_ratio", float(plan_count) / float(max(1, step_num)), episode_idx)
+    writer.add_scalar("refinement/applied_ratio", float(applied_plans) / float(max(1, plan_count)), episode_idx)
+    writer.add_scalar("refinement/applied_plan_ratio", float(applied_plans) / float(max(1, plan_count)), episode_idx)
+    writer.add_scalar("refinement/feasible_ratio", float(feasible_plans) / float(max(1, plan_count)), episode_idx)
+    writer.add_scalar("refinement/feasible_plan_ratio", float(feasible_plans) / float(max(1, plan_count)), episode_idx)
+    writer.add_scalar("refinement/plan_length_mean", _safe_mean(stats.get("plan_lengths", [])), episode_idx)
+    writer.add_scalar("refinement/cost_delta_mean", _safe_mean(stats.get("cost_deltas", [])), episode_idx)
+    writer.add_scalar("refinement/cost_delta_sum", float(np.sum(stats.get("cost_deltas", []) or [0.0])), episode_idx)
+    writer.add_scalar("refinement/prefix_shrink_ratio", 0.0, episode_idx)
+    writer.add_scalar("refinement/prefix_shrink_steps_mean", 0.0, episode_idx)
+    writer.add_scalar("refinement/runtime_ms_mean", _safe_mean(stats.get("runtime_ms", [])), episode_idx)
+    writer.add_scalar("refinement/terminal_scale_mean", _safe_mean(stats.get("terminal_scales", [])), episode_idx)
+    writer.add_scalar("refinement/terminal_window_cost_after_mean", _safe_mean(stats.get("terminal_window_cost_after", [])), episode_idx)
+    writer.add_scalar("refinement/final_barrier_cost_after_mean", _safe_mean(stats.get("final_barrier_cost_after", [])), episode_idx)
+    writer.add_scalar("refinement/final_position_error_before_mean", _safe_mean(stats.get("final_position_error_before", [])), episode_idx)
+    writer.add_scalar("refinement/final_position_error_after_mean", _safe_mean(stats.get("final_position_error_after", [])), episode_idx)
+    writer.add_scalar("refinement/final_heading_error_deg_before_mean", _safe_mean(stats.get("final_heading_error_deg_before", [])), episode_idx)
+    writer.add_scalar("refinement/final_heading_error_deg_after_mean", _safe_mean(stats.get("final_heading_error_deg_after", [])), episode_idx)
+    writer.add_scalar("refinement/final_mean_overlap_before_mean", _safe_mean(stats.get("final_mean_overlap_before", [])), episode_idx)
+    writer.add_scalar("refinement/final_mean_overlap_after_mean", _safe_mean(stats.get("final_mean_overlap_after", [])), episode_idx)
+    writer.add_scalar("refinement/final_front_overlap_after_mean", _safe_mean(stats.get("final_front_overlap_after", [])), episode_idx)
+    writer.add_scalar("refinement/final_rear_overlap_after_mean", _safe_mean(stats.get("final_rear_overlap_after", [])), episode_idx)
+
 class SceneChoose:
     """Failure-driven curriculum sampler (ported from HOPE).
 
@@ -771,6 +861,7 @@ if __name__=="__main__":
         ep_prune_ms = []
         ep_score_ms = []
         ep_imitation_samples = 0
+        ep_refinement_stats = _new_refinement_episode_stats()
         # action distributions
         n_actions = env.action_space.n if USE_MOTION_PRIMITIVES else None
         ep_action_counts = np.zeros((n_actions,), dtype=np.int64) if n_actions is not None else None
@@ -821,6 +912,8 @@ if __name__=="__main__":
                     ep_prune_ms.append(float(dbg['fast_prune_ms']))
                 if 'score_ms' in dbg:
                     ep_score_ms.append(float(dbg['score_ms']))
+
+            _update_refinement_episode_stats(ep_refinement_stats, info.get('refinement_plan_debug', None))
 
             if ep_action_counts is not None:
                 try:
@@ -915,6 +1008,13 @@ if __name__=="__main__":
             writer.add_scalar("takeover/triggered", float(ep_takeover_triggered), i)
             writer.add_scalar("takeover/step_ratio", float(ep_takeover_steps) / float(max(1, step_num)), i)
             writer.add_scalar("takeover/steps", float(ep_takeover_steps), i)
+            _log_refinement_episode_stats(
+                writer,
+                i,
+                step_num,
+                bool(USE_PRIMITIVE_REFINEMENT),
+                ep_refinement_stats,
+            )
 
             if len(ep_plan_ms) > 0:
                 writer.add_scalar("takeover/plan_ms_mean", float(np.mean(ep_plan_ms)), i)

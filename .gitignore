@@ -24,4 +24,6 @@ venv/
 *.swp
 Thumbs.db
 /src/log/*
+.copilot
+
 

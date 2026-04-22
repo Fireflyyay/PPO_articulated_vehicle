@@ -16,6 +16,11 @@ try:
 except Exception:  # pragma: no cover
     RecedingHorizonTakeoverPlanner = None
 
+try:
+    from primitives.primitive_refinement import PrimitiveTrajectoryRefiner
+except Exception:  # pragma: no cover
+    PrimitiveTrajectoryRefiner = None
+
 class MacroActionWrapper(gym.Wrapper):
     """
     Gym wrapper that converts discrete primitive IDs into a sequence of low-level actions.
@@ -75,7 +80,7 @@ class MacroActionWrapper(gym.Wrapper):
             )
 
             self._takeover_enabled = bool(TAKEOVER_ENABLE)
-            use_rhp = bool(self._takeover_enabled and TAKEOVER_USE_RHP)
+            use_rhp = bool(TAKEOVER_USE_RHP)
         except Exception:
             self._takeover_enabled = True
             use_rhp = False
@@ -164,6 +169,11 @@ class MacroActionWrapper(gym.Wrapper):
 
         self._action_mask_cached = None
         self._action_mask_calls_since_update = 0
+        self._primitive_refiner = PrimitiveTrajectoryRefiner() if PrimitiveTrajectoryRefiner is not None else None
+        self._planned_action_queue = []
+        self._planned_primitive_queue = []
+        self._planned_phase_debug_queue = []
+        self._planned_cache_source = None
 
     def _ensure_mask_obstacle_cache(self):
         if self._mask_obstacles_prepared is not None and self._mask_obstacles_bounds is not None:
@@ -330,7 +340,7 @@ class MacroActionWrapper(gym.Wrapper):
         )
 
         return (front_box, rear_box)
-        
+
     def step(self, primitive_id):
         """
         Execute the primitive corresponding to primitive_id.
@@ -340,9 +350,14 @@ class MacroActionWrapper(gym.Wrapper):
         # Ensure primitive_id is int
         if isinstance(primitive_id, np.ndarray):
             primitive_id = primitive_id.item()
-        
+
         actions = self.primitive_lib.get_actions(primitive_id)
         # actions shape: [H, 2]
+
+        cached_plan_debug = None
+        cached_actions = self._pop_planned_actions(int(primitive_id))
+        if cached_actions is not None:
+            actions, cached_plan_debug = cached_actions
 
         total_reward = 0.0
         done = False
@@ -373,9 +388,9 @@ class MacroActionWrapper(gym.Wrapper):
                 })
         except Exception:
             pass
-        
+
         last_obs = None
-        
+
         # We need to handle potential 'truncated' from gymnasium if base env uses it.
         terminated = False
         truncated = False
@@ -405,7 +420,7 @@ class MacroActionWrapper(gym.Wrapper):
                 pass
 
             step_result = self.env.step(action_norm)
-            
+
             # Check return signature
             if len(step_result) == 5:
                 obs, reward, terminated, truncated, step_info = step_result
@@ -420,7 +435,7 @@ class MacroActionWrapper(gym.Wrapper):
             total_reward += reward
             steps_executed += 1
             last_obs = obs
-            
+
             # Merge info
             info.update(step_info)
 
@@ -443,12 +458,14 @@ class MacroActionWrapper(gym.Wrapper):
                 macro_exec_trace["status_seq"].append(str(st_status))
             except Exception:
                 pass
-            
+
             if done:
                 break
-        
+
         info['primitive_id'] = primitive_id
         info['executed_steps'] = steps_executed
+        if cached_plan_debug is not None:
+            info['refinement_plan_step'] = True
         if used_prefix_steps is not None:
             info['prefix_steps_used'] = int(used_prefix_steps)
 
@@ -470,7 +487,7 @@ class MacroActionWrapper(gym.Wrapper):
             info.setdefault('takeover_active', False)
             info.setdefault('takeover_triggered', False)
             info['takeover_error'] = str(exc)
-        
+
         # Return consistent with Gymnasium
         return last_obs, total_reward, terminated, truncated, info
 
@@ -503,9 +520,92 @@ class MacroActionWrapper(gym.Wrapper):
             "rel_angle": rel_angle,
         }
 
+    def _takeover_enabled_now(self) -> bool:
+        try:
+            from configs import TAKEOVER_ENABLE
+
+            self._takeover_enabled = bool(TAKEOVER_ENABLE)
+        except Exception:
+            pass
+        return bool(getattr(self, '_takeover_enabled', True))
+
+    def _primitive_refinement_enabled_now(self) -> bool:
+        try:
+            from configs import USE_PRIMITIVE_REFINEMENT
+
+            enabled = bool(USE_PRIMITIVE_REFINEMENT)
+        except Exception:
+            enabled = False
+        return bool(enabled and self._primitive_refiner is not None)
+
+    def _clear_planned_action_cache(self):
+        self._planned_action_queue.clear()
+        self._planned_primitive_queue.clear()
+        self._planned_phase_debug_queue.clear()
+        self._planned_cache_source = None
+
+    def _clear_takeover_plan_cache_if_owned(self):
+        if str(getattr(self, '_planned_cache_source', '')) == 'takeover':
+            self._clear_planned_action_cache()
+
+    def _pop_planned_actions(self, primitive_id: int):
+        if len(self._planned_action_queue) == 0:
+            return None
+        if len(self._planned_primitive_queue) == 0:
+            self._clear_planned_action_cache()
+            return None
+
+        expected_pid = int(self._planned_primitive_queue[0])
+        if int(primitive_id) != expected_pid:
+            self._clear_planned_action_cache()
+            return None
+
+        self._planned_primitive_queue.pop(0)
+        actions = np.asarray(self._planned_action_queue.pop(0), dtype=np.float64)
+        debug = self._planned_phase_debug_queue.pop(0) if len(self._planned_phase_debug_queue) > 0 else None
+        return actions, debug
+
+    def prepare_plan_execution(self, primitive_ids, prefix_steps: int = None, source: str = "external"):
+        primitive_ids = [int(pid) for pid in list(primitive_ids or [])]
+        self._clear_planned_action_cache()
+        self._prefix_steps_queue.clear()
+        if len(primitive_ids) == 0:
+            return None
+
+        phase_actions = [np.asarray(self.primitive_lib.get_actions(pid), dtype=np.float64).copy() for pid in primitive_ids]
+        plan_debug = None
+
+        if self._primitive_refinement_enabled_now():
+            try:
+                result = self._primitive_refiner.refine_plan(self.env, self.primitive_lib, primitive_ids)
+                phase_actions = [np.asarray(actions, dtype=np.float64).copy() for actions in result.phase_actions]
+                plan_debug = result.to_debug_dict()
+            except Exception as exc:
+                plan_debug = {
+                    "attempted": True,
+                    "applied": False,
+                    "feasible": False,
+                    "plan_length": int(len(primitive_ids)),
+                    "total_steps": int(sum(int(a.shape[0]) for a in phase_actions)),
+                    "reason": "error",
+                    "error": str(exc),
+                }
+
+        self._planned_action_queue = [np.asarray(actions, dtype=np.float64).copy() for actions in phase_actions]
+        self._planned_primitive_queue = list(primitive_ids)
+        self._planned_phase_debug_queue = [None] * len(primitive_ids)
+        self._planned_cache_source = str(source)
+
+        if prefix_steps is not None:
+            self._prefix_steps_queue = [int(prefix_steps)] + [None] * max(0, len(primitive_ids) - 1)
+        else:
+            self._prefix_steps_queue = [None] * len(primitive_ids)
+
+        return plan_debug
+
     def _should_takeover(self, obs_vec: np.ndarray) -> bool:
         """Dynamic trigger + hysteresis for terminal takeover."""
-        if not getattr(self, '_takeover_enabled', True):
+        if not self._takeover_enabled_now():
             return False
 
         goal = self._parse_goal_repr_from_obs(obs_vec)
@@ -588,12 +688,14 @@ class MacroActionWrapper(gym.Wrapper):
         if done:
             self._takeover_active = False
             self._prefix_steps_queue.clear()
+            self._clear_planned_action_cache()
             return
 
-        if not getattr(self, '_takeover_enabled', True):
+        if not self._takeover_enabled_now():
             self._takeover_active = False
             self._takeover_fail_count = 0
             self._prefix_steps_queue.clear()
+            self._clear_takeover_plan_cache_if_owned()
             info['takeover_active'] = False
             info['takeover_triggered'] = False
             return
@@ -614,6 +716,7 @@ class MacroActionWrapper(gym.Wrapper):
         if not self._takeover_active:
             self._takeover_fail_count = 0
             self._prefix_steps_queue.clear()
+            self._clear_takeover_plan_cache_if_owned()
             return
 
         # Build lidar slice
@@ -643,7 +746,10 @@ class MacroActionWrapper(gym.Wrapper):
         if not getattr(self, "_takeover_use_rhp", False):
             plan_ids = self.plan_to_dest(max_len=self.takeover_max_len)
             if plan_ids is not None and len(plan_ids) > 0:
+                refinement_plan_debug = self.prepare_plan_execution(plan_ids, prefix_steps=None, source="takeover")
                 info['path_to_dest'] = list(map(int, plan_ids))
+                if refinement_plan_debug is not None:
+                    info['refinement_plan_debug'] = refinement_plan_debug
             return
 
         if self._takeover_planner is not None:
@@ -675,17 +781,18 @@ class MacroActionWrapper(gym.Wrapper):
                 plan_ids = []
 
         if plan_ids is not None and len(plan_ids) > 0:
+            refinement_plan_debug = self.prepare_plan_execution(plan_ids, prefix_steps=prefix_steps, source="takeover")
             info['path_to_dest'] = list(map(int, plan_ids))
             info['takeover_expert_primitive'] = int(plan_ids[0])
             info['takeover_plan_length'] = int(len(plan_ids))
             if prefix_steps is not None:
-                self._prefix_steps_queue = [int(prefix_steps)] + [None] * max(0, len(plan_ids) - 1)
                 info['takeover_prefix_steps'] = int(prefix_steps)
-            else:
-                self._prefix_steps_queue = [None] * len(plan_ids)
+            if refinement_plan_debug is not None:
+                info['refinement_plan_debug'] = refinement_plan_debug
 
             self._takeover_prev_choice = int(plan_ids[0])
         else:
+            self._clear_takeover_plan_cache_if_owned()
             info['takeover_no_path'] = True
 
         # Light profiling hooks
@@ -1021,6 +1128,7 @@ class MacroActionWrapper(gym.Wrapper):
         self._takeover_mode = "auto"
         self._takeover_fail_count = 0
         self._prefix_steps_queue.clear()
+        self._clear_planned_action_cache()
 
         # Invalidate obstacle cache; it will be rebuilt lazily on first mask query.
         self._mask_obstacles_prepared = None
@@ -1078,6 +1186,8 @@ def update_primitive_library(env_or_wrapper, new_lib, H: int = None):
     try:
         w._mask_obstacles_prepared = None
         w._mask_obstacles_bounds = None
+        w._prefix_steps_queue.clear()
+        w._clear_planned_action_cache()
     except Exception:
         pass
 
