@@ -34,7 +34,7 @@ class PrimitiveLibrary:
         except Exception:
             self.grid_index = None
             self.mask_index = None
-        
+
     @property
     def size(self):
         return self.actions.shape[0]
@@ -51,7 +51,7 @@ class PrimitiveLibrary:
 
     def get_actions(self, primitive_id):
         return self.actions[primitive_id]
-        
+
     def get_delta(self, primitive_id):
         return self.deltas[primitive_id]
 
