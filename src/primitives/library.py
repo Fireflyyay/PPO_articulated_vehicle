@@ -19,6 +19,7 @@ class PrimitiveLibrary:
         # Best-effort load; training should still run without it.
         self.grid_index = None
         self.mask_index = None
+        self.ray_safety_index = None
         try:
             from primitives.primitive_index import try_load_index_for_library
 
@@ -34,6 +35,21 @@ class PrimitiveLibrary:
         except Exception:
             self.grid_index = None
             self.mask_index = None
+
+        try:
+            from primitives.primitive_ray_safety import try_load_ray_safety_for_library
+
+            explicit = None
+            if isinstance(self.meta, dict):
+                explicit = self.meta.get('ray_safety_path', None)
+            self.ray_safety_index = try_load_ray_safety_for_library(
+                self.npz_path,
+                actions=self.actions,
+                deltas=self.deltas,
+                explicit_path=explicit,
+            )
+        except Exception:
+            self.ray_safety_index = None
 
     @property
     def size(self):

@@ -52,6 +52,8 @@ class PPOConfig(ConfigBase):
         self.imitation_batch_size = 256
         self.imitation_min_buffer = 128
         self.imitation_loss_weight = 0.05
+        self.soft_mask_logit_lambda = 1.0
+        self.soft_mask_small_value = 1e-8
 
         self.merge_configs(configs)
 
@@ -246,7 +248,7 @@ class PPOAgent(AgentBase):
         if action_mask is None:
             masked_logits = logits
         else:
-            mask = torch.as_tensor(action_mask, device=logits.device, dtype=torch.bool)
+            mask = torch.as_tensor(action_mask, device=logits.device)
             if mask.dim() == 1:
                 mask = mask.unsqueeze(0)
             if mask.shape != logits.shape:
@@ -255,7 +257,13 @@ class PPOAgent(AgentBase):
                     mask = mask.expand(logits.shape[0], -1)
             if mask.shape != logits.shape:
                 masked_logits = logits
+            elif torch.is_floating_point(mask):
+                soft_mask = torch.clamp(mask.to(dtype=torch.float32), 0.0, 1.0)
+                lambda_mask = float(getattr(self.configs, "soft_mask_logit_lambda", 1.0))
+                small_value = float(getattr(self.configs, "soft_mask_small_value", 1e-8))
+                masked_logits = logits + lambda_mask * torch.log(torch.clamp(soft_mask, min=small_value))
             else:
+                mask = mask.to(dtype=torch.bool)
                 masked_logits = logits.clone()
                 masked_logits[~mask] = -1e10
 
@@ -404,7 +412,7 @@ class PPOAgent(AgentBase):
 
         self.imitation_memory["state"].append(deepcopy(obs))
         self.imitation_memory["action"].append(int(action))
-        self.imitation_memory["action_mask"].append(None if action_mask is None else np.asarray(action_mask, dtype=np.int8).copy())
+        self.imitation_memory["action_mask"].append(None if action_mask is None else np.asarray(action_mask).copy())
 
     def imitation_buffer_size(self) -> int:
         return int(len(self.imitation_memory["state"]))
@@ -428,7 +436,7 @@ class PPOAgent(AgentBase):
                 if m is None:
                     masks.append(np.ones((int(self.configs.action_dim),), dtype=np.int8))
                 else:
-                    masks.append(np.asarray(m, dtype=np.int8))
+                    masks.append(np.asarray(m))
             masks = np.asarray(masks)
         return states, actions, masks
 
@@ -446,7 +454,7 @@ class PPOAgent(AgentBase):
         logits = self.actor_net(state_tensor)
         mask_tensor = None
         if action_mask is not None:
-            mask_tensor = torch.as_tensor(action_mask, dtype=torch.bool, device=self.device)
+            mask_tensor = torch.as_tensor(action_mask, device=self.device)
         dist = self._build_dist(logits, action_mask=mask_tensor)
         return -dist.log_prob(action_tensor).mean()
 
@@ -489,7 +497,7 @@ class PPOAgent(AgentBase):
         next_state_batch = self.obs2tensor(batches["next_obs"])
         action_mask_batch = None
         if self.discrete and "action_mask" in batches:
-            action_mask_batch = torch.as_tensor(batches["action_mask"], dtype=torch.bool, device=self.device)
+            action_mask_batch = torch.as_tensor(batches["action_mask"], device=self.device)
         self.memory.clear()
         imitation_loss_value = 0.0
 

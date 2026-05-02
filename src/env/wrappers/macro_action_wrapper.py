@@ -156,7 +156,9 @@ class MacroActionWrapper(gym.Wrapper):
             mode = str(ACTION_MASK_MODE).strip().lower()
         except Exception:
             mode = "hybrid"
-        if mode not in ("fast_only", "hybrid", "full"):
+        if mode in ("soft", "ray_soft"):
+            mode = "soft_ray"
+        if mode not in ("fast_only", "hybrid", "full", "soft_ray"):
             mode = "hybrid"
         self._action_mask_mode = mode
 
@@ -169,6 +171,48 @@ class MacroActionWrapper(gym.Wrapper):
 
         self._action_mask_cached = None
         self._action_mask_calls_since_update = 0
+        self._last_action_mask_debug = {}
+        self._ray_safety_index = getattr(self.primitive_lib, "ray_safety_index", None)
+        try:
+            from configs import (
+                SOFT_MASK_EPS,
+                SOFT_MASK_GAMMA,
+                SOFT_MASK_LOGIT_LAMBDA,
+                SOFT_MASK_MIN_ACTION_COUNT,
+                SOFT_MASK_SMALL_VALUE,
+                SOFT_MASK_TERMINAL_ARTICULATION_SCALE,
+                SOFT_MASK_TERMINAL_EPS,
+                SOFT_MASK_TERMINAL_GAMMA,
+                SOFT_MASK_TERMINAL_HEADING_SCALE,
+                SOFT_MASK_TERMINAL_RADIUS,
+                SOFT_MASK_TERMINAL_WEIGHT_MAX,
+                SOFT_MASK_TERMINAL_WEIGHT_MIN,
+            )
+        except Exception:
+            SOFT_MASK_GAMMA = 1.5
+            SOFT_MASK_EPS = 0.01
+            SOFT_MASK_SMALL_VALUE = 1e-8
+            SOFT_MASK_LOGIT_LAMBDA = 1.0
+            SOFT_MASK_TERMINAL_RADIUS = 4.0
+            SOFT_MASK_TERMINAL_GAMMA = 0.5
+            SOFT_MASK_TERMINAL_EPS = 0.05
+            SOFT_MASK_MIN_ACTION_COUNT = 6
+            SOFT_MASK_TERMINAL_HEADING_SCALE = math.radians(35.0)
+            SOFT_MASK_TERMINAL_ARTICULATION_SCALE = math.radians(35.0)
+            SOFT_MASK_TERMINAL_WEIGHT_MIN = 0.60
+            SOFT_MASK_TERMINAL_WEIGHT_MAX = 1.25
+        self._soft_mask_gamma = float(SOFT_MASK_GAMMA)
+        self._soft_mask_eps = float(SOFT_MASK_EPS)
+        self._soft_mask_small_value = float(SOFT_MASK_SMALL_VALUE)
+        self._soft_mask_logit_lambda = float(SOFT_MASK_LOGIT_LAMBDA)
+        self._soft_mask_terminal_radius = float(SOFT_MASK_TERMINAL_RADIUS)
+        self._soft_mask_terminal_gamma = float(SOFT_MASK_TERMINAL_GAMMA)
+        self._soft_mask_terminal_eps = float(SOFT_MASK_TERMINAL_EPS)
+        self._soft_mask_min_action_count = int(SOFT_MASK_MIN_ACTION_COUNT)
+        self._soft_mask_terminal_heading_scale = float(SOFT_MASK_TERMINAL_HEADING_SCALE)
+        self._soft_mask_terminal_articulation_scale = float(SOFT_MASK_TERMINAL_ARTICULATION_SCALE)
+        self._soft_mask_terminal_weight_min = float(SOFT_MASK_TERMINAL_WEIGHT_MIN)
+        self._soft_mask_terminal_weight_max = float(SOFT_MASK_TERMINAL_WEIGHT_MAX)
         self._primitive_refiner = PrimitiveTrajectoryRefiner() if PrimitiveTrajectoryRefiner is not None else None
         self._planned_action_queue = []
         self._planned_primitive_queue = []
@@ -226,6 +270,119 @@ class MacroActionWrapper(gym.Wrapper):
             return candidate_ids.astype(np.int64)
         except Exception:
             return None
+
+    def _terminal_weights_from_obs(self, obs_vec: np.ndarray) -> np.ndarray:
+        n_actions = int(self.action_space.n)
+        deltas = getattr(self.primitive_lib, "deltas", None)
+        if deltas is None:
+            return np.ones((n_actions,), dtype=np.float32)
+        deltas = np.asarray(deltas, dtype=np.float64)
+        if deltas.shape[0] != n_actions or deltas.shape[1] < 3:
+            return np.ones((n_actions,), dtype=np.float32)
+
+        goal = self._parse_goal_repr_from_obs(obs_vec)
+        gx = float(goal.get("goal_x", 0.0))
+        gy = float(goal.get("goal_y", 0.0))
+        gh = float(goal.get("goal_heading", 0.0))
+        art = float(goal.get("articulation", 0.0))
+        dist_before = max(float(goal.get("dist", 0.0)), 1e-6)
+        radius = max(float(self._soft_mask_terminal_radius), 1e-6)
+        heading_scale = max(float(self._soft_mask_terminal_heading_scale), 1e-6)
+        art_scale = max(float(self._soft_mask_terminal_articulation_scale), 1e-6)
+
+        dx = deltas[:, 0]
+        dy = deltas[:, 1]
+        dtheta = deltas[:, 2]
+        dgamma = deltas[:, 3] if deltas.shape[1] > 3 else np.zeros_like(dtheta)
+        pos_after = np.sqrt((gx - dx) * (gx - dx) + (gy - dy) * (gy - dy))
+        heading_err = np.abs((gh - dtheta + np.pi) % (2.0 * np.pi) - np.pi)
+        art_err = np.abs((art - dgamma + np.pi) % (2.0 * np.pi) - np.pi)
+        progress = np.clip((dist_before - pos_after) / radius, -1.0, 1.0)
+        pos_score = np.exp(-np.square(pos_after / radius))
+        heading_score = np.exp(-np.square(heading_err / heading_scale))
+        art_score = np.exp(-np.square(art_err / art_scale))
+        weights = (
+            0.72
+            + 0.28 * pos_score
+            + 0.22 * heading_score
+            + 0.08 * art_score
+            + 0.18 * np.maximum(progress, 0.0)
+            - 0.10 * np.maximum(-progress, 0.0)
+        )
+        return np.clip(
+            weights,
+            float(self._soft_mask_terminal_weight_min),
+            float(self._soft_mask_terminal_weight_max),
+        ).astype(np.float32)
+
+    def _compute_soft_ray_action_mask(self, obs_vec=None) -> np.ndarray:
+        t0 = time.perf_counter()
+        n_actions = int(self.action_space.n)
+        eps = float(self._soft_mask_eps)
+        index = getattr(self, "_ray_safety_index", None)
+        debug = {
+            "mode": "soft_ray",
+            "ray_safety_available": index is not None,
+            "terminal_reweight_applied": False,
+            "fallback": None,
+        }
+
+        if obs_vec is None:
+            mask = np.ones((n_actions,), dtype=np.float32)
+            debug["fallback"] = "missing_observation"
+        elif index is None:
+            candidate_ids = self._get_mask_candidate_ids(obs_vec, n_actions)
+            mask = np.full((n_actions,), eps, dtype=np.float32)
+            if candidate_ids is None:
+                mask[:] = 1.0
+                debug["fallback"] = "no_ray_safety_no_fast_index"
+            else:
+                mask[np.asarray(candidate_ids, dtype=np.int64)] = 1.0
+                debug["fallback"] = "fast_prune"
+                debug["precomputed_candidate_count"] = int(len(candidate_ids))
+        else:
+            try:
+                from configs import LIDAR_NUM, LIDAR_RANGE
+
+                lidar_num = int(LIDAR_NUM)
+                lidar_range = float(LIDAR_RANGE)
+            except Exception:
+                lidar_num = int(getattr(index, "lidar_num", 120))
+                lidar_range = float(getattr(index, "lidar_range", 30.0))
+            lidar = np.asarray(obs_vec, dtype=np.float64).reshape(-1)[:lidar_num]
+            mask, mask_debug = index.compute_soft_mask(
+                lidar,
+                gamma=float(self._soft_mask_gamma),
+                eps=eps,
+                lidar_range=lidar_range,
+            )
+            debug.update(mask_debug)
+            terminal = False
+            try:
+                goal = self._parse_goal_repr_from_obs(obs_vec)
+                terminal = float(goal.get("dist", 1e9)) <= float(self._soft_mask_terminal_radius)
+            except Exception:
+                terminal = False
+            terminal = terminal or int(mask_debug.get("positive_step_count", 0)) < int(self._soft_mask_min_action_count)
+            if terminal:
+                terminal_mask, terminal_debug = index.compute_soft_mask(
+                    lidar,
+                    gamma=float(self._soft_mask_terminal_gamma),
+                    eps=float(self._soft_mask_terminal_eps),
+                    lidar_range=lidar_range,
+                )
+                terminal_weights = self._terminal_weights_from_obs(obs_vec)
+                mask = np.clip(terminal_mask * terminal_weights, float(self._soft_mask_terminal_eps), 1.0).astype(np.float32)
+                debug.update({f"terminal_{k}": v for k, v in terminal_debug.items()})
+                debug["terminal_reweight_applied"] = True
+
+        debug["soft_mask_ms"] = float((time.perf_counter() - t0) * 1000.0)
+        debug["soft_mask_min"] = float(np.min(mask)) if mask.size else 0.0
+        debug["soft_mask_max"] = float(np.max(mask)) if mask.size else 0.0
+        debug["soft_mask_mean"] = float(np.mean(mask)) if mask.size else 0.0
+        debug["effective_action_count"] = int(np.count_nonzero(mask > (float(np.min(mask)) + 1e-6)))
+        self._last_action_mask_debug = debug
+        return mask.astype(np.float32)
 
     def _physical_to_normalized_action(self, action_phys: np.ndarray) -> np.ndarray:
         """Convert a physical action (steer, speed) into env-expected [-1, 1]."""
@@ -1002,15 +1159,25 @@ class MacroActionWrapper(gym.Wrapper):
         # for collision checking (paper's two-step collision detection). We let the
         # takeover planner prune/choose, and keep PPO log_prob consistent by not masking.
         if getattr(self, "_takeover_active", False):
+            if getattr(self, "_action_mask_mode", "hybrid") == "soft_ray":
+                return self._compute_soft_ray_action_mask(obs_vec)
             return np.ones(self.action_space.n, dtype=np.int8)
 
         if (
+            getattr(self, "_action_mask_mode", "hybrid") != "soft_ray"
+            and
             self._action_mask_update_every_k > 1
             and self._action_mask_cached is not None
             and self._action_mask_calls_since_update < (self._action_mask_update_every_k - 1)
         ):
             self._action_mask_calls_since_update += 1
             return self._action_mask_cached.copy()
+
+        if getattr(self, "_action_mask_mode", "hybrid") == "soft_ray":
+            mask = self._compute_soft_ray_action_mask(obs_vec)
+            self._action_mask_cached = mask.copy()
+            self._action_mask_calls_since_update = 0
+            return mask
 
         # If base env doesn't expose expected attributes, fall back to no mask.
         base_env = self.env
@@ -1173,6 +1340,7 @@ def update_primitive_library(env_or_wrapper, new_lib, H: int = None):
 
     # refresh cached deltas used by approximate planner ranking
     w._primitive_deltas = getattr(new_lib, 'deltas', None)
+    w._ray_safety_index = getattr(new_lib, 'ray_safety_index', None)
 
     # refresh takeover planner index (best-effort)
     try:

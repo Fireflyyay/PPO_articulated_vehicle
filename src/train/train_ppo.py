@@ -544,6 +544,8 @@ if __name__=="__main__":
         "imitation_batch_size": int(IMITATION_BATCH_SIZE),
         "imitation_min_buffer": int(IMITATION_MIN_BUFFER),
         "imitation_loss_weight": float(IMITATION_LOSS_WEIGHT),
+        "soft_mask_logit_lambda": float(SOFT_MASK_LOGIT_LAMBDA),
+        "soft_mask_small_value": float(SOFT_MASK_SMALL_VALUE),
         # Ensure gamma is consistent with macro-action horizon
         "gamma": (GAMMA_BASE ** primitive_h) if USE_MOTION_PRIMITIVES else GAMMA,
     }
@@ -1275,4 +1277,3 @@ if __name__=="__main__":
             _log_learning_rate_state(writer, i, parking_agent, lr_scale, restore_progress)
         else:
             _log_learning_rate_state(writer, i, parking_agent, 1.0, 1.0)
-
