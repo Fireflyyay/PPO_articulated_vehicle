@@ -2,7 +2,7 @@ import os
 import numpy as np
 import argparse
 
-from configs import VALID_SPEED, VALID_STEER
+from configs import HITCH_OFFSET, TRAILER_LENGTH, VALID_SPEED, VALID_STEER
 from env.vehicle import Vehicle, State
 
 def generate_primitives(H, S, output_path):
@@ -55,7 +55,11 @@ def generate_primitives(H, S, output_path):
             init_state = State(init_state_list)
             
             # Use articulated=True
-            vehicle = Vehicle(articulated=True)
+            vehicle = Vehicle(
+                articulated=True,
+                trailer_length=TRAILER_LENGTH,
+                hitch_offset=HITCH_OFFSET,
+            )
             vehicle.reset(init_state)
             
             # Apply action for H steps
@@ -124,8 +128,17 @@ def generate_primitives(H, S, output_path):
     
     # Save
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    np.savez_compressed(output_path, actions=primitives_actions, deltas=primitives_deltas, 
-                        meta={'H': H, 'S': S})
+    np.savez_compressed(
+        output_path,
+        actions=primitives_actions,
+        deltas=primitives_deltas,
+        meta={
+            'H': H,
+            'S': S,
+            'trailer_length': float(TRAILER_LENGTH),
+            'hitch_offset': float(HITCH_OFFSET),
+        },
+    )
     print(f"Saved {len(primitives_actions)} primitives to {output_path}")
 
 if __name__ == "__main__":
