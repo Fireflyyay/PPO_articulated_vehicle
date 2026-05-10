@@ -1155,16 +1155,28 @@ class MacroActionWrapper(gym.Wrapper):
 
         This does NOT change environment state.
         """
+        requested_mode = getattr(self, "_action_mask_mode", "hybrid")
+        soft_ray_available = not (
+            requested_mode == "soft_ray"
+            and getattr(self, "_ray_safety_index", None) is None
+        )
+
         # IMPORTANT: during terminal takeover we must NOT forward-simulate all primitives
         # for collision checking (paper's two-step collision detection). We let the
         # takeover planner prune/choose, and keep PPO log_prob consistent by not masking.
         if getattr(self, "_takeover_active", False):
-            if getattr(self, "_action_mask_mode", "hybrid") == "soft_ray":
+            if requested_mode == "soft_ray" and soft_ray_available:
                 return self._compute_soft_ray_action_mask(obs_vec)
             return np.ones(self.action_space.n, dtype=np.int8)
 
+        effective_mode = requested_mode
+        soft_fallback = None
+        if requested_mode == "soft_ray" and not soft_ray_available:
+            effective_mode = "hybrid"
+            soft_fallback = "hybrid_no_ray_safety"
+
         if (
-            getattr(self, "_action_mask_mode", "hybrid") != "soft_ray"
+            effective_mode != "soft_ray"
             and
             self._action_mask_update_every_k > 1
             and self._action_mask_cached is not None
@@ -1173,11 +1185,27 @@ class MacroActionWrapper(gym.Wrapper):
             self._action_mask_calls_since_update += 1
             return self._action_mask_cached.copy()
 
-        if getattr(self, "_action_mask_mode", "hybrid") == "soft_ray":
+        if effective_mode == "soft_ray":
             mask = self._compute_soft_ray_action_mask(obs_vec)
             self._action_mask_cached = mask.copy()
             self._action_mask_calls_since_update = 0
             return mask
+
+        mask = self._compute_hard_action_mask(obs_vec, mode_override=effective_mode)
+        if soft_fallback is not None:
+            self._last_action_mask_debug = {
+                "mode": "soft_ray",
+                "ray_safety_available": False,
+                "fallback": soft_fallback,
+                "effective_mode": effective_mode,
+                "hard_feasible_count": int(np.count_nonzero(mask)),
+            }
+        return mask
+
+    def _compute_hard_action_mask(self, obs_vec=None, mode_override=None):
+        mode = str(mode_override or getattr(self, "_action_mask_mode", "hybrid")).strip().lower()
+        if mode == "soft_ray":
+            mode = "hybrid"
 
         # If base env doesn't expose expected attributes, fall back to no mask.
         base_env = self.env
@@ -1198,7 +1226,6 @@ class MacroActionWrapper(gym.Wrapper):
         state0 = vehicle.state
         n_actions = self.action_space.n
 
-        mode = getattr(self, "_action_mask_mode", "hybrid")
         if mode == "full":
             candidate_ids = None
         else:

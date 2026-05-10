@@ -1,6 +1,7 @@
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
+from types import SimpleNamespace
 
 import configs as cfg
 from env.wrappers.macro_action_wrapper import MacroActionWrapper
@@ -81,3 +82,35 @@ def test_takeover_respects_runtime_config_when_patched_before_init(monkeypatch):
     assert wrapper._takeover_enabled is True
     assert wrapper._should_takeover(_make_takeover_obs(dist_m=3.5)) is True
     assert wrapper._should_takeover(_make_takeover_obs(dist_m=8.0, rel_heading=np.deg2rad(50.0), articulation=np.deg2rad(30.0), min_lidar_m=1.0)) is False
+
+
+def test_soft_ray_without_ray_safety_falls_back_to_hybrid_mask():
+    wrapper = object.__new__(MacroActionWrapper)
+    wrapper._takeover_active = False
+    wrapper._action_mask_mode = "soft_ray"
+    wrapper._ray_safety_index = None
+    wrapper._action_mask_update_every_k = 1
+    wrapper._action_mask_cached = None
+    wrapper._action_mask_calls_since_update = 0
+    wrapper._last_action_mask_debug = {}
+    wrapper.action_space = SimpleNamespace(n=3)
+
+    called = {}
+
+    def fake_hard(obs_vec=None, mode_override=None):
+        called["mode_override"] = mode_override
+        return np.array([1, 0, 1], dtype=np.int8)
+
+    wrapper._compute_hard_action_mask = fake_hard
+
+    def fail_soft(obs_vec=None):
+        raise AssertionError("soft ray path should not run without ray safety")
+
+    wrapper._compute_soft_ray_action_mask = fail_soft
+
+    mask = MacroActionWrapper.get_action_mask(wrapper, np.array([0.0], dtype=np.float64))
+
+    assert np.array_equal(mask, np.array([1, 0, 1], dtype=np.int8))
+    assert called["mode_override"] == "hybrid"
+    assert wrapper._last_action_mask_debug["fallback"] == "hybrid_no_ray_safety"
+    assert wrapper._last_action_mask_debug["effective_mode"] == "hybrid"
