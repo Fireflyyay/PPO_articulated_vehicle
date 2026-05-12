@@ -30,7 +30,7 @@ class PPOConfig(ConfigBase):
         self.clip_epsilon = 0.2
         self.lambda_ = 0.95
         self.var_max = 1
-        
+
         # Decaying variance settings
         self.action_std_init = 1.0
         self.action_std_decay_rate = 0.015
@@ -38,7 +38,7 @@ class PPOConfig(ConfigBase):
 
         # tricks
         self.adv_norm = True
-        self.state_norm = True 
+        self.state_norm = True
         self.reward_norm = False
         self.use_gae = True
         self.reward_scaling = False
@@ -71,7 +71,7 @@ class PPOAgent(AgentBase):
         # debug
         self.actor_loss_list = []
         self.critic_loss_list = []
-        
+
         # Action std
         self.action_std = self.configs.action_std_init
 
@@ -99,7 +99,7 @@ class PPOAgent(AgentBase):
         if self.configs.state_norm:
             self.state_normalize = StateNorm(self.configs.observation_shape)
 
-        
+
     def _init_network(self):
         '''
         Initialize 1.the network, 2.the optimizer, 3.the checklist.
@@ -119,14 +119,14 @@ class PPOAgent(AgentBase):
             # Removed learnable log_std
             self.actor_optimizer = \
                 torch.optim.Adam(
-                    self.actor_net.parameters(), 
-                    self.configs.lr_actor, 
+                    self.actor_net.parameters(),
+                    self.configs.lr_actor,
                     # eps=self.configs.lr_actor
                 )
         else:
             self.actor_optimizer = \
                 torch.optim.Adam(
-                    self.actor_net.parameters(), 
+                    self.actor_net.parameters(),
                     eps=self.configs.lr_actor
                 )
 
@@ -134,12 +134,12 @@ class PPOAgent(AgentBase):
             MultiObsEmbedding(self.configs.critic_layers).to(self.device)
         self.critic_optimizer = \
             torch.optim.Adam(
-                self.critic_net.parameters(), 
+                self.critic_net.parameters(),
                 self.configs.lr_critic,
                 eps=self.configs.adam_epsilon
             )
         self.critic_target = deepcopy(self.critic_net).to(self.device)
-        
+
         # save and load
         self.check_list = [ # (name, item, save_state_dict)
             ("configs", self.configs, 0),
@@ -305,16 +305,16 @@ class PPOAgent(AgentBase):
         if self.configs.state_norm:
             observation = self.state_normalize.state_norm(observation)
         observation = self.obs2tensor(observation)
-        
+
         with torch.no_grad():
             policy_out = self.actor_net(observation)
             if len(policy_out.shape) > 1 and policy_out.shape[0] > 1:
                 # raise NotImplementedError # Why was this here?
                 pass
             dist = self._build_dist(policy_out, action_mask=action_mask)
-            
+
         return dist
-    
+
     def _post_process_action(self, action_dist: torch.distributions.Distribution, deterministic: bool = False):
         if deterministic:
             if self.discrete:
@@ -327,15 +327,15 @@ class PPOAgent(AgentBase):
 
         if not self.discrete and self.configs.dist_type == "gaussian":
                 action = torch.clamp(action, -1, 1)
-        
+
         log_prob = action_dist.log_prob(action)
         action = action.detach().cpu().numpy().flatten()
-        
+
         # fix: for discrete, action might be scalar after flatten if batch=1, but we want it to be int.
         # if continuous, it is float.
         if self.discrete and action.size == 1:
             action = int(action.item())
-        
+
         log_prob = log_prob.detach().cpu().numpy().flatten()
         return action, log_prob
 
@@ -344,23 +344,23 @@ class PPOAgent(AgentBase):
 
         dist = self._actor_forward(obs, action_mask=action_mask)
         action, other_info = self._post_process_action(dist, deterministic=deterministic)
-                
+
         return action, other_info
 
     def get_action(self, obs: np.ndarray, action_mask=None):
-        '''Take action based on one observation. 
+        '''Take action based on one observation.
 
         Args:
             observation(np.ndarray): np.ndarray with the same shape of self.state_dim.
 
         Returns:
-            action: If self.discrete, the action is an (int) index. 
+            action: If self.discrete, the action is an (int) index.
                 If the action space is continuous, the action is an (np.ndarray).
             log_prob(np.ndarray): the log probability of taken action.
         '''
         dist = self._actor_forward(obs, action_mask=action_mask)
         action, log_prob = self._post_process_action(dist)
-                
+
         return action, log_prob
 
     def get_log_prob(self, obs: np.ndarray, action, action_mask=None):
@@ -470,7 +470,7 @@ class PPOAgent(AgentBase):
                 obs = obs.unsqueeze(0)
         # Removed dict handling as we flattened the observation
         return obs
-    
+
     def get_obs(self, obs, ids):
         return obs[ids]
 
@@ -481,11 +481,11 @@ class PPOAgent(AgentBase):
         # batches = self.memory.shuffle()
         batches = self.memory.get_items(np.arange(len(self.memory)))
         state_batch = self.obs2tensor(batches["state"])
-        
+
         if self.discrete:
             action_batch = torch.IntTensor(np.array(batches["action"])).to(self.device).reshape(-1)
         else:
-            action_batch = torch.FloatTensor(np.array(batches["action"])).to(self.device) 
+            action_batch = torch.FloatTensor(np.array(batches["action"])).to(self.device)
         rewards = torch.FloatTensor(np.array(batches["reward"])).unsqueeze(1)
         reward_batch = self._reward_norm(rewards) \
             if self.configs.reward_norm else rewards
@@ -520,7 +520,7 @@ class PPOAgent(AgentBase):
             v_target = adv + value
             if self.configs.adv_norm: # advantage normalization
                 adv = (adv - adv.mean()) / (adv.std() + 1e-5)
-        
+
         # apply multi update epoch
         for _ in range(self.configs.mini_epoch):
             # use mini batch and shuffle data
@@ -582,14 +582,14 @@ class PPOAgent(AgentBase):
                 self.critic_optimizer.zero_grad()
                 total_actor_loss.backward()
                 critic_loss.mean().backward()
-                
+
                 self.actor_loss_list.append(actor_loss.mean().item())
                 self.critic_loss_list.append(critic_loss.mean().item())
                 if self.configs.gradient_clip: # gradient clip
                     nn.utils.clip_grad_norm_(self.critic_net.parameters(), 0.5)
                     nn.utils.clip_grad_norm(self.actor_net.parameters(), 0.5)
                 self.actor_optimizer.step()
-                self.critic_optimizer.step() 
+                self.critic_optimizer.step()
 
             self._soft_update(self.critic_target, self.critic_net)
 
@@ -623,7 +623,7 @@ class PPOAgent(AgentBase):
             torch.save(checkpoint, path)
         else:
             torch.save(self, path)
-        
+
         if self.verbose:
             print("Save current model to %s" % path)
 
@@ -669,13 +669,13 @@ class PPOAgent(AgentBase):
                         pass
 
             # if 'log' in checkpoint:
-            #     self.log_std.data.copy_(checkpoint['log'].data if isinstance(checkpoint['log'], torch.nn.Parameter) else checkpoint['log']) 
-            
+            #     self.log_std.data.copy_(checkpoint['log'].data if isinstance(checkpoint['log'], torch.nn.Parameter) else checkpoint['log'])
+
             if 'state_norm' in checkpoint:
                 self.state_normalize = checkpoint['state_norm']
             if (not load_params_only) and ('optimizer' in checkpoint.keys()):
                 self.actor_optimizer, self.critic_optimizer = checkpoint['optimizer']
-        
+
         if self.verbose:
             print("Load the model from %s" % path)
 
@@ -692,97 +692,7 @@ class PPOAgent(AgentBase):
                 else:
                     item = checkpoint[name]
 
-            # self.log_std.data.copy_(checkpoint['log']) 
+            # self.log_std.data.copy_(checkpoint['log'])
             # self.actor_target_net = deepcopy(self.actor_net).to(self.device)
             if 'state_norm' in checkpoint:
                 self.state_normalize = checkpoint['state_norm']
-
-
-def expand_discrete_actor_output(
-    ppo_agent: PPOAgent,
-    new_action_dim: int,
-    init_mode: str = "random_small",
-    init_std: float = 0.01,
-) -> PPOAgent:
-    """Expand (or shrink) the discrete actor logits dimension with parameter transfer.
-
-    This is designed for action-space growth when adding new motion primitives.
-
-    Behavior:
-    - Rebuilds `actor_net` with output_size=new_action_dim.
-    - Copies all compatible layers.
-    - Copies old logits rows into the first old_n positions.
-    - Initializes newly added logits rows with small random weights.
-    - Rebuilds actor optimizer.
-
-    Notes:
-    - Critic does not depend on action dim and is unchanged.
-    - On-policy memory should be cleared by caller to avoid mask dim mismatch.
-    """
-    if not bool(getattr(ppo_agent, "discrete", False)):
-        raise ValueError("expand_discrete_actor_output requires PPOAgent(discrete=True)")
-
-    new_action_dim = int(new_action_dim)
-    if new_action_dim <= 0:
-        raise ValueError("new_action_dim must be > 0")
-
-    try:
-        old_last = ppo_agent.actor_net.net[-1]
-    except Exception as e:
-        raise RuntimeError("Unexpected actor_net structure") from e
-
-    if not isinstance(old_last, nn.Linear):
-        raise RuntimeError("Expected actor_net.net[-1] to be nn.Linear")
-
-    old_n = int(old_last.out_features)
-    if new_action_dim == old_n:
-        return ppo_agent
-
-    actor_layers = dict(ppo_agent.configs.actor_layers) if isinstance(ppo_agent.configs.actor_layers, dict) else {}
-    actor_layers["output_size"] = int(new_action_dim)
-    actor_layers["use_tanh_output"] = False
-
-    new_net = MultiObsEmbedding(actor_layers).to(ppo_agent.device)
-
-    with torch.no_grad():
-        # copy shared linear layers except last
-        for i in range(len(new_net.net) - 1):
-            nl = new_net.net[i]
-            if not isinstance(nl, nn.Linear):
-                continue
-            try:
-                ol = ppo_agent.actor_net.net[i]
-            except Exception:
-                continue
-            if isinstance(ol, nn.Linear) and tuple(ol.weight.shape) == tuple(nl.weight.shape):
-                nl.weight.copy_(ol.weight)
-                nl.bias.copy_(ol.bias)
-
-        # last layer partial copy
-        new_last = new_net.net[-1]
-        assert isinstance(new_last, nn.Linear)
-        k = int(min(old_n, new_action_dim))
-        new_last.weight[:k].copy_(old_last.weight[:k])
-        new_last.bias[:k].copy_(old_last.bias[:k])
-
-        if new_action_dim > old_n:
-            if init_mode == "zero":
-                new_last.weight[old_n:].zero_()
-                new_last.bias[old_n:].zero_()
-            else:
-                new_last.weight[old_n:].normal_(mean=0.0, std=float(init_std))
-                new_last.bias[old_n:].zero_()
-
-    ppo_agent.actor_net = new_net
-    ppo_agent.configs.actor_layers = actor_layers
-    ppo_agent.configs.action_dim = int(new_action_dim)
-    ppo_agent.rebuild_actor_optimizer()
-
-    # If we had a previous bias with old shape, drop it.
-    try:
-        if ppo_agent.action_logit_bias is not None and int(ppo_agent.action_logit_bias.numel()) != int(new_action_dim):
-            ppo_agent.clear_action_logit_bias()
-    except Exception:
-        pass
-
-    return ppo_agent

@@ -4,6 +4,7 @@ import numpy as np
 import copy
 import math
 import time
+from types import SimpleNamespace
 from shapely.geometry import Polygon
 from shapely.affinity import affine_transform
 try:
@@ -23,14 +24,14 @@ except Exception:  # pragma: no cover
 
 class MacroActionWrapper(gym.Wrapper):
     """
-    Gym wrapper that converts discrete primitive IDs into a sequence of low-level actions.
+    Gym wrapper that converts discrete primitive family IDs into low-level action sequences.
     """
     def __init__(self, env, primitive_lib, H=None, takeover_dist: float = None, takeover_max_len: int = 3, normalize_before_step: bool = True):
         """
         Args:
             env: The base environment.
-            primitive_lib: An object with .get_actions(primitive_id) -> np.ndarray[H, 2]
-                           and .size property.
+            primitive_lib: Family-based primitive library. PPO-visible action IDs are
+                           family IDs; the wrapper resolves them to concrete variants.
             H (int): Horizon length of primitives (must match lib).
         """
         super().__init__(env)
@@ -47,7 +48,8 @@ class MacroActionWrapper(gym.Wrapper):
                 if actions is not None:
                     H = int(actions.shape[1])
         self.H = int(H)
-        self.action_space = spaces.Discrete(primitive_lib.size)
+        self.action_space = spaces.Discrete(int(getattr(primitive_lib, 'action_dim', primitive_lib.size)))
+        self._family_resolution_cache = {}
         # Terminal takeover settings (motion-primitive planner)
         if takeover_dist is None:
             try:
@@ -327,19 +329,10 @@ class MacroActionWrapper(gym.Wrapper):
             "fallback": None,
         }
 
-        if obs_vec is None:
-            mask = np.ones((n_actions,), dtype=np.float32)
-            debug["fallback"] = "missing_observation"
-        elif index is None:
-            candidate_ids = self._get_mask_candidate_ids(obs_vec, n_actions)
-            mask = np.full((n_actions,), eps, dtype=np.float32)
-            if candidate_ids is None:
-                mask[:] = 1.0
-                debug["fallback"] = "no_ray_safety_no_fast_index"
-            else:
-                mask[np.asarray(candidate_ids, dtype=np.int64)] = 1.0
-                debug["fallback"] = "fast_prune"
-                debug["precomputed_candidate_count"] = int(len(candidate_ids))
+        if obs_vec is None or index is None:
+            hard_mask = self._compute_hard_action_mask(obs_vec, mode_override="full").astype(np.float32)
+            mask = np.clip(hard_mask, eps, 1.0).astype(np.float32)
+            debug["fallback"] = "hard_family_mask"
         else:
             try:
                 from configs import LIDAR_NUM, LIDAR_RANGE
@@ -350,31 +343,18 @@ class MacroActionWrapper(gym.Wrapper):
                 lidar_num = int(getattr(index, "lidar_num", 120))
                 lidar_range = float(getattr(index, "lidar_range", 30.0))
             lidar = np.asarray(obs_vec, dtype=np.float64).reshape(-1)[:lidar_num]
-            mask, mask_debug = index.compute_soft_mask(
+            variant_mask, mask_debug = index.compute_soft_mask(
                 lidar,
                 gamma=float(self._soft_mask_gamma),
                 eps=eps,
                 lidar_range=lidar_range,
             )
             debug.update(mask_debug)
-            terminal = False
-            try:
-                goal = self._parse_goal_repr_from_obs(obs_vec)
-                terminal = float(goal.get("dist", 1e9)) <= float(self._soft_mask_terminal_radius)
-            except Exception:
-                terminal = False
-            terminal = terminal or int(mask_debug.get("positive_step_count", 0)) < int(self._soft_mask_min_action_count)
-            if terminal:
-                terminal_mask, terminal_debug = index.compute_soft_mask(
-                    lidar,
-                    gamma=float(self._soft_mask_terminal_gamma),
-                    eps=float(self._soft_mask_terminal_eps),
-                    lidar_range=lidar_range,
-                )
-                terminal_weights = self._terminal_weights_from_obs(obs_vec)
-                mask = np.clip(terminal_mask * terminal_weights, float(self._soft_mask_terminal_eps), 1.0).astype(np.float32)
-                debug.update({f"terminal_{k}": v for k, v in terminal_debug.items()})
-                debug["terminal_reweight_applied"] = True
+            mask = np.full((n_actions,), eps, dtype=np.float32)
+            self._family_resolution_cache = {}
+            for family_id in range(n_actions):
+                ref = self._resolve_family_ref(family_id, obs_vec=obs_vec)
+                mask[int(family_id)] = float(variant_mask[int(ref.flat_index)])
 
         debug["soft_mask_ms"] = float((time.perf_counter() - t0) * 1000.0)
         debug["soft_mask_min"] = float(np.min(mask)) if mask.size else 0.0
@@ -498,23 +478,167 @@ class MacroActionWrapper(gym.Wrapper):
 
         return (front_box, rear_box)
 
-    def step(self, primitive_id):
+    def _current_vehicle_state(self):
+        base_env = self.env
+        vehicle = getattr(base_env, 'vehicle', None)
+        return getattr(vehicle, 'state', None)
+
+    def _current_articulation(self) -> float:
+        state = self._current_vehicle_state()
+        if state is None:
+            return 0.0
+        return self._wrap_pi(float(state.heading) - float(getattr(state, 'rear_heading', state.heading)))
+
+    def _goal_repr_from_env_state(self, obs_vec=None) -> dict:
+        if obs_vec is not None:
+            try:
+                return self._parse_goal_repr_from_obs(obs_vec)
+            except Exception:
+                pass
+
+        state = self._current_vehicle_state()
+        base_env = self.env
+        world_map = getattr(base_env, 'map', None)
+        dest = getattr(world_map, 'dest', None) if world_map is not None else None
+        if state is None or dest is None:
+            return {
+                "goal_x": 0.0,
+                "goal_y": 0.0,
+                "goal_heading": 0.0,
+                "articulation": self._current_articulation(),
+                "dist": 0.0,
+                "rel_angle": 0.0,
+            }
+
+        dx = float(dest.loc.x) - float(state.loc.x)
+        dy = float(dest.loc.y) - float(state.loc.y)
+        c = math.cos(float(state.heading))
+        s = math.sin(float(state.heading))
+        goal_x = c * dx + s * dy
+        goal_y = -s * dx + c * dy
+        goal_heading = self._wrap_pi(float(dest.heading) - float(state.heading))
+        articulation = self._current_articulation()
+        rel_angle = math.atan2(goal_y, goal_x)
+        return {
+            "goal_x": float(goal_x),
+            "goal_y": float(goal_y),
+            "goal_heading": float(goal_heading),
+            "articulation": float(articulation),
+            "dist": float(math.hypot(goal_x, goal_y)),
+            "rel_angle": float(rel_angle),
+        }
+
+    def _legacy_flat_variant_ref(self, primitive_id: int):
+        return SimpleNamespace(
+            flat_index=int(primitive_id),
+            gamma_bin_id=0,
+            family_id=int(primitive_id),
+            variant_id=0,
+        )
+
+    def _resolved_variant_debug(self, resolved_ref) -> dict:
+        if hasattr(self.primitive_lib, 'resolved_variant_debug'):
+            return self.primitive_lib.resolved_variant_debug(resolved_ref)
+
+        primitive_id = int(getattr(resolved_ref, 'flat_index', -1))
+        actions = np.asarray(self.primitive_lib.get_actions(primitive_id), dtype=np.float64)
+        return {
+            "flat_index": int(primitive_id),
+            "gamma_bin_id": int(getattr(resolved_ref, 'gamma_bin_id', 0)),
+            "gamma_bin_value": float(self._current_articulation()),
+            "family_id": int(getattr(resolved_ref, 'family_id', primitive_id)),
+            "family_name": f"primitive-{primitive_id}",
+            "family_type": "legacy_flat",
+            "variant_id": int(getattr(resolved_ref, 'variant_id', 0)),
+            "mode": "legacy_flat",
+            "speed_sign": int(np.sign(np.mean(actions[:, 1]))) if actions.size else 0,
+            "duration": float(actions.shape[0]),
+            "effective_horizon": int(actions.shape[0]),
+            "is_compound": False,
+            "switch_index": -1,
+        }
+
+    def _resolve_family_ref(self, family_id: int, obs_vec=None):
+        if not hasattr(self.primitive_lib, 'resolve_family_variant'):
+            ref = self._legacy_flat_variant_ref(family_id)
+            self._family_resolution_cache[int(family_id)] = ref
+            return ref
+
+        goal_repr = self._goal_repr_from_env_state(obs_vec=obs_vec)
+        gamma = self._current_articulation()
+        ref = self.primitive_lib.resolve_family_variant(int(family_id), gamma=float(gamma), goal_repr=goal_repr)
+        self._family_resolution_cache[int(family_id)] = ref
+        return ref
+
+    def _canonical_state_to_world(self, state0, canonical_state: np.ndarray):
+        from env.vehicle import State
+
+        row = np.asarray(canonical_state, dtype=np.float64).reshape(-1)
+        x_c, y_c, heading_c, rear_heading_c = map(float, row[:4])
+        speed = float(row[4]) if row.size > 4 else 0.0
+        steering = float(row[5]) if row.size > 5 else 0.0
+
+        c = math.cos(float(state0.heading))
+        s = math.sin(float(state0.heading))
+        x_w = float(state0.loc.x) + c * x_c - s * y_c
+        y_w = float(state0.loc.y) + s * x_c + c * y_c
+        heading_w = self._wrap_pi(float(state0.heading) + heading_c)
+        rear_heading_w = self._wrap_pi(float(state0.heading) + rear_heading_c)
+        return State([x_w, y_w, heading_w, speed, steering, rear_heading_w])
+
+    def _variant_rollout_is_safe(self, flat_index: int) -> bool:
+        state0 = self._current_vehicle_state()
+        base_env = self.env
+        world_map = getattr(base_env, 'map', None)
+        if state0 is None or world_map is None:
+            return True
+
+        self._ensure_mask_obstacle_cache()
+        prepared = self._mask_obstacles_prepared if self._mask_obstacles_prepared is not None else []
+        obst_bounds = self._mask_obstacles_bounds if self._mask_obstacles_bounds is not None else []
+        xmin, xmax = float(world_map.xmin), float(world_map.xmax)
+        ymin, ymax = float(world_map.ymin), float(world_map.ymax)
+
+        def bounds_overlap(a, b):
+            return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
+
+        rollout_states = self.primitive_lib.get_rollout_states(int(flat_index))
+        for canonical_state in rollout_states[1:]:
+            world_state = self._canonical_state_to_world(state0, canonical_state)
+            if world_state.loc.x < xmin or world_state.loc.x > xmax or world_state.loc.y < ymin or world_state.loc.y > ymax:
+                return False
+            boxes = world_state.create_box()
+            for box in boxes:
+                bb = box.bounds
+                for pg, ob in zip(prepared, obst_bounds):
+                    if not bounds_overlap(bb, ob):
+                        continue
+                    try:
+                        hit = pg.intersects(box)
+                    except Exception:
+                        hit = box.intersects(pg)
+                    if hit:
+                        return False
+        return True
+
+    def step(self, family_id):
         """
-        Execute the primitive corresponding to primitive_id.
+        Execute the variant resolved from a PPO-selected primitive family.
         accumulate reward, check done at each step.
         """
-        # Get action sequence from library
-        # Ensure primitive_id is int
-        if isinstance(primitive_id, np.ndarray):
-            primitive_id = primitive_id.item()
+        if isinstance(family_id, np.ndarray):
+            family_id = family_id.item()
 
+        family_id = int(family_id)
+        resolved_ref = self._resolve_family_ref(family_id)
+        resolved_debug = self._resolved_variant_debug(resolved_ref)
+        primitive_id = int(resolved_ref.flat_index)
         actions = self.primitive_lib.get_actions(primitive_id)
-        # actions shape: [H, 2]
-
         cached_plan_debug = None
-        cached_actions = self._pop_planned_actions(int(primitive_id))
-        if cached_actions is not None:
-            actions, cached_plan_debug = cached_actions
+        cached_plan = self._pop_planned_actions(primitive_id)
+        if cached_plan is not None:
+            actions, cached_plan_debug = cached_plan
+        actions = np.asarray(actions, dtype=np.float64)
 
         total_reward = 0.0
         done = False
@@ -619,10 +743,20 @@ class MacroActionWrapper(gym.Wrapper):
             if done:
                 break
 
-        info['primitive_id'] = primitive_id
+        info['family_id'] = int(family_id)
+        info['resolved_family_id'] = int(getattr(resolved_ref, 'family_id', family_id))
+        info['primitive_id'] = int(primitive_id)
+        info['resolved_variant_id'] = int(resolved_ref.variant_id)
+        info['resolved_gamma_bin_id'] = int(resolved_ref.gamma_bin_id)
+        info['resolved_mode'] = str(resolved_debug.get('mode', 'normal'))
+        info['resolved_is_compound'] = bool(resolved_debug.get('is_compound', False))
+        info['resolved_switch_index'] = int(resolved_debug.get('switch_index', -1))
+        info['resolved_family_name'] = str(resolved_debug.get('family_name', ''))
+        info['resolved_family_type'] = str(resolved_debug.get('family_type', 'normal'))
         info['executed_steps'] = steps_executed
         if cached_plan_debug is not None:
             info['refinement_plan_step'] = True
+            info['refinement_plan_debug'] = cached_plan_debug
         if used_prefix_steps is not None:
             info['prefix_steps_used'] = int(used_prefix_steps)
 
@@ -636,14 +770,9 @@ class MacroActionWrapper(gym.Wrapper):
             pass
         info['macro_exec_trace'] = macro_exec_trace
 
-        # Provide a terminal plan (HOPE-compatible key) for the next decision.
-        # Online planner is called at high frequency, and only commits a short prefix.
-        try:
-            self._maybe_plan_terminal_takeover(last_obs, done, info)
-        except Exception as exc:
-            info.setdefault('takeover_active', False)
-            info.setdefault('takeover_triggered', False)
-            info['takeover_error'] = str(exc)
+        info['takeover_active'] = False
+        info['takeover_triggered'] = False
+        info['path_to_dest'] = None
 
         # Return consistent with Gymnasium
         return last_obs, total_reward, terminated, truncated, info
@@ -1147,27 +1276,12 @@ class MacroActionWrapper(gym.Wrapper):
         return plan
 
     def get_action_mask(self, obs_vec=None):
-        """Return a binary mask over primitives: 1=feasible, 0=infeasible.
-
-        Feasibility is checked by forward simulating each primitive from the
-        current vehicle state using the SAME kinematic model, and marking
-        primitives infeasible if they collide with obstacles or leave the map.
-
-        This does NOT change environment state.
-        """
+        """Return a family-level action mask with shape [family_count]."""
         requested_mode = getattr(self, "_action_mask_mode", "hybrid")
         soft_ray_available = not (
             requested_mode == "soft_ray"
             and getattr(self, "_ray_safety_index", None) is None
         )
-
-        # IMPORTANT: during terminal takeover we must NOT forward-simulate all primitives
-        # for collision checking (paper's two-step collision detection). We let the
-        # takeover planner prune/choose, and keep PPO log_prob consistent by not masking.
-        if getattr(self, "_takeover_active", False):
-            if requested_mode == "soft_ray" and soft_ray_available:
-                return self._compute_soft_ray_action_mask(obs_vec)
-            return np.ones(self.action_space.n, dtype=np.int8)
 
         effective_mode = requested_mode
         soft_fallback = None
@@ -1203,114 +1317,22 @@ class MacroActionWrapper(gym.Wrapper):
         return mask
 
     def _compute_hard_action_mask(self, obs_vec=None, mode_override=None):
-        mode = str(mode_override or getattr(self, "_action_mask_mode", "hybrid")).strip().lower()
-        if mode == "soft_ray":
-            mode = "hybrid"
-
-        # If base env doesn't expose expected attributes, fall back to no mask.
-        base_env = self.env
-        if not hasattr(base_env, 'vehicle') or not hasattr(base_env, 'map'):
-            mask = np.ones(self.action_space.n, dtype=np.int8)
-            self._action_mask_cached = mask.copy()
-            self._action_mask_calls_since_update = 0
-            return mask
-
-        vehicle = base_env.vehicle
-        world_map = base_env.map
-        if vehicle is None or getattr(vehicle, 'state', None) is None:
-            mask = np.ones(self.action_space.n, dtype=np.int8)
-            self._action_mask_cached = mask.copy()
-            self._action_mask_calls_since_update = 0
-            return mask
-
-        state0 = vehicle.state
         n_actions = self.action_space.n
+        mask = np.zeros(n_actions, dtype=np.int8)
+        self._family_resolution_cache = {}
+        for family_id in range(n_actions):
+            ref = self._resolve_family_ref(family_id, obs_vec=obs_vec)
+            mask[int(family_id)] = 1 if self._variant_rollout_is_safe(int(ref.flat_index)) else 0
 
-        if mode == "full":
-            candidate_ids = None
-        else:
-            candidate_ids = self._get_mask_candidate_ids(obs_vec, n_actions)
-
-        if mode == "fast_only":
-            if candidate_ids is None:
-                mask = np.ones(n_actions, dtype=np.int8)
-            else:
-                mask = np.zeros(n_actions, dtype=np.int8)
-                mask[candidate_ids] = 1
-            if mask.sum() == 0:
-                mask[:] = 1
-            self._action_mask_cached = mask.copy()
-            self._action_mask_calls_since_update = 0
-            return mask
-
-        if candidate_ids is None:
-            mask = np.ones(n_actions, dtype=np.int8)
-            eval_ids = range(n_actions)
-        else:
-            mask = np.zeros(n_actions, dtype=np.int8)
-            eval_ids = candidate_ids
-
-        # Cache obstacles list for speed (prepared in reset when possible)
-        obstacles = getattr(world_map, 'obstacles', []) or []
-        xmin, xmax = world_map.xmin, world_map.xmax
-        ymin, ymax = world_map.ymin, world_map.ymax
-
-        self._ensure_mask_obstacle_cache()
-        prepared = self._mask_obstacles_prepared if self._mask_obstacles_prepared is not None else []
-        obst_bounds = self._mask_obstacles_bounds if self._mask_obstacles_bounds is not None else []
-
-        def bounds_overlap(a, b):
-            return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
-
-        # Import NUM_STEP from configs (used by the vehicle model)
-        try:
-            from configs import NUM_STEP
-        except Exception:
-            NUM_STEP = None
-
-        for pid in eval_ids:
-            actions = self.primitive_lib.get_actions(pid)
-            steps = min(self.H, int(actions.shape[0]))
-            end_state, feasible = self._simulate_mask_primitive_end_state(
-                state0,
-                actions[:steps],
-                xmin,
-                xmax,
-                ymin,
-                ymax,
-                NUM_STEP if NUM_STEP is not None else getattr(vehicle.kinetic_model, 'n_step', 1),
-            )
-
-            # Collision check only at the end state (much faster; allows rare
-            # false-feasible cases where intermediate collision would occur).
-            if feasible and len(prepared) > 0 and end_state is not None:
-                boxes = self._create_mask_boxes(*end_state)
-                collided = False
-                for box in boxes:
-                    bb = box.bounds
-                    for pg, ob in zip(prepared, obst_bounds):
-                        if not bounds_overlap(bb, ob):
-                            continue
-                        try:
-                            hit = pg.intersects(box)
-                        except Exception:
-                            hit = box.intersects(pg)
-                        if hit:
-                            collided = True
-                            break
-                    if collided:
-                        break
-                if collided:
-                    feasible = False
-
-            mask[pid] = 1 if feasible else 0
-
-        # If everything got masked (can happen in tight scenarios), fall back.
         if mask.sum() == 0:
             mask[:] = 1
 
         self._action_mask_cached = mask.copy()
         self._action_mask_calls_since_update = 0
+        self._last_action_mask_debug = {
+            "mode": str(mode_override or getattr(self, "_action_mask_mode", "hybrid")),
+            "family_feasible_count": int(np.count_nonzero(mask)),
+        }
 
         return mask
 
@@ -1330,6 +1352,7 @@ class MacroActionWrapper(gym.Wrapper):
 
         self._action_mask_cached = None
         self._action_mask_calls_since_update = 0
+        self._family_resolution_cache = {}
         return out
 
 
@@ -1361,13 +1384,14 @@ def update_primitive_library(env_or_wrapper, new_lib, H: int = None):
     try:
         from gymnasium import spaces
 
-        w.action_space = spaces.Discrete(int(getattr(new_lib, 'size')))
+        w.action_space = spaces.Discrete(int(getattr(new_lib, 'action_dim', getattr(new_lib, 'size'))))
     except Exception:
         pass
 
     # refresh cached deltas used by approximate planner ranking
     w._primitive_deltas = getattr(new_lib, 'deltas', None)
     w._ray_safety_index = getattr(new_lib, 'ray_safety_index', None)
+    w._family_resolution_cache = {}
 
     # refresh takeover planner index (best-effort)
     try:

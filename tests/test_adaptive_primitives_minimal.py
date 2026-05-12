@@ -1,8 +1,11 @@
 import numpy as np
 import torch
+from types import SimpleNamespace
 
 from primitives.trajectory_miner import TrajectoryMiner
-from model.agent.ppo_agent import PPOAgent, expand_discrete_actor_output
+from model.agent.ppo_agent import PPOAgent
+from primitives.generate_primitives import generate_primitives
+from primitives.library import PrimitiveLibrary
 
 
 def test_resample_segment_to_H_shape_and_endpoints():
@@ -49,29 +52,44 @@ def _make_discrete_ppo(action_dim: int):
     return PPOAgent(cfg, discrete=True)
 
 
-def test_expand_discrete_actor_output_copies_old_rows():
-    agent = _make_discrete_ppo(action_dim=4)
+def test_family_action_dim_stays_fixed_when_gamma_bins_and_variants_change(tmp_path):
+    path_a = tmp_path / "family_small_g5_v1.npz"
+    path_b = tmp_path / "family_small_g9_v3.npz"
 
-    # Set last layer weights to a known pattern
+    generate_primitives(H=1, S=11, output_path=str(path_a), gamma_bins=5, variant_count=1, family_preset="small")
+    generate_primitives(H=1, S=11, output_path=str(path_b), gamma_bins=9, variant_count=3, family_preset="small")
+
+    lib_a = PrimitiveLibrary(str(path_a), load_sidecars=False)
+    lib_b = PrimitiveLibrary(str(path_b), load_sidecars=False)
+
+    assert lib_a.family_count == lib_b.family_count
+    assert lib_a.action_dim == lib_b.action_dim == lib_a.family_count
+    assert lib_a.gamma_bin_count != lib_b.gamma_bin_count
+    assert lib_a.size != lib_b.size
+
+    agent = _make_discrete_ppo(action_dim=lib_a.action_dim)
     last = agent.actor_net.net[-1]
-    assert last.out_features == 4
-    with torch.no_grad():
-        last.weight.zero_()
-        last.bias.zero_()
-        for i in range(4):
-            last.weight[i, i % last.in_features] = float(i + 1)
-            last.bias[i] = float(-(i + 1))
+    assert last.out_features == lib_a.action_dim
 
-    old_w = last.weight.detach().cpu().clone()
-    old_b = last.bias.detach().cpu().clone()
 
-    expand_discrete_actor_output(agent, new_action_dim=6, init_mode="zero")
+def test_compute_novelty_uses_delta_difference_when_actions_match():
+    miner = TrajectoryMiner()
+    library = SimpleNamespace(
+        actions=np.array([[[0.0, 1.0]]], dtype=np.float64),
+        deltas=np.array([[0.0, 0.0, 0.0, 0.0]], dtype=np.float64),
+        horizon=1,
+    )
+    cfg = SimpleNamespace(
+        AP_NOVELTY_ACTION_L2_SCALE=1.0,
+        AP_NOVELTY_DELTA_WEIGHT=0.5,
+        AP_NOVELTY_DELTA_L2_SCALE=1.0,
+    )
 
-    new_last = agent.actor_net.net[-1]
-    assert new_last.out_features == 6
+    novelty = miner.compute_novelty(
+        np.array([[0.0, 1.0]], dtype=np.float64),
+        np.array([1.0, 0.0, 0.0], dtype=np.float64),
+        library,
+        cfg,
+    )
 
-    new_w = new_last.weight.detach().cpu()
-    new_b = new_last.bias.detach().cpu()
-
-    assert torch.allclose(new_w[:4], old_w)
-    assert torch.allclose(new_b[:4], old_b)
+    assert novelty > 0.0

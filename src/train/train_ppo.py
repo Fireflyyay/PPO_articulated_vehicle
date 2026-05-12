@@ -20,9 +20,10 @@ from torch.utils.tensorboard import SummaryWriter
 
 import configs as cfg
 from train.lr_schedule import build_scaled_learning_rates, compute_post_expand_restore_scale
+from train.adaptive_mining import build_mining_schedule, build_proxy_eval_contexts, select_replay_episodes, wrap_pi as adaptive_wrap_pi
 
 from model.agent.ppo_agent import PPOAgent as PPO
-from model.agent.parking_agent import ParkingAgent, PrimitivePlanner
+from model.agent.parking_agent import ParkingAgent
 from env.car_parking_base import CarParking
 from env.vehicle import VALID_SPEED, Status
 from configs import *
@@ -40,7 +41,6 @@ if USE_MOTION_PRIMITIVES:
         from primitives.primitive_pruner import PrimitivePruner
         from train.adaptive_primitive_scheduler import AdaptivePrimitiveScheduler
         from reward.shaping_from_discovered_primitives import DiscoveredPrimitiveShaping
-        from model.agent.ppo_agent import expand_discrete_actor_output
     except Exception:
         AdaptivePrimitiveLibraryManager = None
         EpisodeTrace = None
@@ -48,7 +48,6 @@ if USE_MOTION_PRIMITIVES:
         PrimitivePruner = None
         AdaptivePrimitiveScheduler = None
         DiscoveredPrimitiveShaping = None
-        expand_discrete_actor_output = None
 
 
 def _scene_is_hard(scene_name: str) -> bool:
@@ -122,7 +121,6 @@ def _collect_rollouts_for_mining(env, parking_agent, n_episodes: int, scene_sche
         ep_dones = []
         ep_infos = []
         total_reward = 0.0
-        takeover_used = False
 
         while not done:
             ep_obs.append(np.asarray(obs, dtype=np.float64))
@@ -132,15 +130,13 @@ def _collect_rollouts_for_mining(env, parking_agent, n_episodes: int, scene_sche
             action, _ = parking_agent.choose_action(obs, deterministic=deterministic, action_mask=action_mask)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-
-            takeover_used = takeover_used or bool(info.get('takeover_active', False))
-            ep_actions.append(int(info.get('primitive_id', action)))
+            ep_actions.append(int(info.get('resolved_family_id', action)))
             tr = info.get('macro_exec_trace', {}) if isinstance(info, dict) else {}
             sub_u = tr.get('sub_actions_phys', None)
             if sub_u is None:
                 # fallback: use library primitive actions (may over-estimate executed steps)
                 try:
-                    sub_u = env.primitive_lib.get_actions(int(action))
+                    sub_u = env.primitive_lib.get_actions(int(info.get('primitive_id', -1)))
                 except Exception:
                     sub_u = np.zeros((1, 2), dtype=np.float64)
             ep_low.append(np.asarray(sub_u, dtype=np.float64))
@@ -159,7 +155,7 @@ def _collect_rollouts_for_mining(env, parking_agent, n_episodes: int, scene_sche
                 success=bool(success),
                 total_reward=float(total_reward),
                 step_count_macro=int(len(ep_actions)),
-                takeover_used=bool(takeover_used),
+                takeover_used=False,
                 observations=ep_obs,
                 actions_primitive=ep_actions,
                 actions_low_level=ep_low,
@@ -191,6 +187,12 @@ def _get_current_library_size(env, ap_lib_mgr=None) -> int:
         except Exception:
             pass
     try:
+        primitive_lib = getattr(env, "primitive_lib", None)
+        if primitive_lib is not None:
+            return int(getattr(primitive_lib, "size"))
+    except Exception:
+        pass
+    try:
         return int(env.action_space.n)
     except Exception:
         return 0
@@ -211,6 +213,99 @@ def _log_adaptive_library_state(writer, episode_idx: int, env, ap_lib_mgr=None, 
             float(current_size) / float(max_size),
             episode_idx,
         )
+
+
+def _windowed_success_rates(scene_chooser, succ_record, window: int):
+    n = min(len(scene_chooser.scene_record), len(succ_record))
+    if n <= 0 or window <= 0:
+        return 0.0, 0.0, 0.0, 0.0
+
+    aligned = list(zip(scene_chooser.scene_record[-n:], succ_record[-n:]))
+    recent = aligned[-int(window) :]
+    previous = aligned[-2 * int(window) : -int(window)] if len(aligned) > int(window) else []
+
+    def _rate(records, hard_only: bool) -> float:
+        values = []
+        for sid, success in records:
+            scene_name = scene_chooser.scene_types.get(int(sid), 'Normal')
+            if hard_only and not _scene_is_hard(scene_name):
+                continue
+            values.append(int(success))
+        return _safe_mean(values)
+
+    return _rate(recent, False), _rate(recent, True), _rate(previous, False), _rate(previous, True)
+
+
+def _build_proxy_pruning_hooks(wrapper_env, proxy_contexts, config):
+    contexts = list(proxy_contexts)
+    if len(contexts) == 0:
+        return None, None
+
+    base_env = getattr(wrapper_env, 'env', wrapper_env)
+    vehicle = getattr(base_env, 'vehicle', None)
+    is_valid = getattr(wrapper_env, '_is_state_valid', None)
+    if vehicle is None or getattr(vehicle, 'kinetic_model', None) is None or is_valid is None:
+        return None, None
+
+    try:
+        from env.vehicle import State
+    except Exception:
+        return None, None
+
+    try:
+        step_time = int(NUM_STEP)
+    except Exception:
+        step_time = None
+
+    progress_scale = float(getattr(config, 'AP_D_TERM', 10.0))
+
+    def env_sampler():
+        return list(contexts)
+
+    def planner_eval_fn(context, actions_H):
+        start_state = context.start_state
+        try:
+            s = State([
+                float(start_state.get('x', 0.0)),
+                float(start_state.get('y', 0.0)),
+                float(start_state.get('heading', 0.0)),
+                float(start_state.get('speed', 0.0)),
+                float(start_state.get('steering', 0.0)),
+                float(start_state.get('rear_heading', start_state.get('heading', 0.0))),
+            ])
+        except Exception:
+            return 0.0
+
+        goal_x, goal_y, goal_heading = context.goal_world
+        initial_dist = max(float(context.initial_goal_dist), 1e-6)
+        best_dist = initial_dist
+        final_dist = initial_dist
+        initial_heading_err = abs(adaptive_wrap_pi(goal_heading - float(start_state.get('heading', 0.0))))
+        final_heading_err = initial_heading_err
+
+        try:
+            actions = np.asarray(actions_H, dtype=np.float64)
+            for action in actions:
+                if step_time is None:
+                    s = vehicle.kinetic_model.step(s, action)
+                else:
+                    s = vehicle.kinetic_model.step(s, action, step_time=step_time)
+                if not bool(is_valid(s)):
+                    return -1.0
+
+                cur_dist = float(np.hypot(float(goal_x) - float(s.loc.x), float(goal_y) - float(s.loc.y)))
+                best_dist = min(best_dist, cur_dist)
+                final_dist = cur_dist
+                final_heading_err = abs(adaptive_wrap_pi(goal_heading - float(s.heading)))
+        except Exception:
+            return 0.0
+
+        progress = max(0.0, initial_dist - final_dist) / max(progress_scale, 1e-6)
+        best_progress = max(0.0, initial_dist - best_dist) / max(progress_scale, 1e-6)
+        heading_gain = max(0.0, initial_heading_err - final_heading_err) / np.pi
+        return float(context.scene_weight) * (0.55 * progress + 0.35 * best_progress + 0.10 * heading_gain)
+
+    return env_sampler, planner_eval_fn
 
 
 def _log_adaptive_round_uplift(
@@ -470,7 +565,7 @@ if __name__=="__main__":
         primitive_lib = load_library(lib_full_path)
         primitive_h = getattr(primitive_lib, 'horizon', PRIMITIVE_H)
         env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
-        print(f"Wrapped env with MacroActionWrapper. Action space: {env.action_space.n} primitives. H={primitive_h}")
+        print(f"Wrapped env with MacroActionWrapper. Action space: {env.action_space.n} families. H={primitive_h}")
 
     scene_chooser = SceneChoose()
 
@@ -513,8 +608,10 @@ if __name__=="__main__":
     actor_params = dict(ACTOR_CONFIGS)
     critic_params = dict(CRITIC_CONFIGS)
 
+    motion_action_dim = int(getattr(primitive_lib, 'action_dim', env.action_space.n)) if USE_MOTION_PRIMITIVES else None
+
     if USE_MOTION_PRIMITIVES:
-        actor_params['output_size'] = env.action_space.n
+        actor_params['output_size'] = int(motion_action_dim)
         # Discrete policy uses logits; do NOT tanh-clip.
         actor_params['use_tanh_output'] = False
         # Critic input dim doesn't change (observation same)
@@ -529,7 +626,7 @@ if __name__=="__main__":
         # CarParking has observation_shape attribute.
         # Gym Wrapper forwards getattr usually, but let's be safe.
 
-        "action_dim": env.action_space.n if USE_MOTION_PRIMITIVES else env.action_space.shape[0],
+        "action_dim": int(motion_action_dim) if USE_MOTION_PRIMITIVES else env.action_space.shape[0],
         "hidden_size": 64,
         "activation": "tanh",
         "dist_type": "gaussian", # This might be ignored if discrete is True in Agent
@@ -539,7 +636,7 @@ if __name__=="__main__":
         "action_std_init": 1.5, # Increased from 0.6
         "action_std_decay_rate": 0.001, # Decreased from 0.001 to slow down decay
         "min_action_std": 0.1,
-        "use_imitation_loss": bool(USE_MOTION_PRIMITIVES and USE_TAKEOVER_EXPERT_SUPERVISION),
+        "use_imitation_loss": False,
         "imitation_buffer_size": int(IMITATION_BUFFER_SIZE),
         "imitation_batch_size": int(IMITATION_BATCH_SIZE),
         "imitation_min_buffer": int(IMITATION_MIN_BUFFER),
@@ -556,8 +653,7 @@ if __name__=="__main__":
         rl_agent.load(checkpoint_path, params_only=True)
         print('load pre-trained model!')
 
-    primitive_planner = PrimitivePlanner() if USE_MOTION_PRIMITIVES else None
-    parking_agent = ParkingAgent(rl_agent, planner=primitive_planner)
+    parking_agent = ParkingAgent(rl_agent, planner=None)
 
     # Adaptive primitive expansion components
     adaptive_enabled = bool(USE_MOTION_PRIMITIVES and USE_ADAPTIVE_PRIMITIVE_EXPANSION)
@@ -571,6 +667,7 @@ if __name__=="__main__":
     ap_last_good_version = None
     ap_base_library_size = _get_current_library_size(env)
     ap_last_expand_baseline = None
+    ap_last_round_metrics = None
     post_expand_lr_restore = None
 
     # mining buffer
@@ -597,7 +694,7 @@ if __name__=="__main__":
 
     def run_adaptive_primitive_round(ep_idx: int, trigger_stats: dict = None):
         global env, primitive_lib, primitive_h
-        global ap_round_id, ap_last_good_ckpt, ap_last_good_version, ap_last_expand_baseline, post_expand_lr_restore
+        global ap_round_id, ap_last_good_ckpt, ap_last_good_version, ap_last_expand_baseline, ap_last_round_metrics, post_expand_lr_restore
 
         if not adaptive_enabled:
             return
@@ -608,7 +705,7 @@ if __name__=="__main__":
         writer.add_scalar("adaptive/triggered", 1.0, ep_idx)
 
         old_version = ap_lib_mgr.active_version_id
-        old_lib_size = int(env.action_space.n)
+        old_lib_size = _get_current_library_size(env, ap_lib_mgr=ap_lib_mgr)
         _log_adaptive_library_state(
             writer,
             ep_idx,
@@ -635,16 +732,21 @@ if __name__=="__main__":
         writer.add_scalar("adaptive/validation_success_before", float(val_before["success"]), ep_idx)
         writer.add_scalar("adaptive/validation_extreme_success_before", float(val_before["success_extreme"]), ep_idx)
 
-        # Collect mining rollouts (bias towards hard scenes)
-        mining_schedule = ["Complex", "Extrem", "Complex", "Normal"]
-        rollouts = _collect_rollouts_for_mining(
+        replay_budget = int(max(0, round(int(AP_MINING_ROLLOUTS) * float(getattr(cfg, 'AP_MINING_REPLAY_RATIO', 0.35)))))
+        replay_rollouts = select_replay_episodes(ap_trace_buffer, replay_budget, cfg)
+        mining_schedule = build_mining_schedule(trigger_stats or {}, cfg)
+        fresh_budget = max(0, int(AP_MINING_ROLLOUTS) - len(replay_rollouts))
+        fresh_rollouts = _collect_rollouts_for_mining(
             env,
             parking_agent,
-            n_episodes=int(AP_MINING_ROLLOUTS),
+            n_episodes=int(fresh_budget),
             scene_schedule=mining_schedule,
             deterministic=bool(AP_MINING_DETERMINISTIC),
             start_episode_id=int(1000000 + ap_round_id * 10000),
         )
+        rollouts = list(replay_rollouts) + list(fresh_rollouts)
+        writer.add_scalar('adaptive/mining_replay_count', float(len(replay_rollouts)), ep_idx)
+        writer.add_scalar('adaptive/mining_fresh_count', float(len(fresh_rollouts)), ep_idx)
 
         # Mine
         cands = ap_miner.mine_from_episodes(rollouts, ap_lib_mgr.get_active_library(), cfg)
@@ -654,8 +756,10 @@ if __name__=="__main__":
         c_dedup = ap_pruner.deduplicate(cands, ap_lib_mgr.get_active_library(), cfg)
         writer.add_scalar("adaptive/candidates_after_dedup", float(len(c_dedup)), ep_idx)
 
-        # Proxy pruning (Phase1 no-op unless user wires env_sampler)
-        c_proxy = ap_pruner.prune_by_proxy_value(c_dedup, env_sampler=None, planner_eval_fn=None, config=cfg)
+        proxy_contexts = build_proxy_eval_contexts(replay_rollouts if len(replay_rollouts) > 0 else ap_trace_buffer, cfg)
+        env_sampler, planner_eval_fn = _build_proxy_pruning_hooks(env, proxy_contexts, cfg)
+        writer.add_scalar('adaptive/proxy_context_count', float(len(proxy_contexts)), ep_idx)
+        c_proxy = ap_pruner.prune_by_proxy_value(c_dedup, env_sampler=env_sampler, planner_eval_fn=planner_eval_fn, config=cfg)
         writer.add_scalar("adaptive/candidates_after_prune", float(len(c_proxy)), ep_idx)
 
         # Feasibility checks (best-effort)
@@ -664,7 +768,19 @@ if __name__=="__main__":
 
         # Select top-K to add
         remaining = int(AP_MAX_LIBRARY_SIZE) - int(old_lib_size)
-        k_add = int(min(AP_MAX_ADD_PER_ROUND, max(0, remaining)))
+        max_add_this_round = int(AP_MAX_ADD_PER_ROUND)
+        if isinstance(trigger_stats, dict):
+            hard_delta = float(trigger_stats.get('hard_success_rate_recent_delta', 0.0))
+            recent_uplift = trigger_stats.get('post_expand_hard_success_uplift_per_added_primitive_recent', None)
+            validation_uplift = trigger_stats.get('last_validation_extreme_success_gain_per_added_primitive', None)
+            if hard_delta <= 0.0:
+                max_add_this_round = max(1, int(np.ceil(float(max_add_this_round) * 0.5)))
+            if recent_uplift is not None and float(recent_uplift) <= 0.0:
+                max_add_this_round = max(1, int(np.ceil(float(max_add_this_round) * 0.5)))
+            if validation_uplift is not None and float(validation_uplift) <= 0.0:
+                max_add_this_round = max(1, int(np.ceil(float(max_add_this_round) * 0.5)))
+        writer.add_scalar('adaptive/max_add_this_round', float(max_add_this_round), ep_idx)
+        k_add = int(min(max_add_this_round, max(0, remaining)))
         add_list = c_feas[:k_add]
 
         if k_add <= 0 or len(add_list) == 0:
@@ -713,9 +829,7 @@ if __name__=="__main__":
             ep_idx,
         )
 
-        # Expand actor output dim + clear on-policy buffer
-        if expand_discrete_actor_output is not None:
-            expand_discrete_actor_output(parking_agent.agent, int(new_lib.size), init_mode="random_small")
+        # The PPO-visible action space is fixed at family_count; only clear the on-policy buffer.
         parking_agent.agent.memory.clear()
 
         # Post-expansion stabilization: lower LR + freeze backbone + logit bias for new actions
@@ -728,13 +842,6 @@ if __name__=="__main__":
             parking_agent.agent.freeze_actor_backbone(True)
         except Exception:
             pass
-        try:
-            bias = np.zeros((int(new_lib.size),), dtype=np.float32)
-            bias[int(old_lib_size) :] = float(AP_NEW_ACTION_LOGIT_BIAS_INIT)
-            parking_agent.agent.set_action_logit_bias(bias)
-        except Exception:
-            pass
-
         # Update wrapper/library reference (rebuild wrapper is safest)
         primitive_lib = new_lib
         primitive_h = getattr(primitive_lib, 'horizon', primitive_h)
@@ -769,6 +876,15 @@ if __name__=="__main__":
             old_library_size=old_lib_size,
             new_library_size=int(new_lib.size),
         )
+        added_count = max(0, int(new_lib.size) - int(old_lib_size))
+        gain_denom = float(max(1, added_count))
+        ap_last_round_metrics = {
+            'added_count': int(added_count),
+            'validation_success_gain': float(val_after['success'] - val_before['success']),
+            'validation_extreme_success_gain': float(val_after['success_extreme'] - val_before['success_extreme']),
+            'validation_success_gain_per_added_primitive': float(val_after['success'] - val_before['success']) / gain_denom,
+            'validation_extreme_success_gain_per_added_primitive': float(val_after['success_extreme'] - val_before['success_extreme']) / gain_denom,
+        }
 
         # Rollback if regressed
         rollback = False
@@ -790,10 +906,6 @@ if __name__=="__main__":
             env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
 
             # restore agent params and action dim
-            try:
-                expand_discrete_actor_output(parking_agent.agent, int(primitive_lib.size), init_mode="random_small")
-            except Exception:
-                pass
             try:
                 parking_agent.agent.load(ckpt_before, params_only=True)
             except Exception:
@@ -855,19 +967,10 @@ if __name__=="__main__":
         ep_dones_trace = []
         ep_infos_trace = []
 
-        # Takeover statistics (per-episode)
-        ep_takeover_steps = 0
-        ep_takeover_triggered = 0
-        ep_takeover_used = False
-        ep_plan_ms = []
-        ep_prune_ms = []
-        ep_score_ms = []
-        ep_imitation_samples = 0
         ep_refinement_stats = _new_refinement_episode_stats()
         # action distributions
         n_actions = env.action_space.n if USE_MOTION_PRIMITIVES else None
         ep_action_counts = np.zeros((n_actions,), dtype=np.int64) if n_actions is not None else None
-        ep_takeover_action_counts = np.zeros((n_actions,), dtype=np.int64) if n_actions is not None else None
 
         while not done:
             step_num += 1
@@ -875,17 +978,9 @@ if __name__=="__main__":
             action_mask = None
             if USE_MOTION_PRIMITIVES and USE_ACTION_MASK and hasattr(env, 'get_action_mask'):
                 action_mask = env.get_action_mask(obs)
-            planner_executing = bool(USE_MOTION_PRIMITIVES and parking_agent.executing_plan)
             action, log_prob = parking_agent.choose_action(obs, action_mask=action_mask)
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
-
-            if planner_executing and bool(USE_MOTION_PRIMITIVES and USE_TAKEOVER_EXPERT_SUPERVISION):
-                try:
-                    parking_agent.agent.push_imitation_memory(obs, int(action), action_mask=action_mask)
-                    ep_imitation_samples += 1
-                except Exception:
-                    pass
 
             # weak shaping reward from discovered primitives (optional)
             shaping_r = 0.0
@@ -898,31 +993,12 @@ if __name__=="__main__":
             if shaping_r != 0.0:
                 writer.add_scalar("adaptive/shaping_reward", float(shaping_r), i)
 
-            # Takeover accounting (macro-step level)
-            takeover_active = bool(info.get('takeover_active', False))
-            if takeover_active:
-                ep_takeover_steps += 1
-                ep_takeover_used = True
-            if bool(info.get('takeover_triggered', False)):
-                ep_takeover_triggered = 1
-
-            dbg = info.get('takeover_debug', None)
-            if isinstance(dbg, dict):
-                if 'plan_ms' in dbg:
-                    ep_plan_ms.append(float(dbg['plan_ms']))
-                if 'fast_prune_ms' in dbg:
-                    ep_prune_ms.append(float(dbg['fast_prune_ms']))
-                if 'score_ms' in dbg:
-                    ep_score_ms.append(float(dbg['score_ms']))
-
             _update_refinement_episode_stats(ep_refinement_stats, info.get('refinement_plan_debug', None))
 
             if ep_action_counts is not None:
                 try:
-                    pid = int(info.get('primitive_id', action))
-                    ep_action_counts[pid] += 1
-                    if takeover_active:
-                        ep_takeover_action_counts[pid] += 1
+                    family_id = int(info.get('resolved_family_id', action))
+                    ep_action_counts[family_id] += 1
                 except Exception:
                     pass
 
@@ -937,14 +1013,14 @@ if __name__=="__main__":
 
             # ---- EpisodeTrace step record ----
             try:
-                ep_actions_trace.append(int(info.get('primitive_id', action)))
+                ep_actions_trace.append(int(info.get('resolved_family_id', action)))
             except Exception:
                 ep_actions_trace.append(int(action) if USE_MOTION_PRIMITIVES else -1)
             tr = info.get('macro_exec_trace', {}) if isinstance(info, dict) else {}
             sub_u = tr.get('sub_actions_phys', None)
             if sub_u is None:
                 try:
-                    sub_u = env.primitive_lib.get_actions(int(action))
+                    sub_u = env.primitive_lib.get_actions(int(info.get('primitive_id', -1)))
                 except Exception:
                     sub_u = np.zeros((1, 2), dtype=np.float64)
             ep_low_actions_trace.append(np.asarray(sub_u, dtype=np.float64))
@@ -954,17 +1030,10 @@ if __name__=="__main__":
 
             # Store transition in memory
             # obs, action, reward, done, log_prob, next_obs
-            # Optional: skip takeover transitions to reduce teacher bias.
-            store_this = True
             if USE_MOTION_PRIMITIVES:
-                if (not TAKEOVER_TEACHER_FORCING) and takeover_active:
-                    store_this = False
-
-            if store_this:
-                if USE_MOTION_PRIMITIVES:
-                    parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs, action_mask))
-                else:
-                    parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs))
+                parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs, action_mask))
+            else:
+                parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs))
 
             obs = next_obs
 
@@ -982,9 +1051,6 @@ if __name__=="__main__":
 
                 writer.add_scalar("actor_loss", actor_loss, i)
                 writer.add_scalar("critic_loss", critic_loss, i)
-                if bool(USE_MOTION_PRIMITIVES and USE_TAKEOVER_EXPERT_SUPERVISION):
-                    writer.add_scalar("imitation/loss", float(getattr(parking_agent.agent, "last_imitation_loss", 0.0)), i)
-                    writer.add_scalar("imitation/buffer_size", float(parking_agent.agent.imitation_buffer_size()), i)
 
             if done:
                 if info['status'] == Status.ARRIVED:
@@ -994,10 +1060,6 @@ if __name__=="__main__":
                     succ_record.append(0)
                     scene_chooser.update_success_record(0)
 
-            # Terminal takeover plan (motion primitives)
-            if USE_MOTION_PRIMITIVES and info.get('path_to_dest', None) is not None:
-                parking_agent.set_planner_path(info['path_to_dest'])
-
         writer.add_scalar("total_reward", total_reward, i)
         if len(reward_per_state_list) > 0:
             writer.add_scalar("avg_reward", np.mean(reward_per_state_list[-1000:]), i)
@@ -1005,11 +1067,7 @@ if __name__=="__main__":
         # Log std
         writer.add_scalar("action_std", parking_agent.agent.action_std, i)
 
-        # Takeover logging
         if USE_MOTION_PRIMITIVES:
-            writer.add_scalar("takeover/triggered", float(ep_takeover_triggered), i)
-            writer.add_scalar("takeover/step_ratio", float(ep_takeover_steps) / float(max(1, step_num)), i)
-            writer.add_scalar("takeover/steps", float(ep_takeover_steps), i)
             _log_refinement_episode_stats(
                 writer,
                 i,
@@ -1017,26 +1075,6 @@ if __name__=="__main__":
                 bool(USE_PRIMITIVE_REFINEMENT),
                 ep_refinement_stats,
             )
-
-            if len(ep_plan_ms) > 0:
-                writer.add_scalar("takeover/plan_ms_mean", float(np.mean(ep_plan_ms)), i)
-            if len(ep_prune_ms) > 0:
-                writer.add_scalar("takeover/fast_prune_ms_mean", float(np.mean(ep_prune_ms)), i)
-            if len(ep_score_ms) > 0:
-                writer.add_scalar("takeover/score_ms_mean", float(np.mean(ep_score_ms)), i)
-
-            success = 1.0 if (len(succ_record) > 0 and succ_record[-1] == 1) else 0.0
-            writer.add_scalar("takeover/success_when_used", success if ep_takeover_used else 0.0, i)
-            if bool(USE_TAKEOVER_EXPERT_SUPERVISION):
-                writer.add_scalar("imitation/samples_per_episode", float(ep_imitation_samples), i)
-
-            # policy vs planner distribution divergence (episode-level KL)
-            if ep_action_counts is not None and ep_takeover_action_counts is not None:
-                if ep_takeover_action_counts.sum() > 0 and ep_action_counts.sum() > 0:
-                    p = (ep_takeover_action_counts + 1e-6) / float(ep_takeover_action_counts.sum() + 1e-6 * ep_takeover_action_counts.size)
-                    q = (ep_action_counts + 1e-6) / float(ep_action_counts.sum() + 1e-6 * ep_action_counts.size)
-                    kl = float(np.sum(p * (np.log(p) - np.log(q))))
-                    writer.add_scalar("takeover/action_KL", kl, i)
 
         for type_id, scene_name in scene_chooser.scene_types.items():
             rec = scene_chooser.success_record[int(type_id)]
@@ -1129,7 +1167,7 @@ if __name__=="__main__":
                     success=bool(success),
                     total_reward=float(total_reward),
                     step_count_macro=int(len(ep_actions_trace)),
-                    takeover_used=bool(takeover_used),
+                    takeover_used=False,
                     observations=ep_obs_trace,
                     actions_primitive=ep_actions_trace,
                     actions_low_level=ep_low_actions_trace,
@@ -1173,31 +1211,26 @@ if __name__=="__main__":
             try:
                 # recent success rates
                 w = int(AP_TRIGGER_WINDOW)
-                recent = succ_record[-w:] if len(succ_record) > 0 else []
-                sr_recent = float(np.mean(recent)) if len(recent) > 0 else 0.0
-
-                # hard success: use scene_chooser.scene_record aligned with succ_record
-                hard = []
-                for j in range(1, min(len(scene_chooser.scene_record), len(succ_record), w) + 1):
-                    sid = int(scene_chooser.scene_record[-j])
-                    scene_name = scene_chooser.scene_types.get(sid, 'Normal')
-                    if _scene_is_hard(scene_name):
-                        hard.append(int(succ_record[-j]))
-                sr_hard = float(np.mean(hard)) if len(hard) > 0 else 0.0
+                sr_recent, sr_hard, sr_prev, sr_hard_prev = _windowed_success_rates(scene_chooser, succ_record, w)
+                current_size = _get_current_library_size(env, ap_lib_mgr=ap_lib_mgr)
+                capacity_remaining = max(0, int(AP_MAX_LIBRARY_SIZE) - int(current_size))
 
                 stats = {
                     "success_rate_recent": sr_recent,
                     "hard_success_rate_recent": sr_hard,
-                    "plateau": True,
+                    "success_rate_recent_delta": float(sr_recent - sr_prev),
+                    "hard_success_rate_recent_delta": float(sr_hard - sr_hard_prev),
+                    "capacity_remaining": int(capacity_remaining),
                 }
                 writer.add_scalar("adaptive/success_rate_recent", float(sr_recent), i)
                 writer.add_scalar("adaptive/hard_success_rate_recent", float(sr_hard), i)
+                writer.add_scalar("adaptive/success_rate_recent_delta", float(sr_recent - sr_prev), i)
+                writer.add_scalar("adaptive/hard_success_rate_recent_delta", float(sr_hard - sr_hard_prev), i)
 
                 if ap_last_expand_baseline is not None:
                     base_recent = float(ap_last_expand_baseline.get("success_rate_recent", 0.0))
                     base_hard = float(ap_last_expand_baseline.get("hard_success_rate_recent", 0.0))
                     base_size = int(ap_last_expand_baseline.get("library_size", ap_base_library_size))
-                    current_size = _get_current_library_size(env, ap_lib_mgr=ap_lib_mgr)
                     size_gain = max(0, int(current_size) - int(base_size))
                     writer.add_scalar("adaptive/post_expand_success_uplift_recent", float(sr_recent - base_recent), i)
                     writer.add_scalar("adaptive/post_expand_hard_success_uplift_recent", float(sr_hard - base_hard), i)
@@ -1211,6 +1244,14 @@ if __name__=="__main__":
                         "adaptive/post_expand_hard_success_uplift_per_added_primitive_recent",
                         float(sr_hard - base_hard) / float(max(1, size_gain)),
                         i,
+                    )
+                    stats["added_since_baseline"] = float(size_gain)
+                    stats["post_expand_success_uplift_per_added_primitive_recent"] = float(sr_recent - base_recent) / float(max(1, size_gain))
+                    stats["post_expand_hard_success_uplift_per_added_primitive_recent"] = float(sr_hard - base_hard) / float(max(1, size_gain))
+
+                if ap_last_round_metrics is not None:
+                    stats["last_validation_extreme_success_gain_per_added_primitive"] = float(
+                        ap_last_round_metrics.get("validation_extreme_success_gain_per_added_primitive", 0.0)
                     )
 
                 if ap_scheduler.should_trigger(stats, episode_idx=int(i)):

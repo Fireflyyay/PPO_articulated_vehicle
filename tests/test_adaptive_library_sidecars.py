@@ -11,12 +11,69 @@ def _write_base_library(path):
     actions = np.array(
         [
             [[0.0, 1.0]],
-            [[0.0, -1.0]],
+            [[0.05, 1.0]],
         ],
         dtype=np.float64,
     )
-    deltas = np.zeros((actions.shape[0], 4), dtype=np.float64)
-    np.savez_compressed(path, actions=actions, deltas=deltas)
+    deltas = np.array(
+        [
+            [0.2, 0.0, 0.0, 0.0],
+            [0.2, 0.02, 0.01, 0.01],
+        ],
+        dtype=np.float64,
+    )
+    rollout_states = np.zeros((2, 2, 6), dtype=np.float64)
+    rollout_states[0, 1] = np.array([0.2, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float64)
+    rollout_states[1, 1] = np.array([0.2, 0.02, 0.01, 0.0, 1.0, 0.05], dtype=np.float64)
+    np.savez_compressed(
+        path,
+        schema_version=np.asarray("family_library_v1", dtype=object),
+        actions=actions,
+        deltas=deltas,
+        rollout_states=rollout_states,
+        variant_horizons=np.asarray([1, 1], dtype=np.int64),
+        switch_indices=np.asarray([-1, -1], dtype=np.int64),
+        durations=np.asarray([0.2, 0.2], dtype=np.float64),
+        speed_signs=np.asarray([1, 1], dtype=np.int64),
+        is_compound=np.asarray([0, 0], dtype=np.int8),
+        variant_flat_to_gamma=np.asarray([0, 0], dtype=np.int64),
+        variant_flat_to_family=np.asarray([0, 0], dtype=np.int64),
+        variant_flat_to_variant=np.asarray([0, 1], dtype=np.int64),
+        variant_flat_to_family_type=np.asarray(["normal", "normal"], dtype=object),
+        variant_flat_to_mode=np.asarray(["normal", "normal"], dtype=object),
+        gamma_bin_values=np.asarray([0.0], dtype=np.float64),
+        family_names=np.asarray(["unit-forward"], dtype=object),
+        family_types=np.asarray(["normal"], dtype=object),
+        family_count=np.asarray(1, dtype=np.int64),
+        variant_count_per_family=np.asarray(2, dtype=np.int64),
+        index_table=np.asarray([[[0, 1]]], dtype=np.int64),
+        variant_counts=np.asarray([[2]], dtype=np.int64),
+        default_variant_table=np.asarray([[0]], dtype=np.int64),
+        step_seconds=np.asarray(0.2, dtype=np.float64),
+        meta=np.asarray(
+            {
+                "H": 1,
+                "gamma_bins": 1,
+                "variant_count": 2,
+                "family_preset": "unit",
+                "step_seconds": 0.2,
+                "family_specs": [
+                    {
+                        "family_id": 0,
+                        "name": "unit-forward",
+                        "family_type": "normal",
+                        "speed_sign": 1,
+                        "speed_scale": 1.0,
+                        "gamma_rate_scale": 0.0,
+                        "mode": "normal",
+                        "compound_split": None,
+                        "compound_exit_gamma_scale": 0.0,
+                    }
+                ],
+            },
+            dtype=object,
+        ),
+    )
 
 
 def test_adaptive_library_persistent_versions_generate_sidecars(tmp_path):

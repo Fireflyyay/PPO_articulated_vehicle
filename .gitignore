@@ -25,5 +25,7 @@ venv/
 Thumbs.db
 /src/log/*
 .copilot
+docs/
+docs/*
 
 

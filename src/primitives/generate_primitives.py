@@ -1,164 +1,275 @@
-import os
-import numpy as np
+from __future__ import annotations
+
 import argparse
+import os
+import sys
+from typing import Dict, List, Tuple
 
-from configs import HITCH_OFFSET, TRAILER_LENGTH, VALID_SPEED, VALID_STEER
-from env.vehicle import Vehicle, State
+import numpy as np
 
-def generate_primitives(H, S, output_path):
-    print(f"Generating primitives with H={H}, S={S}...")
 
-    # Define action candidates
-    # Steer (omega/gamma_dot) levels
-    steer_min, steer_max = VALID_STEER
-    steers = np.linspace(steer_min, steer_max, S)
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.dirname(CURRENT_DIR)
+if SRC_DIR not in sys.path:
+    sys.path.append(SRC_DIR)
 
-    # Speed levels: Forward and Backward
-    speed_min, speed_max = VALID_SPEED
-    # Create levels: -max, -half, half, max
-    # e.g. -2.5, -1.25, 1.25, 2.5
-    # speeds = [speed_min, speed_min/2, speed_max/2, speed_max]
-    # Let's be explicit
-    speeds = [-2.5, -1.0, 1.0, 2.5]
+from configs import HITCH_OFFSET, NUM_STEP, STEP_LENGTH, TRAILER_LENGTH, VALID_SPEED, VALID_STEER
+from env.vehicle import State, Vehicle
+from primitives.family_catalog import build_family_catalog
+from primitives.primitive_def import PrimitiveFamilySpec
 
-    # Generate all combinations of constant actions
-    # Action = (steer, speed) held constant for H steps
 
-    primitives_actions = []
-    primitives_deltas = []
+def _wrap_pi(angle: float) -> float:
+    return (angle + np.pi) % (2.0 * np.pi) - np.pi
 
-    # Create a dummy vehicle for simulation
-    # We need to set up initial state such that we can measure delta.
-    # Initial state: x=0, y=0, theta=0, v=0, gamma=0 (theta1=theta2)
-    # Note: State expects raw_state list.
-    # raw_state layout: [x, y, theta, speed, steering, rear_heading]
-    # steering in State is actually gamma (articulation angle) or steer angle?
-    # In ArticulatedKSModel, new_state.steering seems to be used as 'omega' (input) but also stored in state.
-    # But wait, ArticulatedKSModel.step:
-    # omega, speed = action
-    # new_state.steering = omega
-    # So state.steering stores the last applied input (omega).
 
-    # FOR DELTA CALCULATION:
-    # We want delta relative to the vehicle frame.
-    # Delta x, Delta y in vehicle frame. Delta theta, Delta gamma.
+def _state_to_array(state) -> np.ndarray:
+    return np.asarray(
+        [
+            float(state.loc.x),
+            float(state.loc.y),
+            float(state.heading),
+            float(state.rear_heading),
+            float(getattr(state, "speed", 0.0)),
+            float(getattr(state, "steering", 0.0)),
+        ],
+        dtype=np.float64,
+    )
 
-    for speed in speeds:
-        for steer in steers:
-            # Skip if speed is 0
-            if abs(speed) < 0.01:
-                continue
 
-            # Initialize vehicle at origin
-            # x=0, y=0, theta=0, v=0, omega=0, rear_theta=0 (so gamma=0)
-            init_state_list = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-            init_state = State(init_state_list)
+def build_gamma_bins(num_bins: int, gamma_max: float) -> np.ndarray:
+    return np.linspace(-float(gamma_max), float(gamma_max), int(max(3, num_bins)), dtype=np.float64)
 
-            # Use articulated=True
-            vehicle = Vehicle(
-                articulated=True,
-                trailer_length=TRAILER_LENGTH,
-                hitch_offset=HITCH_OFFSET,
-            )
-            vehicle.reset(init_state)
 
-            # Apply action for H steps
-            # Action = [steer, speed]
-            action = np.array([steer, speed])
+def _variant_speed_scale(variant_id: int, variant_count: int) -> float:
+    scales = np.linspace(0.75, 1.25, int(max(1, variant_count)), dtype=np.float64)
+    return float(scales[int(variant_id)])
 
-            trajectory = []
-            valid = True
 
-            for _ in range(H):
-                # We need to pass step_time=1 (sim 1 step) and loop H times
-                # OR pass step_time=H.
-                # Primitive is a sequence of actions. Here action is constant.
-                # Let's step 1 by 1 to simulate trajectory if needed,
-                # but KSModel.step supports step_time.
-                # However, we want to store the sequence of actions [H, 2].
-                # If we step once with step_time=H, we get final state.
+def _variant_duration(variant_id: int, variant_count: int, step_seconds: float, horizon: int) -> float:
+    scales = np.linspace(0.75, 1.25, int(max(1, variant_count)), dtype=np.float64)
+    return float(float(step_seconds) * float(horizon) * scales[int(variant_id)])
 
-                # Let's use step_time=1 in a loop to double check validity at each step if we had checks.
-                # But here we just assume constant action.
 
-                vehicle.step(action, step_time=1)
+def _initial_state_for_gamma(gamma0: float) -> State:
+    return State([0.0, 0.0, 0.0, 0.0, 0.0, -float(gamma0)])
 
-                # Check validity if possible (e.g. constraints)
-                # ArticulatedKSModel already clamps inputs and handles phi limits (gamma limits).
-                # So the resulting state is valid kinematically.
 
-            final_state = vehicle.state
+def _build_action_sequence(
+    spec: PrimitiveFamilySpec,
+    gamma0: float,
+    variant_id: int,
+    variant_count: int,
+    horizon: int,
+) -> Tuple[np.ndarray, int]:
+    max_speed = float(max(abs(float(VALID_SPEED[0])), abs(float(VALID_SPEED[1]))))
+    max_rate = float(max(abs(float(VALID_STEER[0])), abs(float(VALID_STEER[1]))))
+    speed_scale = _variant_speed_scale(variant_id=variant_id, variant_count=variant_count)
+    actions = np.zeros((int(horizon), 2), dtype=np.float64)
 
-            # Calculate delta
-            # Delta should be in the frame of the start state (which is identity)
-            # dx = final_x - 0
-            # dy = final_y - 0
-            # BUT we want it in the local frame of the start.
-            # Start was at 0,0,0. So global xy is local xy.
+    if spec.family_type == "straighten":
+        k_gamma = 1.1 * max_rate
+        bias = 0.20 * float(spec.gamma_rate_scale) * max_rate
+        for step_idx in range(int(horizon)):
+            decay = 1.0 - 0.25 * float(step_idx) / float(max(1, horizon - 1))
+            omega = np.clip((-k_gamma * float(gamma0) + bias) * decay, VALID_STEER[0], VALID_STEER[1])
+            speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.45
+            actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
+        return actions, -1
 
-            dx = final_state.loc.x
-            dy = final_state.loc.y
-            dtheta = final_state.heading
+    if spec.family_type == "terminal":
+        for step_idx in range(int(horizon)):
+            taper = 1.0 - 0.35 * float(step_idx) / float(max(1, horizon - 1))
+            omega = np.clip(float(spec.gamma_rate_scale) * max_rate * 0.45 * taper, VALID_STEER[0], VALID_STEER[1])
+            speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.35
+            actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
+        return actions, -1
 
-            # Gamma delta?
-            # Gamma = theta_front - theta_rear
-            # Initial gamma = 0 - 0 = 0.
-            # Final gamma = final.heading - final.rear_heading
-            # So dgamma = Final gamma.
+    if spec.family_type == "compound":
+        split_ratio = float(spec.compound_split if spec.compound_split is not None else 0.5)
+        switch_index = int(max(1, min(horizon - 1, round(split_ratio * horizon))))
+        for step_idx in range(int(horizon)):
+            if step_idx < switch_index:
+                omega = np.clip(float(spec.gamma_rate_scale) * max_rate * 0.80, VALID_STEER[0], VALID_STEER[1])
+                speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.55
+            else:
+                blend = 1.0 - float(step_idx - switch_index) / float(max(1, horizon - switch_index))
+                omega = np.clip(float(spec.compound_exit_gamma_scale) * max_rate * 0.75 * max(0.35, blend), VALID_STEER[0], VALID_STEER[1])
+                speed = -float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.45
+            actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
+        return actions, int(switch_index)
 
-            gamma = final_state.heading - final_state.rear_heading
-            # Normalize gamma?
-            gamma = (gamma + np.pi) % (2 * np.pi) - np.pi
+    for step_idx in range(int(horizon)):
+        taper = 1.0 - 0.10 * float(step_idx) / float(max(1, horizon - 1))
+        omega = np.clip(float(spec.gamma_rate_scale) * max_rate * taper, VALID_STEER[0], VALID_STEER[1])
+        speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed
+        actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
+    return actions, -1
 
-            delta = np.array([dx, dy, dtheta, gamma])
 
-            # Create action sequence [H, 2]
-            action_seq = np.tile(action, (H, 1))
+def rollout_variant(
+    spec: PrimitiveFamilySpec,
+    gamma0: float,
+    variant_id: int,
+    variant_count: int,
+    horizon: int,
+) -> Dict:
+    vehicle = Vehicle(
+        articulated=True,
+        trailer_length=TRAILER_LENGTH,
+        hitch_offset=HITCH_OFFSET,
+    )
+    vehicle.reset(_initial_state_for_gamma(gamma0))
+    actions, switch_index = _build_action_sequence(spec, gamma0, variant_id, variant_count, horizon)
 
-            # Filter trivial primitives? (e.g. no movement)
-            if np.linalg.norm([dx, dy]) < 0.01 and abs(dtheta) < 0.01:
-                continue
+    rollout_states: List[np.ndarray] = [_state_to_array(vehicle.state)]
+    for action in actions:
+        vehicle.step(np.asarray(action, dtype=np.float64), step_time=1)
+        rollout_states.append(_state_to_array(vehicle.state))
 
-            primitives_actions.append(action_seq)
-            primitives_deltas.append(delta)
+    final_state = vehicle.state
+    delta = np.asarray(
+        [
+            float(final_state.loc.x),
+            float(final_state.loc.y),
+            float(_wrap_pi(final_state.heading)),
+            float(_wrap_pi(final_state.heading - final_state.rear_heading)),
+        ],
+        dtype=np.float64,
+    )
+    return {
+        "actions": np.asarray(actions, dtype=np.float64),
+        "rollout_states": np.asarray(rollout_states, dtype=np.float64),
+        "delta": delta,
+        "duration": _variant_duration(variant_id, variant_count, step_seconds=STEP_LENGTH * NUM_STEP, horizon=horizon),
+        "speed_sign": int(np.sign(np.mean(actions[:, 1]))) if np.any(np.abs(actions[:, 1]) > 1e-8) else 0,
+        "is_compound": int(spec.family_type == "compound"),
+        "switch_index": int(switch_index),
+        "mode": str(spec.mode),
+        "family_type": str(spec.family_type),
+    }
 
-    # Convert to numpy
-    primitives_actions = np.array(primitives_actions) # [N, H, 2]
-    primitives_deltas = np.array(primitives_deltas)   # [N, 4]
 
-    # Save
+def generate_primitives(
+    H: int,
+    S: int,
+    output_path: str,
+    gamma_bins: int = 31,
+    variant_count: int = 3,
+    family_preset: str = "main",
+):
+    del S  # retained for CLI/backward compatibility in experiment scripts
+
+    horizon = int(H)
+    variant_count = int(max(1, variant_count))
+    gamma_max = float(max(abs(float(VALID_STEER[0])), abs(float(VALID_STEER[1]))))
+    gamma_bin_values = build_gamma_bins(num_bins=int(gamma_bins), gamma_max=gamma_max)
+    family_specs = build_family_catalog(preset=family_preset)
+    family_count = int(len(family_specs))
+
+    flat_actions: List[np.ndarray] = []
+    flat_rollout_states: List[np.ndarray] = []
+    flat_deltas: List[np.ndarray] = []
+    flat_variant_horizons: List[int] = []
+    flat_switch_indices: List[int] = []
+    flat_durations: List[float] = []
+    flat_speed_signs: List[int] = []
+    flat_is_compound: List[int] = []
+    flat_to_gamma: List[int] = []
+    flat_to_family: List[int] = []
+    flat_to_variant: List[int] = []
+    flat_to_family_type: List[str] = []
+    flat_to_mode: List[str] = []
+
+    index_table = np.full((len(gamma_bin_values), family_count, variant_count), -1, dtype=np.int64)
+    variant_counts = np.zeros((len(gamma_bin_values), family_count), dtype=np.int64)
+    default_variant_table = np.full((len(gamma_bin_values), family_count), -1, dtype=np.int64)
+
+    for gamma_bin_id, gamma0 in enumerate(gamma_bin_values.tolist()):
+        for spec in family_specs:
+            for variant_id in range(variant_count):
+                payload = rollout_variant(spec, float(gamma0), int(variant_id), variant_count, horizon)
+                flat_index = len(flat_actions)
+                index_table[int(gamma_bin_id), int(spec.family_id), int(variant_id)] = int(flat_index)
+                variant_counts[int(gamma_bin_id), int(spec.family_id)] += 1
+                if int(variant_id) == int(variant_count // 2):
+                    default_variant_table[int(gamma_bin_id), int(spec.family_id)] = int(flat_index)
+
+                flat_actions.append(np.asarray(payload["actions"], dtype=np.float64))
+                flat_rollout_states.append(np.asarray(payload["rollout_states"], dtype=np.float64))
+                flat_deltas.append(np.asarray(payload["delta"], dtype=np.float64))
+                flat_variant_horizons.append(int(horizon))
+                flat_switch_indices.append(int(payload["switch_index"]))
+                flat_durations.append(float(payload["duration"]))
+                flat_speed_signs.append(int(payload["speed_sign"]))
+                flat_is_compound.append(int(payload["is_compound"]))
+                flat_to_gamma.append(int(gamma_bin_id))
+                flat_to_family.append(int(spec.family_id))
+                flat_to_variant.append(int(variant_id))
+                flat_to_family_type.append(str(payload["family_type"]))
+                flat_to_mode.append(str(payload["mode"]))
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     np.savez_compressed(
         output_path,
-        actions=primitives_actions,
-        deltas=primitives_deltas,
-        meta={
-            'H': H,
-            'S': S,
-            'trailer_length': float(TRAILER_LENGTH),
-            'hitch_offset': float(HITCH_OFFSET),
-        },
+        schema_version=np.asarray("family_library_v1", dtype=object),
+        actions=np.asarray(flat_actions, dtype=np.float64),
+        deltas=np.asarray(flat_deltas, dtype=np.float64),
+        rollout_states=np.asarray(flat_rollout_states, dtype=np.float64),
+        variant_horizons=np.asarray(flat_variant_horizons, dtype=np.int64),
+        switch_indices=np.asarray(flat_switch_indices, dtype=np.int64),
+        durations=np.asarray(flat_durations, dtype=np.float64),
+        speed_signs=np.asarray(flat_speed_signs, dtype=np.int64),
+        is_compound=np.asarray(flat_is_compound, dtype=np.int8),
+        variant_flat_to_gamma=np.asarray(flat_to_gamma, dtype=np.int64),
+        variant_flat_to_family=np.asarray(flat_to_family, dtype=np.int64),
+        variant_flat_to_variant=np.asarray(flat_to_variant, dtype=np.int64),
+        variant_flat_to_family_type=np.asarray(flat_to_family_type, dtype=object),
+        variant_flat_to_mode=np.asarray(flat_to_mode, dtype=object),
+        gamma_bin_values=np.asarray(gamma_bin_values, dtype=np.float64),
+        family_names=np.asarray([spec.name for spec in family_specs], dtype=object),
+        family_types=np.asarray([spec.family_type for spec in family_specs], dtype=object),
+        family_count=np.asarray(int(family_count), dtype=np.int64),
+        variant_count_per_family=np.asarray(int(variant_count), dtype=np.int64),
+        index_table=np.asarray(index_table, dtype=np.int64),
+        variant_counts=np.asarray(variant_counts, dtype=np.int64),
+        default_variant_table=np.asarray(default_variant_table, dtype=np.int64),
+        step_seconds=np.asarray(float(STEP_LENGTH * NUM_STEP), dtype=np.float64),
+        meta=np.asarray(
+            {
+                "H": int(horizon),
+                "gamma_bins": int(gamma_bins),
+                "variant_count": int(variant_count),
+                "family_preset": str(family_preset),
+                "trailer_length": float(TRAILER_LENGTH),
+                "hitch_offset": float(HITCH_OFFSET),
+                "step_seconds": float(STEP_LENGTH * NUM_STEP),
+                "family_specs": [spec.__dict__.copy() for spec in family_specs],
+            },
+            dtype=object,
+        ),
     )
-    print(f"Saved {len(primitives_actions)} primitives to {output_path}")
+    print(
+        f"Saved family primitive library to {output_path} | families={family_count} | gamma_bins={gamma_bins} | variants={len(flat_actions)}"
+    )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    # Defaults from requirements
-    parser.add_argument("--H", type=int, default=4)
+    parser.add_argument("--H", type=int, default=3)
     parser.add_argument("--S", type=int, default=11)
-
+    parser.add_argument("--gamma-bins", type=int, default=31)
+    parser.add_argument("--variant-count", type=int, default=3)
+    parser.add_argument("--family-preset", type=str, default="main", choices=("small", "main", "large"))
     args = parser.parse_args()
 
-    output_file = f"src/data/primitives_articulated_H{args.H}_S{args.S}.npz"
-    # Ensure src/data exists? The path in config is "../data/..." relative to src/config.py?
-    # User said: "data/primitives_articulated_H{H}_S{S}.npz" in B1.
-    # And config: "USE_MOTION_PRIMITIVES = True", "PRIMITIVE_LIBRARY_PATH = '../data/primitives_articulated_H20_S11.npz'"
-    # If config is in src/configs.py, then '../data' is src/../data = data/ (root data).
-    # But wait, create_file created src/primitives.
-    # Where should data be? 'PPO_articulated_vehicle/data/'.
-
-    # Let's target PPO_articulated_vehicle/data
     root_data_path = os.path.join(os.path.dirname(__file__), "../../data")
-    output_path = os.path.join(root_data_path, f"primitives_articulated_H{args.H}_S{args.S}.npz")
-
-    generate_primitives(args.H, args.S, output_path)
+    output_path = os.path.join(root_data_path, f"primitives_family_{args.family_preset}_G{args.gamma_bins}_V{args.variant_count}.npz")
+    generate_primitives(
+        H=args.H,
+        S=args.S,
+        output_path=output_path,
+        gamma_bins=args.gamma_bins,
+        variant_count=args.variant_count,
+        family_preset=args.family_preset,
+    )

@@ -153,8 +153,23 @@ class TrajectoryMiner:
                 cand.end_feature = end_feat
                 cand.delta_feature = delta_feat
 
-            cand.complexity_score = float(self.score_segment_complexity(seg_u, seg_states, config))
+            macro0 = int(low2macro[int(t0)]) if low2macro is not None else 0
+            macro1 = int(low2macro[int(max(t0, t1 - 1))]) if low2macro is not None else (len(ep.observations) - 1)
+            macro0 = max(0, min(macro0, len(ep.observations) - 1))
+            macro1 = max(0, min(macro1, len(ep.observations) - 1))
+            obs_seq = ep.observations[macro0 : macro1 + 1]
+
+            cand.complexity_score = float(self.score_segment_complexity(seg_u, seg_states, config, observations=obs_seq))
             cand.utility_score = float(self.score_segment_utility(ep, t0, t1, low2macro, config))
+            cand.utility_score = float(
+                np.clip(
+                    cand.utility_score
+                    + float(getattr(config, "AP_UTILITY_HARD_RECOVERY_BONUS", 0.10))
+                    * self._score_hard_recovery_bonus(ep, ep.observations[macro1], config),
+                    0.0,
+                    1.0,
+                )
+            )
             cand.novelty_score = float(self.compute_novelty(actions_H, cand.delta_feature, current_library, config))
 
             a = float(getattr(config, "AP_W_COMPLEXITY", 0.35))
@@ -270,7 +285,13 @@ class TrajectoryMiner:
     # -------------------------
     # Scoring
     # -------------------------
-    def score_segment_complexity(self, actions: np.ndarray, states: Optional[np.ndarray], config) -> float:
+    def score_segment_complexity(
+        self,
+        actions: np.ndarray,
+        states: Optional[np.ndarray],
+        config,
+        observations: Optional[Sequence[np.ndarray]] = None,
+    ) -> float:
         """Complexity proxy in [0,1] (best-effort)."""
         actions = np.asarray(actions, dtype=np.float64)
         T = int(actions.shape[0])
@@ -324,8 +345,8 @@ class TrajectoryMiner:
             beta_max = float(np.deg2rad(36))
             r_art = float(np.mean(np.clip(beta_abs / (beta_max + 1e-6), 0.0, 1.0)))
 
-        # F) near-obstacle proxy unavailable in trace by default
-        r_obs = 0.0
+        # F) obstacle proximity from macro observations when available
+        r_obs = self._score_obstacle_proximity(observations, config)
 
         w = getattr(config, "AP_COMPLEXITY_WEIGHTS", None) or {}
         w_rev = float(w.get("rev", 0.15))
@@ -414,8 +435,30 @@ class TrajectoryMiner:
         min_d = float(np.min(dists)) if dists.size > 0 else 1.0
 
         scale = float(getattr(config, "AP_NOVELTY_ACTION_L2_SCALE", 1.0))
-        nov = min_d / max(1e-6, scale)
-        return float(np.clip(nov, 0.0, 1.0))
+        nov_action = float(np.clip(min_d / max(1e-6, scale), 0.0, 1.0))
+
+        if delta_feature is None:
+            return nov_action
+
+        try:
+            lib_deltas = np.asarray(getattr(current_library, "deltas"), dtype=np.float64)
+        except Exception:
+            lib_deltas = None
+
+        if lib_deltas is None or lib_deltas.ndim != 2 or lib_deltas.shape[0] != lib_actions.shape[0] or lib_deltas.shape[1] < 3:
+            return nov_action
+
+        cand_delta = np.asarray(delta_feature, dtype=np.float64).reshape(-1)
+        if cand_delta.size < 3:
+            return nov_action
+
+        cand_delta = cand_delta[:3]
+        delta_vec = lib_deltas[:, :3]
+        delta_dists = np.linalg.norm(delta_vec - cand_delta[None, :], axis=1) / np.sqrt(float(cand_delta.size) + 1e-9)
+        delta_scale = float(getattr(config, "AP_NOVELTY_DELTA_L2_SCALE", 1.0))
+        nov_delta = float(np.clip(float(np.min(delta_dists)) / max(1e-6, delta_scale), 0.0, 1.0))
+        delta_weight = float(np.clip(getattr(config, "AP_NOVELTY_DELTA_WEIGHT", 0.35), 0.0, 1.0))
+        return float(np.clip((1.0 - delta_weight) * nov_action + delta_weight * nov_delta, 0.0, 1.0))
 
     # -------------------------
     # Resampling
@@ -534,6 +577,56 @@ class TrajectoryMiner:
             "articulation": _wrap_pi(articulation),
             "rel_angle": rel_angle,
         }
+
+    def _score_obstacle_proximity(self, observations: Optional[Sequence[np.ndarray]], config) -> float:
+        if observations is None:
+            return 0.0
+
+        try:
+            lidar_n = int(getattr(config, "LIDAR_NUM", 120))
+            lidar_range = float(getattr(config, "LIDAR_RANGE", 30.0))
+            d0 = float(getattr(config, "AP_D0_OBS", 3.0))
+        except Exception:
+            lidar_n, lidar_range, d0 = 120, 30.0, 3.0
+
+        min_dist = None
+        for obs in observations:
+            obs_vec = np.asarray(obs, dtype=np.float64).reshape(-1)
+            if obs_vec.size < lidar_n or lidar_n <= 0:
+                continue
+            lidar = obs_vec[:lidar_n]
+            if lidar.size == 0:
+                continue
+            local_min = float(np.min(lidar))
+            if local_min <= 1.5:
+                local_min *= lidar_range
+            if min_dist is None:
+                min_dist = local_min
+            else:
+                min_dist = min(min_dist, local_min)
+
+        if min_dist is None:
+            return 0.0
+        return float(np.clip(1.0 - float(min_dist) / max(1e-6, d0), 0.0, 1.0))
+
+    def _score_hard_recovery_bonus(self, ep: EpisodeTrace, terminal_obs: np.ndarray, config) -> float:
+        if bool(getattr(ep, "success", False)):
+            return 0.0
+
+        scene = str(getattr(ep, "scene_type", "Normal"))
+        if scene not in ("Complex", "Extrem", "Extreme"):
+            return 0.0
+
+        try:
+            dist = float(self._parse_goal_from_obs(terminal_obs, config)["dist"])
+        except Exception:
+            return 0.0
+
+        near_thr = float(getattr(config, "AP_NEAR_SUCCESS_DIST_THR", 3.0))
+        if dist > 2.0 * near_thr:
+            return 0.0
+
+        return float(np.clip(1.0 - dist / max(1e-6, 2.0 * near_thr), 0.0, 1.0))
 
     def _state_features(self, states: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Return (start_feature, end_feature, delta_feature) from low-level states.
