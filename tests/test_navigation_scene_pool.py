@@ -3,6 +3,7 @@ import time
 import pytest
 
 from configs import (
+    BLOCK_MIXING_PLANT_CONFIG,
     NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
     NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL,
     NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL,
@@ -13,6 +14,7 @@ from env.parking_map_normal import ParkingMapNormal
 @pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
 def test_navigation_scene_pool_preserves_scene_filter_constraints(level):
     parking_map = ParkingMapNormal(level, enable_scene_pool=True, scene_pool_size=3)
+    cfg = BLOCK_MIXING_PLANT_CONFIG[level]
 
     for _ in range(4):
         parking_map.reset()
@@ -21,9 +23,9 @@ def test_navigation_scene_pool_preserves_scene_filter_constraints(level):
 
         assert metrics is not None
         assert final_metrics is not None
-        assert float(metrics["path_ratio"]) <= float(NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL[level]) + 1e-6
-        assert float(metrics["path_min_clearance"]) >= float(NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL[level]) - 1e-6
-        assert float(metrics["min_endpoint_clearance"]) >= float(NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL[level]) - 1e-6
+        assert float(metrics["path_ratio"]) <= float(cfg["scene_metric_max_path_ratio"]) + 1e-6
+        assert float(metrics["path_min_clearance"]) >= float(cfg["scene_metric_min_path_clearance"]) - 1e-6
+        assert float(metrics["min_endpoint_clearance"]) >= float(cfg["scene_metric_min_endpoint_clearance"]) - 1e-6
         assert float(final_metrics["path_ratio"]) > 0.0
         assert float(final_metrics["path_min_clearance"]) > 0.0
         assert float(final_metrics["min_endpoint_clearance"]) > 0.0

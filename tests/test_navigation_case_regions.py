@@ -1,113 +1,100 @@
-import pytest
+from __future__ import annotations
+
+import math
+
 import numpy as np
-from shapely.geometry import Point
+import pytest
 
+from configs import BLOCK_MIXING_PLANT_CONFIG
 from env.parking_map_normal import generate_navigation_case
-from configs import (
-    NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
-    NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL,
-    NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL,
-    NAVIGATION_TIGHT_TURN_HEADING_DEG_BY_LEVEL,
-    NAVIGATION_TIGHT_TURN_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
-)
 
 
-def _in_plaza(pose, plaza) -> bool:
-    pt = Point(float(pose[0]), float(pose[1]))
-    # Pose is sampled with `poly.contains`, but add a tiny buffer for numeric robustness.
-    return bool(plaza.buffer(1e-9).contains(pt))
-
-
-def _support_edge_id(edge_meta):
-    assert edge_meta is not None
-    assert "edge_id" in edge_meta
-    return int(edge_meta["edge_id"])
-
-
-@pytest.mark.parametrize(
-    "level, expected_in_plaza_count",
-    [
-        ("Normal", 2),   # easy: both in plaza
-        ("Complex", 1),  # normal: exactly one in plaza
-        ("Extrem", 0),   # hard: both in corridor
-    ],
-)
-def test_navigation_case_start_goal_region_by_difficulty(level, expected_in_plaza_count):
-    # Sample multiple times to guard against rare edge cases.
-    for _ in range(20):
-        start, dest, _obstacles, regions = generate_navigation_case(level, return_regions=True)
-        plaza = regions["plaza"]
-        corridors = regions["corridors"]
-
-        assert plaza is not None and (not plaza.is_empty)
-        # For Complex/Extrem, corridors must exist.
-        if level in ["Complex", "Extrem"]:
-            assert len(corridors) > 0
-
-        in_plaza_count = int(_in_plaza(start, plaza)) + int(_in_plaza(dest, plaza))
-        assert in_plaza_count == expected_in_plaza_count
-
-        # If a pose is in corridor (i.e., not in plaza), it should not be right at the corridor mouth.
-        # We require a small positive distance to plaza for robustness.
-        for pose in [start, dest]:
-            if not _in_plaza(pose, plaza):
-                assert float(Point(float(pose[0]), float(pose[1])).distance(plaza)) > 1.0
+def _world_to_cell(scene_meta: dict, pose_xyz) -> tuple[int, int]:
+    origin_x, origin_y = scene_meta["grid_origin"]
+    block_size = float(scene_meta["block_size"])
+    gx = int(math.floor((float(pose_xyz[0]) - float(origin_x)) / block_size))
+    gy = int(math.floor((float(pose_xyz[1]) - float(origin_y)) / block_size))
+    return gx, gy
 
 
 @pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
-def test_navigation_case_scene_metrics_respect_filter_gate(level):
-    for _ in range(8):
-        start, dest, _obstacles, regions = generate_navigation_case(level, return_regions=True)
-        metrics = regions["scene_metrics"]
+def test_navigation_case_block_scene_metadata_matches_config(level):
+    start, dest, obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
 
-        assert metrics is not None
-        assert float(metrics["path_ratio"]) <= float(NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL[level]) + 1e-6
-        assert float(metrics["path_min_clearance"]) >= float(NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL[level]) - 1e-6
-        assert float(metrics["min_endpoint_clearance"]) >= float(NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL[level]) - 1e-6
+    cfg = BLOCK_MIXING_PLANT_CONFIG[level]
+    occupancy = scene_meta["occupancy_grid"]
+    free_grid = scene_meta["free_grid"]
 
-        if float(metrics["heading_diff_deg"]) >= float(NAVIGATION_TIGHT_TURN_HEADING_DEG_BY_LEVEL[level]) - 1e-6:
-            assert float(metrics["min_endpoint_clearance"]) >= float(
-                NAVIGATION_TIGHT_TURN_MIN_ENDPOINT_CLEARANCE_BY_LEVEL[level]
-            ) - 1e-6
+    assert scene_meta["scene_type"] == "block_mixing_plant"
+    assert tuple(occupancy.shape) == (int(cfg["grid_height"]), int(cfg["grid_width"]))
+    assert tuple(free_grid.shape) == tuple(occupancy.shape)
+    assert np.array_equal(free_grid, occupancy == 0)
+    assert len(obstacles) > 0
+    assert int(scene_meta["parking_bay_count"]) >= int(cfg["parking_bay_count_range"][0])
+    assert float(scene_meta["free_ratio"]) >= float(cfg["min_free_ratio"]) - 1e-6
+    assert float(scene_meta["free_ratio"]) <= float(cfg["max_free_ratio"]) + 1e-6
+    assert scene_meta["guidance_occupancy_payload"] is not None
+    assert scene_meta["guidance_path_points"] is not None
+    assert len(scene_meta["guidance_path_points"]) >= 2
+
+    sx, sy = _world_to_cell(scene_meta, start)
+    dx, dy = _world_to_cell(scene_meta, dest)
+    assert occupancy[sy, sx] == 0
+    assert occupancy[dy, dx] == 0
 
 
 @pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
-def test_navigation_case_divider_walls_never_degenerate(level):
-    for _ in range(10):
-        _start, _dest, obstacles, regions = generate_navigation_case(level, return_regions=True)
+def test_navigation_case_scene_metrics_respect_block_filter_gate(level):
+    _start, _dest, _obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
+    metrics = scene_meta["scene_metrics"]
+    cfg = BLOCK_MIXING_PLANT_CONFIG[level]
 
-        assert int(regions["start_divider_wall_count"]) > 0
-        assert int(regions["dest_divider_wall_count"]) > 0
-        assert int(regions["divider_wall_count"]) >= (
-            int(regions["start_divider_wall_count"]) + int(regions["dest_divider_wall_count"])
-        )
-        assert len(obstacles) > 5
+    assert metrics is not None
+    assert float(metrics["path_ratio"]) <= float(cfg["scene_metric_max_path_ratio"]) + 1e-6
+    assert float(metrics["path_min_clearance"]) >= float(cfg["scene_metric_min_path_clearance"]) - 1e-6
+    assert float(metrics["min_endpoint_clearance"]) >= float(cfg["scene_metric_min_endpoint_clearance"]) - 1e-6
 
 
-def test_navigation_case_normal_support_edges_not_always_same_wall():
-    np.random.seed(0)
+@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+def test_navigation_case_parking_bays_have_access_to_free_corridor(level):
+    _start, _dest, _obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
+    occupancy = scene_meta["occupancy_grid"]
+    parking_bays = scene_meta["parking_bays"]
 
-    total = 60
-    same_edge = 0
-    different_edge = 0
+    assert len(parking_bays) == int(scene_meta["parking_bay_count"])
+    for bay in parking_bays:
+        assert bay.access_cells is not None
+        assert len(bay.access_cells) > 0
+        for gx, gy in bay.grid_cells[: min(4, len(bay.grid_cells))]:
+            assert occupancy[gy, gx] == 0
+        for ax, ay in bay.access_cells[: min(3, len(bay.access_cells))]:
+            assert occupancy[ay, ax] == 0
 
-    for _ in range(total):
-        start, dest, _obstacles, regions = generate_navigation_case("Normal", return_regions=True)
-        plaza = regions["plaza"]
-        start_edge = regions["start_support_edge"]
-        dest_edge = regions["dest_support_edge"]
 
-        assert _in_plaza(start, plaza)
-        assert _in_plaza(dest, plaza)
-        assert start_edge is not None
-        assert dest_edge is not None
-        assert start_edge["poly_label"] == "plaza"
-        assert dest_edge["poly_label"] == "plaza"
+@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+def test_navigation_case_parking_bays_keep_far_side_wall_intact(level):
+    _start, _dest, _obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
+    occupancy = scene_meta["occupancy_grid"]
+    parking_bays = scene_meta["parking_bays"]
 
-        if _support_edge_id(start_edge) == _support_edge_id(dest_edge):
-            same_edge += 1
+    for bay in parking_bays:
+        bay_cells = np.asarray(bay.grid_cells, dtype=np.int64)
+        gx0 = int(np.min(bay_cells[:, 0]))
+        gx1 = int(np.max(bay_cells[:, 0]))
+        gy0 = int(np.min(bay_cells[:, 1]))
+        gy1 = int(np.max(bay_cells[:, 1]))
+
+        access_cells = np.asarray(bay.access_cells, dtype=np.int64)
+        access_x = int(access_cells[len(access_cells) // 2][0])
+        access_y = int(access_cells[len(access_cells) // 2][1])
+        bay_center_cell_x = 0.5 * float(gx0 + gx1)
+        bay_center_cell_y = 0.5 * float(gy0 + gy1)
+
+        if np.all(access_cells[:, 1] == access_cells[0, 1]):
+            far_y = gy0 - 1 if bay_center_cell_y < float(access_y) else gy1 + 1
+            assert 0 <= far_y < occupancy.shape[0]
+            assert np.all(occupancy[far_y, gx0:gx1 + 1] == 1)
         else:
-            different_edge += 1
-
-    assert different_edge >= 12
-    assert same_edge < total
+            far_x = gx0 - 1 if bay_center_cell_x < float(access_x) else gx1 + 1
+            assert 0 <= far_x < occupancy.shape[1]
+            assert np.all(occupancy[gy0:gy1 + 1, far_x] == 1)

@@ -18,6 +18,8 @@ import random as pyrandom
 
 import numpy as np
 
+from configs import BLOCK_MIXING_PLANT_CONFIG
+
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC_DIR = os.path.dirname(_THIS_DIR)
@@ -36,13 +38,8 @@ def _abs_angle_diff(a: float, b: float) -> float:
 
 
 def _constraints(level: str):
-    if level == "Normal":
-        return (0.0, 36.0), (0.0, 80.0)
-    if level == "Complex":
-        return (30.0, 50.0), (45.0, 90.0)
-    if level == "Extrem":
-        return (50.0, None), (60.0, 180.0)
-    raise ValueError(level)
+    cfg = BLOCK_MIXING_PLANT_CONFIG[str(level)]
+    return tuple(cfg["pair_distance_range"]), tuple(cfg["pair_heading_diff_range_deg"])
 
 
 def main():

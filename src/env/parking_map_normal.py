@@ -15,6 +15,10 @@ from shapely.ops import unary_union
 from shapely.prepared import prep
 
 from env.global_guidance import SoftGlobalGuidance
+from env.scene_generators.block_mixing_plant_generator import (
+    generate_block_mixing_plant_scene,
+    sample_navigation_case_from_scene,
+)
 from env.vehicle import State
 from env.map_base import *
 from configs import *
@@ -2192,6 +2196,71 @@ def _generate_navigation_case_once(
     return start, dest, obstacles
 
 
+def _generate_block_mixing_navigation_case_once(
+    map_level,
+    return_regions: bool = False,
+    _retry_idx: int = 0,
+    _failure_counts=None,
+):
+    def _retry(reason: str):
+        if _failure_counts is not None:
+            key = str(reason)
+            _failure_counts[key] = int(_failure_counts.get(key, 0)) + 1
+        raise _NavigationGenerationRetry(str(reason))
+
+    try:
+        scene = generate_block_mixing_plant_scene(map_level)
+    except Exception as exc:
+        _retry(f"block mixing plant generation failed: {exc}")
+
+    try:
+        start, dest, nav_meta = sample_navigation_case_from_scene(scene, map_level)
+    except Exception as exc:
+        _retry(f"block mixing plant pose sampling failed: {exc}")
+
+    obstacles = list(scene.obstacle_polygons)
+    guidance_occupancy_payload = scene.metadata.get('guidance_occupancy_payload')
+    static_obstacles = list(scene.metadata.get('guidance_static_obstacles') or obstacles)
+    dynamic_obstacles = list(scene.metadata.get('guidance_dynamic_obstacles') or [])
+
+    guidance_path_points = nav_meta.get('guidance_path_points')
+    if return_regions and ENABLE_GLOBAL_SOFT_GUIDANCE and bool(NAVIGATION_REQUIRE_GUIDANCE_SUCCESS):
+        if guidance_path_points is None or len(guidance_path_points) < 2:
+            guidance_path_points, guidance_occupancy_payload = _plan_guidance_path_for_scene(
+                obstacles,
+                start,
+                dest,
+                occupancy_payload=guidance_occupancy_payload,
+                static_obstacles=static_obstacles,
+                dynamic_obstacles=dynamic_obstacles,
+            )
+            if guidance_path_points is None:
+                _retry("exact guidance planner rejected block mixing plant scene")
+
+    scene_meta = dict(scene.metadata)
+    scene_meta.update(dict(nav_meta))
+    scene_meta.update({
+        'guidance_path_points': guidance_path_points,
+        'guidance_occupancy_payload': guidance_occupancy_payload,
+        'guidance_static_obstacles': static_obstacles,
+        'guidance_dynamic_obstacles': dynamic_obstacles,
+        'guidance_static_obstacle_signature': scene_meta.get('guidance_static_obstacle_signature') or (
+            None if guidance_occupancy_payload is None else guidance_occupancy_payload.get('static_obstacle_signature')
+        ),
+        'guidance_dynamic_obstacle_signature': scene_meta.get('guidance_dynamic_obstacle_signature') or (
+            None if guidance_occupancy_payload is None else guidance_occupancy_payload.get('dynamic_obstacle_signature')
+        ),
+        'generation_attempt_index': int(_retry_idx),
+        'generation_attempts_used': int(_retry_idx) + 1,
+        'generation_retry_count': int(_retry_idx),
+        'generation_retry_reasons': dict(_failure_counts or {}),
+    })
+
+    if return_regions:
+        return start, dest, obstacles, scene_meta
+    return start, dest, obstacles
+
+
 def generate_navigation_case(map_level, return_regions: bool = False, _retry_idx: int = 0):
     max_attempts = int(max(1, NAVIGATION_GENERATION_MAX_SCENE_ATTEMPTS))
     start_attempt = int(max(0, _retry_idx))
@@ -2200,7 +2269,7 @@ def generate_navigation_case(map_level, return_regions: bool = False, _retry_idx
 
     for attempt_idx in range(start_attempt, max_attempts):
         try:
-            return _generate_navigation_case_once(
+            return _generate_block_mixing_navigation_case_once(
                 map_level,
                 return_regions=return_regions,
                 _retry_idx=attempt_idx,
@@ -2211,7 +2280,7 @@ def generate_navigation_case(map_level, return_regions: bool = False, _retry_idx
             continue
 
     if bool(NAVIGATION_ALLOW_LAST_RESORT):
-        return _generate_navigation_case_once(
+        return _generate_block_mixing_navigation_case_once(
             map_level,
             return_regions=return_regions,
             _retry_idx=max_attempts - 1,

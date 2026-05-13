@@ -10,12 +10,12 @@ SEED = 42
 
 #########################
 # vehicle
-WHEEL_BASE = 3.0  # wheelbase (HITCH_OFFSET + TRAILER_LENGTH)
-FRONT_HANG = 1.0  # front hang length
-REAR_HANG = 1.0  # rear hang length
-WIDTH = 2.0  # width
-TRAILER_LENGTH = 1.5
-HITCH_OFFSET = 1.5
+WHEEL_BASE = 3.6  # mm 3600
+FRONT_HANG = 3.2  # front overhang, inferred from user-provided overall length
+REAR_HANG = 2.6  # rear overhang, inferred from user-provided overall length
+WIDTH = 3.43  # strict user-table value
+TRAILER_LENGTH = 1.8  # articulation center to rear axle center
+HITCH_OFFSET = 1.8  # front axle center to articulation center
 LENGTH = FRONT_HANG + WHEEL_BASE + REAR_HANG  # total length
 
 from shapely.geometry import LinearRing
@@ -45,7 +45,7 @@ COLOR_POOL = [
 ]
 
 VALID_SPEED = [-2.5, 2.5]
-VALID_STEER = [-np.radians(36), np.radians(36)]
+VALID_STEER = [-np.radians(38), np.radians(38)]
 VALID_ACCEL = [-1.0, 1.0]
 VALID_ANGULAR_SPEED = [-0.5, 0.5]
 
@@ -174,6 +174,139 @@ NAVIGATION_TIGHT_TURN_MIN_ENDPOINT_CLEARANCE_BY_LEVEL = {
     'Normal': 1.15,
     'Complex': 1.00,
     'Extrem': 0.90,
+}
+
+# -----------------------------
+# Block-based mixing plant navigation scenes
+# Dense obstacle grid first, then carve corridors / bays.
+# World bounds remain fixed at [-40, 40] to preserve env/guidance contracts.
+# -----------------------------
+BLOCK_MIXING_PLANT_CONFIG = {
+    "Normal": {
+        "grid_width": 80,
+        "grid_height": 80,
+        "block_size": 1.0,
+
+        "corridor_width_range": (8, 8),
+        "main_corridor_count": 3,
+        "branch_count_range": (3, 5),
+        "loop_count_range": (1, 1),
+        "dead_end_count_range": (1, 2),
+
+        "segment_length_range": (8, 16),
+        "turn_probability": 0.28,
+
+        "parking_bay_count_range": (2, 3),
+        "parking_bay_length_range": (7, 8),
+        "parking_bay_depth_range": (8,8),
+        "parking_bay_min_spacing": 5,
+        "parking_head_wall_clearance": 1.0,
+
+        "min_free_ratio": 0.22,
+        "max_free_ratio": 0.34,
+
+        "pair_distance_range": (10.0, 60.0),
+        "pair_heading_diff_range_deg": (0.0, 180.0),
+        "scene_metric_max_path_ratio": 2.2,
+        "scene_metric_min_path_clearance": 0.50,
+        "scene_metric_min_endpoint_clearance": 0.95,
+        "scene_metric_tight_turn_heading_deg": 110.0,
+        "scene_metric_tight_turn_min_endpoint_clearance": 1.00,
+
+        "block_rotation_deg_max": 2.0,
+        "block_position_jitter_ratio": 0.04,
+
+        "boundary_margin": 2,
+        "max_generation_attempts": 400,
+        "max_parking_bay_attempts": 240,
+        "max_pose_sample_attempts": 240,
+        "obstacle_merge_mode": "rect_merge",
+        "seed": None,
+    },
+
+    "Complex": {
+        "grid_width": 80,
+        "grid_height": 80,
+        "block_size": 1.0,
+
+        "corridor_width_range": (7, 7),
+        "main_corridor_count": 3,
+        "branch_count_range": (8, 12),
+        "loop_count_range": (1, 2),
+        "dead_end_count_range": (3, 6),
+
+        "segment_length_range": (5, 12),
+        "turn_probability": 0.50,
+
+        "parking_bay_count_range": (2, 4),
+        "parking_bay_length_range": (6,7),
+        "parking_bay_depth_range": (8, 8),
+        "parking_bay_min_spacing": 5,
+        "parking_head_wall_clearance": 1.0,
+
+        "min_free_ratio": 0.18,
+        "max_free_ratio": 0.34,
+
+        "pair_distance_range": (18.0, 70.0),
+        "pair_heading_diff_range_deg": (0.0, 180.0),
+        "scene_metric_max_path_ratio": 2.8,
+        "scene_metric_min_path_clearance": 1.40,
+        "scene_metric_min_endpoint_clearance": 0.50,
+        "scene_metric_tight_turn_heading_deg": 125.0,
+        "scene_metric_tight_turn_min_endpoint_clearance": 0.50,
+
+        "block_rotation_deg_max": 3.0,
+        "block_position_jitter_ratio": 0.05,
+
+        "boundary_margin": 2,
+        "max_generation_attempts": 120,
+        "max_parking_bay_attempts": 320,
+        "max_pose_sample_attempts": 320,
+        "obstacle_merge_mode": "rect_merge",
+        "seed": None,
+    },
+
+    "Extrem": {
+        "grid_width": 80,
+        "grid_height": 80,
+        "block_size": 1.0,
+
+        "corridor_width_range": (6, 6),
+        "main_corridor_count": 5,
+        "branch_count_range": (22, 36),
+        "loop_count_range": (1, 4),
+        "dead_end_count_range": (10, 20),
+
+        "segment_length_range": (4, 10),
+        "turn_probability": 0.72,
+
+        "parking_bay_count_range": (8, 14),
+        "parking_bay_length_range": (5,6),
+        "parking_bay_depth_range": (10, 10),
+        "parking_bay_min_spacing": 4,
+        "parking_head_wall_clearance": 1.0,
+
+        "min_free_ratio": 0.14,
+        "max_free_ratio": 0.26,
+
+        "pair_distance_range": (32.0, 80.0),
+        "pair_heading_diff_range_deg": (60.0, 180.0),
+        "scene_metric_max_path_ratio": 3.2,
+        "scene_metric_min_path_clearance": 0.50,
+        "scene_metric_min_endpoint_clearance": 0.25,
+        "scene_metric_tight_turn_heading_deg": 140.0,
+        "scene_metric_tight_turn_min_endpoint_clearance": 0.25,
+
+        "block_rotation_deg_max": 4.0,
+        "block_position_jitter_ratio": 0.06,
+
+        "boundary_margin": 2,
+        "max_generation_attempts": 120,
+        "max_parking_bay_attempts": 420,
+        "max_pose_sample_attempts": 420,
+        "obstacle_merge_mode": "rect_merge",
+        "seed": None,
+    },
 }
 
 # Success-band teacher for Extrem: keep training near the learnable band.
