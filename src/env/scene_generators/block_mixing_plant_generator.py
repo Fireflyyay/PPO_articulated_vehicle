@@ -11,6 +11,11 @@ import numpy as np
 from shapely.geometry import Point, Polygon, box
 from shapely.ops import unary_union
 
+try:
+    from scipy.ndimage import distance_transform_edt
+except Exception:
+    distance_transform_edt = None
+
 from configs import (
     BLOCK_MIXING_PLANT_CONFIG,
     FRONT_HANG,
@@ -94,6 +99,33 @@ class _PoseCandidate:
     bay_heading: float
     anchor_cell: tuple[int, int]
     reverse: bool
+
+
+@dataclass(frozen=True)
+class _ParkingBaySlot:
+    rect: tuple[int, int, int, int]
+    access_cells: tuple[tuple[int, int], ...]
+    center: tuple[float, float]
+    heading: float
+    length_cells: int
+    depth_cells: int
+    segment_kind: str
+    segment_cell_length: int
+
+
+@dataclass(frozen=True)
+class _SegmentAttachment:
+    point: tuple[int, int]
+    direction: tuple[int, int]
+    segment_index: int
+    segment_kind: str
+
+
+@dataclass(frozen=True)
+class _CorridorAnchor:
+    point: tuple[int, int]
+    segment_index: int
+    segment_kind: str
 
 
 def _wrap_pi(angle: float) -> float:
@@ -409,6 +441,208 @@ def _sample_boundary_anchor(config: dict, rng: np.random.Generator, side: int) -
     if side == 2:
         return int(rng.integers(x_low, x_high + 1)), y_low
     return int(rng.integers(x_low, x_high + 1)), y_high
+
+
+def _collect_segment_attachments(
+    occupancy: np.ndarray,
+    carved_segments: list[_CorridorSegment],
+    config: dict,
+    allowed_kinds: set[str] | None = None,
+) -> list[_SegmentAttachment]:
+    attachments: list[_SegmentAttachment] = []
+    height, width = occupancy.shape
+    margin = int(config["boundary_margin"]) + max(2, int(config["corridor_width_range"][1]))
+    for segment_index, segment in enumerate(carved_segments):
+        if allowed_kinds is not None and str(segment.kind) not in allowed_kinds:
+            continue
+        x0, y0, x1, y1 = (int(v) for v in segment.bbox)
+        if segment.orientation == "horizontal":
+            seg_start = min(int(segment.start[0]), int(segment.end[0]))
+            seg_end = max(int(segment.start[0]), int(segment.end[0]))
+            if seg_end - seg_start < 3:
+                continue
+            center_y = (y0 + y1 - 1) // 2
+            x_positions = range(seg_start + 1, seg_end)
+            for direction, check_y in (((0, -1), y0 - 1), ((0, 1), y1)):
+                if check_y < margin or check_y >= height - margin:
+                    continue
+                for x in x_positions:
+                    if x < margin or x >= width - margin:
+                        continue
+                    if int(occupancy[check_y, x]) != 1:
+                        continue
+                    attachments.append(
+                        _SegmentAttachment(
+                            point=(int(x), int(center_y)),
+                            direction=(int(direction[0]), int(direction[1])),
+                            segment_index=int(segment_index),
+                            segment_kind=str(segment.kind),
+                        )
+                    )
+        else:
+            seg_start = min(int(segment.start[1]), int(segment.end[1]))
+            seg_end = max(int(segment.start[1]), int(segment.end[1]))
+            if seg_end - seg_start < 3:
+                continue
+            center_x = (x0 + x1 - 1) // 2
+            y_positions = range(seg_start + 1, seg_end)
+            for direction, check_x in (((-1, 0), x0 - 1), ((1, 0), x1)):
+                if check_x < margin or check_x >= width - margin:
+                    continue
+                for y in y_positions:
+                    if y < margin or y >= height - margin:
+                        continue
+                    if int(occupancy[y, check_x]) != 1:
+                        continue
+                    attachments.append(
+                        _SegmentAttachment(
+                            point=(int(center_x), int(y)),
+                            direction=(int(direction[0]), int(direction[1])),
+                            segment_index=int(segment_index),
+                            segment_kind=str(segment.kind),
+                        )
+                    )
+    return attachments
+
+
+def _collect_corridor_anchors(
+    carved_segments: list[_CorridorSegment],
+) -> list[_CorridorAnchor]:
+    anchors: list[_CorridorAnchor] = []
+    seen: set[tuple[int, int, int]] = set()
+    for segment_index, segment in enumerate(carved_segments):
+        points = [tuple(int(v) for v in segment.start), tuple(int(v) for v in segment.end)]
+        if segment.orientation == "horizontal":
+            mid_x = int(round(0.5 * (int(segment.start[0]) + int(segment.end[0]))))
+            points.append((mid_x, int(segment.start[1])))
+        else:
+            mid_y = int(round(0.5 * (int(segment.start[1]) + int(segment.end[1]))))
+            points.append((int(segment.start[0]), mid_y))
+        for point in points:
+            key = (int(point[0]), int(point[1]), int(segment_index))
+            if key in seen:
+                continue
+            seen.add(key)
+            anchors.append(
+                _CorridorAnchor(
+                    point=(int(point[0]), int(point[1])),
+                    segment_index=int(segment_index),
+                    segment_kind=str(segment.kind),
+                )
+            )
+    return anchors
+
+
+def _constructive_growth_params(config: dict, kind: str) -> tuple[dict, int, int]:
+    min_width = int(config["corridor_width_range"][0])
+    if kind == "branch":
+        width_penalty = 2
+        max_segments = 1 if str(config["grid_width"]) == "42" else 2
+        len_scale = 0.55
+    else:
+        width_penalty = 3
+        max_segments = 1
+        len_scale = 0.40
+
+    growth_config = dict(config)
+    seg_low = int(config["segment_length_range"][0])
+    seg_high = int(config["segment_length_range"][1])
+    growth_config["segment_length_range"] = (
+        max(3, int(round(seg_low * len_scale))),
+        max(4, int(round(seg_high * len_scale))),
+    )
+    return growth_config, width_penalty, max(1, int(max_segments))
+
+
+def _generate_constructive_spurs(
+    occupancy: np.ndarray,
+    config: dict,
+    rng: np.random.Generator,
+    carved_segments: list[_CorridorSegment],
+    target_count: int,
+    kind: str,
+    stop_free_ratio: float | None = None,
+) -> int:
+    if target_count <= 0:
+        return 0
+    growth_config, width_penalty, max_segments = _constructive_growth_params(config, kind)
+    min_width = int(config["corridor_width_range"][0])
+    added = 0
+    attempts = 0
+    max_attempts = max(12, int(target_count) * 10)
+    allowed_kinds = {"main", "branch", "loop"}
+    while added < int(target_count) and attempts < max_attempts:
+        if stop_free_ratio is not None and _grid_free_ratio(occupancy) >= float(stop_free_ratio):
+            break
+        attachments = _collect_segment_attachments(occupancy, carved_segments, growth_config, allowed_kinds=allowed_kinds)
+        if not attachments:
+            break
+        attachment = _choice(rng, attachments)
+        width = max(min_width, _range_sample(rng, config["corridor_width_range"]) - width_penalty)
+        waypoints = _random_walk_waypoints(attachment.point, attachment.direction, growth_config, rng, max_segments=max_segments)
+        attempts += 1
+        if len(waypoints) < 2:
+            continue
+        before_free = int(np.count_nonzero(occupancy == 0))
+        _carve_waypoint_path(occupancy, waypoints, width, kind=kind, carved_segments=carved_segments)
+        after_free = int(np.count_nonzero(occupancy == 0))
+        if after_free <= before_free:
+            continue
+        added += 1
+        if kind == "branch" and rng.random() < float(config["turn_probability"]) * 0.20:
+            _carve_pad(occupancy, waypoints[-1], width + 1)
+    return int(added)
+
+
+def _generate_constructive_loops(
+    occupancy: np.ndarray,
+    config: dict,
+    rng: np.random.Generator,
+    carved_segments: list[_CorridorSegment],
+    target_count: int,
+    stop_free_ratio: float | None = None,
+) -> int:
+    if target_count <= 0:
+        return 0
+    min_width = int(config["corridor_width_range"][0])
+    loop_config = dict(config)
+    seg_low = int(config["segment_length_range"][0])
+    seg_high = int(config["segment_length_range"][1])
+    loop_config["segment_length_range"] = (
+        max(4, int(round(seg_low * 0.65))),
+        max(5, int(round(seg_high * 0.65))),
+    )
+    added = 0
+    attempts = 0
+    max_attempts = max(8, int(target_count) * 8)
+    while added < int(target_count) and attempts < max_attempts:
+        if stop_free_ratio is not None and _grid_free_ratio(occupancy) >= float(stop_free_ratio):
+            break
+        anchors = _collect_corridor_anchors(carved_segments)
+        if len(anchors) < 2:
+            break
+        start_anchor = _choice(rng, anchors)
+        min_distance = max(6, int(config["segment_length_range"][0]))
+        candidates = [
+            anchor
+            for anchor in anchors
+            if int(anchor.segment_index) != int(start_anchor.segment_index)
+            and abs(int(anchor.point[0]) - int(start_anchor.point[0])) + abs(int(anchor.point[1]) - int(start_anchor.point[1])) >= min_distance
+        ]
+        attempts += 1
+        if not candidates:
+            continue
+        end_anchor = _choice(rng, candidates)
+        waypoints = _build_manhattan_waypoints(start_anchor.point, end_anchor.point, loop_config, rng, prefer_dogleg=False)
+        if len(waypoints) < 2:
+            continue
+        before_free = int(np.count_nonzero(occupancy == 0))
+        _carve_waypoint_path(occupancy, waypoints, max(2, min_width), kind="loop", carved_segments=carved_segments)
+        after_free = int(np.count_nonzero(occupancy == 0))
+        if after_free <= before_free:
+            continue
+        added += 1
+    return int(added)
 
 
 def _largest_component_mask(free_grid: np.ndarray) -> tuple[np.ndarray, int, int]:
@@ -755,24 +989,25 @@ def _generate_parking_bays(
     rng: np.random.Generator,
     difficulty: str,
 ) -> list[ParkingBay]:
-    parking_bays: list[ParkingBay] = []
     target_count = _range_sample(rng, config["parking_bay_count_range"])
-    max_attempts = int(config.get("max_parking_bay_attempts", 240))
     boundary_margin = int(config["boundary_margin"])
     far_wall_buffer_cells = int(max(1, config.get("parking_bay_far_wall_buffer_cells", 1)))
     min_spacing = float(config["parking_bay_min_spacing"]) * float(config["block_size"])
     min_bay_length = int(config["parking_bay_length_range"][0])
+    current_free_cells = int(np.count_nonzero(occupancy == 0))
+    max_free_cells = int(math.floor(float(config["max_free_ratio"]) * float(occupancy.size)))
+    remaining_free_budget = max(0, max_free_cells - current_free_cells)
     eligible_segments = [
         segment
         for segment in carved_segments
         if segment.kind in {"main", "branch", "loop"} and segment.cell_length >= (min_bay_length + 1)
     ]
     if not eligible_segments:
-        return parking_bays
+        return []
     eligible_segments.sort(key=lambda segment: (segment.kind != "main", -int(segment.cell_length)))
 
-    def _is_far_enough(center_xy: tuple[float, float]) -> bool:
-        for bay in parking_bays:
+    def _is_far_enough(center_xy: tuple[float, float], placed_bays: list[ParkingBay]) -> bool:
+        for bay in placed_bays:
             if math.hypot(float(center_xy[0]) - float(bay.center[0]), float(center_xy[1]) - float(bay.center[1])) < min_spacing:
                 return False
         return True
@@ -799,118 +1034,158 @@ def _generate_parking_bays(
             return False
         return bool(np.all(occupancy[bay_y0:bay_y1, strip_x0:strip_x1] == 1))
 
-    attempts = 0
-    pass_count = max(3, int(math.ceil(max_attempts / max(1, len(eligible_segments)))))
-    for _ in range(pass_count):
-        if len(parking_bays) >= target_count or attempts >= max_attempts:
-            break
-        segment_order = list(eligible_segments)
-        rng.shuffle(segment_order)
-        for segment in segment_order:
-            if len(parking_bays) >= target_count or attempts >= max_attempts:
-                break
-            length_cells = _range_sample(rng, config["parking_bay_length_range"])
-            depth_cells = _range_sample(rng, config["parking_bay_depth_range"])
-            x0, y0, x1, y1 = (int(v) for v in segment.bbox)
-            side_order = [-1, 1]
-            rng.shuffle(side_order)
-            for side in side_order:
-                if len(parking_bays) >= target_count or attempts >= max_attempts:
-                    break
-                attempts += 1
-                if segment.orientation == "horizontal":
-                    seg_start = min(int(segment.start[0]), int(segment.end[0]))
-                    seg_end = max(int(segment.start[0]), int(segment.end[0]))
-                    if seg_end - seg_start + 1 < length_cells + 2:
-                        continue
-                    x_candidates = list(range(seg_start + 1, seg_end - length_cells + 2))
-                    rng.shuffle(x_candidates)
-                    bay_rect = None
-                    for bay_x0 in x_candidates:
-                        bay_x1 = bay_x0 + length_cells
-                        if side < 0:
-                            bay_y1 = y0
-                            bay_y0 = bay_y1 - depth_cells
-                        else:
-                            bay_y0 = y1
-                            bay_y1 = bay_y0 + depth_cells
-                        if bay_x0 < boundary_margin or bay_y0 < boundary_margin:
-                            continue
-                        if bay_x1 > int(config["grid_width"]) - boundary_margin or bay_y1 > int(config["grid_height"]) - boundary_margin:
-                            continue
-                        if np.any(occupancy[bay_y0:bay_y1, bay_x0:bay_x1] == 0):
-                            continue
-                        if not _keeps_far_side_walled(bay_x0, bay_y0, bay_x1, bay_y1, side, segment.orientation):
-                            continue
-                        world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, bay_x0, bay_y0, bay_x1, bay_y1)
-                        center_xy = (0.5 * (world_x0 + world_x1), 0.5 * (world_y0 + world_y1))
-                        if not _is_far_enough(center_xy):
-                            continue
-                        bay_rect = (bay_x0, bay_y0, bay_x1, bay_y1)
-                        break
-                else:
-                    seg_start = min(int(segment.start[1]), int(segment.end[1]))
-                    seg_end = max(int(segment.start[1]), int(segment.end[1]))
-                    if seg_end - seg_start + 1 < length_cells + 2:
-                        continue
-                    y_candidates = list(range(seg_start + 1, seg_end - length_cells + 2))
-                    rng.shuffle(y_candidates)
-                    bay_rect = None
-                    for bay_y0 in y_candidates:
-                        bay_y1 = bay_y0 + length_cells
-                        if side < 0:
-                            bay_x1 = x0
-                            bay_x0 = bay_x1 - depth_cells
-                        else:
-                            bay_x0 = x1
-                            bay_x1 = bay_x0 + depth_cells
-                        if bay_x0 < boundary_margin or bay_y0 < boundary_margin:
-                            continue
-                        if bay_x1 > int(config["grid_width"]) - boundary_margin or bay_y1 > int(config["grid_height"]) - boundary_margin:
-                            continue
-                        if np.any(occupancy[bay_y0:bay_y1, bay_x0:bay_x1] == 0):
-                            continue
-                        if not _keeps_far_side_walled(bay_x0, bay_y0, bay_x1, bay_y1, side, segment.orientation):
-                            continue
-                        world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, bay_x0, bay_y0, bay_x1, bay_y1)
-                        center_xy = (0.5 * (world_x0 + world_x1), 0.5 * (world_y0 + world_y1))
-                        if not _is_far_enough(center_xy):
-                            continue
-                        bay_rect = (bay_x0, bay_y0, bay_x1, bay_y1)
-                        break
-                if bay_rect is None:
+    length_low = int(config["parking_bay_length_range"][0])
+    length_high = int(config["parking_bay_length_range"][1])
+    depth_low = int(config["parking_bay_depth_range"][0])
+    depth_high = int(config["parking_bay_depth_range"][1])
+    slot_candidates: list[_ParkingBaySlot] = []
+    seen_slots: set[tuple[int, int, int, int]] = set()
+
+    for segment in eligible_segments:
+        x0, y0, x1, y1 = (int(v) for v in segment.bbox)
+        if segment.orientation == "horizontal":
+            seg_start = min(int(segment.start[0]), int(segment.end[0]))
+            seg_end = max(int(segment.start[0]), int(segment.end[0]))
+            for length_cells in range(length_low, length_high + 1):
+                if seg_end - seg_start + 1 < length_cells + 2:
                     continue
-                bay_x0, bay_y0, bay_x1, bay_y1 = bay_rect
-                world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, bay_x0, bay_y0, bay_x1, bay_y1)
-                center_xy = (0.5 * (world_x0 + world_x1), 0.5 * (world_y0 + world_y1))
-                carve_rect(occupancy, bay_x0, bay_y0, bay_x1, bay_y1)
-                if segment.orientation == "horizontal":
-                    anchor_y = (y0 + y1 - 1) // 2
-                    access_cells = [(gx, anchor_y) for gx in range(bay_x0, bay_x1)]
-                else:
-                    anchor_x = (x0 + x1 - 1) // 2
-                    access_cells = [(anchor_x, gy) for gy in range(bay_y0, bay_y1)]
+                for depth_cells in range(depth_low, depth_high + 1):
+                    for side in (-1, 1):
+                        for bay_x0 in range(seg_start + 1, seg_end - length_cells + 2):
+                            bay_x1 = bay_x0 + length_cells
+                            if side < 0:
+                                bay_y1 = y0
+                                bay_y0 = bay_y1 - depth_cells
+                            else:
+                                bay_y0 = y1
+                                bay_y1 = bay_y0 + depth_cells
+                            if bay_x0 < boundary_margin or bay_y0 < boundary_margin:
+                                continue
+                            if bay_x1 > int(config["grid_width"]) - boundary_margin or bay_y1 > int(config["grid_height"]) - boundary_margin:
+                                continue
+                            if np.any(occupancy[bay_y0:bay_y1, bay_x0:bay_x1] == 0):
+                                continue
+                            if not _keeps_far_side_walled(bay_x0, bay_y0, bay_x1, bay_y1, side, segment.orientation):
+                                continue
+                            rect = (bay_x0, bay_y0, bay_x1, bay_y1)
+                            if rect in seen_slots:
+                                continue
+                            seen_slots.add(rect)
+                            world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, bay_x0, bay_y0, bay_x1, bay_y1)
+                            center_xy = (0.5 * (world_x0 + world_x1), 0.5 * (world_y0 + world_y1))
+                            anchor_y = (y0 + y1 - 1) // 2
+                            access_cells = tuple((gx, anchor_y) for gx in range(bay_x0, bay_x1))
+                            anchor_cell = access_cells[len(access_cells) // 2]
+                            access_center = _cell_center_world(config, int(anchor_cell[0]), int(anchor_cell[1]))
+                            heading = math.atan2(
+                                float(center_xy[1]) - float(access_center[1]),
+                                float(center_xy[0]) - float(access_center[0]),
+                            )
+                            slot_candidates.append(
+                                _ParkingBaySlot(
+                                    rect=rect,
+                                    access_cells=access_cells,
+                                    center=center_xy,
+                                    heading=float(_wrap_pi(heading)),
+                                    length_cells=int(length_cells),
+                                    depth_cells=int(depth_cells),
+                                    segment_kind=str(segment.kind),
+                                    segment_cell_length=int(segment.cell_length),
+                                )
+                            )
+        else:
+            seg_start = min(int(segment.start[1]), int(segment.end[1]))
+            seg_end = max(int(segment.start[1]), int(segment.end[1]))
+            for length_cells in range(length_low, length_high + 1):
+                if seg_end - seg_start + 1 < length_cells + 2:
+                    continue
+                for depth_cells in range(depth_low, depth_high + 1):
+                    for side in (-1, 1):
+                        for bay_y0 in range(seg_start + 1, seg_end - length_cells + 2):
+                            bay_y1 = bay_y0 + length_cells
+                            if side < 0:
+                                bay_x1 = x0
+                                bay_x0 = bay_x1 - depth_cells
+                            else:
+                                bay_x0 = x1
+                                bay_x1 = bay_x0 + depth_cells
+                            if bay_x0 < boundary_margin or bay_y0 < boundary_margin:
+                                continue
+                            if bay_x1 > int(config["grid_width"]) - boundary_margin or bay_y1 > int(config["grid_height"]) - boundary_margin:
+                                continue
+                            if np.any(occupancy[bay_y0:bay_y1, bay_x0:bay_x1] == 0):
+                                continue
+                            if not _keeps_far_side_walled(bay_x0, bay_y0, bay_x1, bay_y1, side, segment.orientation):
+                                continue
+                            rect = (bay_x0, bay_y0, bay_x1, bay_y1)
+                            if rect in seen_slots:
+                                continue
+                            seen_slots.add(rect)
+                            world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, bay_x0, bay_y0, bay_x1, bay_y1)
+                            center_xy = (0.5 * (world_x0 + world_x1), 0.5 * (world_y0 + world_y1))
+                            anchor_x = (x0 + x1 - 1) // 2
+                            access_cells = tuple((anchor_x, gy) for gy in range(bay_y0, bay_y1))
+                            anchor_cell = access_cells[len(access_cells) // 2]
+                            access_center = _cell_center_world(config, int(anchor_cell[0]), int(anchor_cell[1]))
+                            heading = math.atan2(
+                                float(center_xy[1]) - float(access_center[1]),
+                                float(center_xy[0]) - float(access_center[0]),
+                            )
+                            slot_candidates.append(
+                                _ParkingBaySlot(
+                                    rect=rect,
+                                    access_cells=access_cells,
+                                    center=center_xy,
+                                    heading=float(_wrap_pi(heading)),
+                                    length_cells=int(length_cells),
+                                    depth_cells=int(depth_cells),
+                                    segment_kind=str(segment.kind),
+                                    segment_cell_length=int(segment.cell_length),
+                                )
+                            )
 
-                anchor_cell = access_cells[len(access_cells) // 2]
-                access_center = _cell_center_world(config, int(anchor_cell[0]), int(anchor_cell[1]))
-                heading = math.atan2(
-                    float(center_xy[1]) - float(access_center[1]),
-                    float(center_xy[0]) - float(access_center[0]),
-                )
+    if not slot_candidates:
+        return []
 
-                grid_cells = [(gx, gy) for gy in range(bay_y0, bay_y1) for gx in range(bay_x0, bay_x1)]
-                parking_bays.append(
-                    ParkingBay(
-                        center=center_xy,
-                        heading=float(_wrap_pi(heading)),
-                        length=float(length_cells) * float(config["block_size"]),
-                        depth=float(depth_cells) * float(config["block_size"]),
-                        grid_cells=grid_cells,
-                        access_cells=access_cells,
-                        polygon=box(world_x0, world_y0, world_x1, world_y1),
-                    )
-                )
-                break
+    kind_priority = {"main": 0, "loop": 1, "branch": 2, "dead_end": 3}
+    ordered_slots = list(slot_candidates)
+    rng.shuffle(ordered_slots)
+    ordered_slots.sort(
+        key=lambda slot: (
+            kind_priority.get(str(slot.segment_kind), 9),
+            -int(slot.segment_cell_length),
+            -int(slot.length_cells),
+            -int(slot.depth_cells),
+        )
+    )
+
+    parking_bays: list[ParkingBay] = []
+    for slot in ordered_slots:
+        if len(parking_bays) >= target_count:
+            break
+        if not _is_far_enough(slot.center, parking_bays):
+            continue
+        bay_x0, bay_y0, bay_x1, bay_y1 = slot.rect
+        slot_area = int((bay_x1 - bay_x0) * (bay_y1 - bay_y0))
+        if slot_area > remaining_free_budget:
+            continue
+        if np.any(occupancy[bay_y0:bay_y1, bay_x0:bay_x1] == 0):
+            continue
+        carve_rect(occupancy, bay_x0, bay_y0, bay_x1, bay_y1)
+        remaining_free_budget = max(0, remaining_free_budget - slot_area)
+        world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, bay_x0, bay_y0, bay_x1, bay_y1)
+        grid_cells = [(gx, gy) for gy in range(bay_y0, bay_y1) for gx in range(bay_x0, bay_x1)]
+        parking_bays.append(
+            ParkingBay(
+                center=slot.center,
+                heading=float(slot.heading),
+                length=float(slot.length_cells) * float(config["block_size"]),
+                depth=float(slot.depth_cells) * float(config["block_size"]),
+                grid_cells=grid_cells,
+                access_cells=list(slot.access_cells),
+                polygon=box(world_x0, world_y0, world_x1, world_y1),
+            )
+        )
 
     return parking_bays
 
@@ -931,16 +1206,56 @@ def _generate_scene_once(config: dict, difficulty: str, rng: np.random.Generator
     loop_target = max(min_free_ratio * 0.90, pre_bay_target - 0.04)
     dead_end_target = pre_bay_target
 
-    _generate_branches_or_deadends(occupancy, config, rng, carved_segments, branch_count, kind="branch", stop_free_ratio=branch_target)
-    _generate_loops(occupancy, config, rng, carved_segments, loop_count, stop_free_ratio=loop_target)
-    _generate_branches_or_deadends(occupancy, config, rng, carved_segments, dead_end_count, kind="dead_end", stop_free_ratio=dead_end_target)
+    branches_added = _generate_constructive_spurs(
+        occupancy,
+        config,
+        rng,
+        carved_segments,
+        branch_count,
+        kind="branch",
+        stop_free_ratio=branch_target,
+    )
+    loops_added = _generate_constructive_loops(
+        occupancy,
+        config,
+        rng,
+        carved_segments,
+        loop_count,
+        stop_free_ratio=loop_target,
+    )
+    dead_ends_added = _generate_constructive_spurs(
+        occupancy,
+        config,
+        rng,
+        carved_segments,
+        dead_end_count,
+        kind="dead_end",
+        stop_free_ratio=dead_end_target,
+    )
 
-    # Top up tight scenes before bay carving if they remain too dense.
+    # Structural top-up remains bounded but grows from existing corridor attachments.
     extra_corridors = 0
     while _grid_free_ratio(occupancy) < pre_bay_target and extra_corridors < 24:
-        _generate_branches_or_deadends(occupancy, config, rng, carved_segments, 1, kind="branch", stop_free_ratio=pre_bay_target)
+        added_branch = _generate_constructive_spurs(
+            occupancy,
+            config,
+            rng,
+            carved_segments,
+            1,
+            kind="branch",
+            stop_free_ratio=pre_bay_target,
+        )
         if rng.random() < 0.5:
-            _generate_loops(occupancy, config, rng, carved_segments, 1, stop_free_ratio=pre_bay_target)
+            _generate_constructive_loops(
+                occupancy,
+                config,
+                rng,
+                carved_segments,
+                1,
+                stop_free_ratio=pre_bay_target,
+            )
+        if int(added_branch) <= 0 and _grid_free_ratio(occupancy) < pre_bay_target:
+            break
         extra_corridors += 1
 
     parking_bays = _generate_parking_bays(occupancy, carved_segments, config, rng, difficulty)
@@ -954,6 +1269,11 @@ def _generate_scene_once(config: dict, difficulty: str, rng: np.random.Generator
     parking_bays = _filter_bays_against_grid(parking_bays, occupancy)
     free_grid = occupancy == 0
     keep_mask, component_size, total_free = _largest_component_mask(free_grid)
+    clearance_map_m = _clearance_map_m(occupancy, float(config["block_size"]))
+    obstacle_distance_steps = np.asarray(
+        clearance_map_m / max(float(config["block_size"]), 1e-6),
+        dtype=np.float32,
+    )
 
     obstacle_polygons = _grid_obstacle_polygons(occupancy, config)
     obstacle_polygons.extend(_outer_world_obstacle_polygons(config))
@@ -973,6 +1293,7 @@ def _generate_scene_once(config: dict, difficulty: str, rng: np.random.Generator
         "difficulty": str(difficulty),
         "seed": None if config.get("seed") is None else int(config["seed"]),
         "attempt_seed": int(attempt_seed),
+        "corridor_generation_mode": "constructive_attachment",
         "world_bounds": (WORLD_MIN, WORLD_MAX, WORLD_MIN, WORLD_MAX),
         "grid_origin": _grid_origin(config),
         "grid_width": int(config["grid_width"]),
@@ -984,15 +1305,20 @@ def _generate_scene_once(config: dict, difficulty: str, rng: np.random.Generator
         "corridor_width_min": int(min(corridor_widths)) if corridor_widths else 0,
         "corridor_width_max": int(max(corridor_widths)) if corridor_widths else 0,
         "main_corridor_count": int(config["main_corridor_count"]),
-        "branch_count": int(branch_count),
-        "loop_count": int(loop_count),
-        "dead_end_count": int(dead_end_count),
+        "branch_count": int(branches_added),
+        "loop_count": int(loops_added),
+        "dead_end_count": int(dead_ends_added),
+        "branch_target_count": int(branch_count),
+        "loop_target_count": int(loop_count),
+        "dead_end_target_count": int(dead_end_count),
         "extra_corridor_topups": int(extra_corridors),
         "parking_bay_count": int(len(parking_bays)),
         "free_ratio": float(_grid_free_ratio(occupancy)),
         "largest_component_free_cells": int(component_size),
         "total_free_cells": int(total_free),
         "island_cleanup": (int(removed_islands), float(component_ratio)),
+        "_clearance_map_m": np.asarray(clearance_map_m, dtype=np.float32),
+        "_obstacle_distance_steps": obstacle_distance_steps,
         "guidance_occupancy_payload": guidance_payload,
         "guidance_static_obstacle_signature": str(guidance_payload["static_obstacle_signature"]),
         "guidance_dynamic_obstacle_signature": str(guidance_payload["dynamic_obstacle_signature"]),
@@ -1002,13 +1328,15 @@ def _generate_scene_once(config: dict, difficulty: str, rng: np.random.Generator
         "block_position_jitter_ratio": float(config["block_position_jitter_ratio"]),
     }
 
-    return BlockMixingPlantScene(
+    scene = BlockMixingPlantScene(
         occupancy_grid=occupancy,
         free_grid=free_grid,
         obstacle_polygons=obstacle_polygons,
         parking_bays=parking_bays,
         metadata=metadata,
     )
+    _prime_navigation_case(scene, str(difficulty), seed=attempt_seed)
+    return scene
 
 
 def get_block_mixing_plant_config(difficulty: str, seed: int | None = None) -> dict:
@@ -1033,10 +1361,8 @@ def generate_block_mixing_plant_scene(difficulty: str = "Normal", seed: int | No
         scene = _generate_scene_once(config, str(difficulty), np.random.default_rng(attempt_seed), attempt_seed)
         valid, attempt_reasons = _validate_scene_data(scene.occupancy_grid, scene.parking_bays, config, scene.metadata)
         if valid:
-            try:
-                sample_navigation_case_from_scene(scene, str(difficulty), seed=attempt_seed)
-            except RuntimeError as exc:
-                attempt_reasons = [f"navigation pair sampling failed: {exc}"]
+            if _get_cached_navigation_case(scene, str(difficulty), attempt_seed) is None:
+                attempt_reasons = ["navigation pair precompute failed"]
             else:
                 scene.metadata["generation_attempt_index"] = int(attempt_idx)
                 scene.metadata["generation_attempts_used"] = int(attempt_idx) + 1
@@ -1048,6 +1374,59 @@ def generate_block_mixing_plant_scene(difficulty: str = "Normal", seed: int | No
 
     detail = ", ".join(last_reasons) if last_reasons else "unknown failure"
     raise RuntimeError(f"Failed to generate block mixing plant scene for {difficulty}: {detail}")
+
+
+def _effective_navigation_case_seed(scene: BlockMixingPlantScene, seed: int | None) -> int | None:
+    effective_seed = scene.metadata.get("attempt_seed") if seed is None else seed
+    return None if effective_seed is None else int(effective_seed)
+
+
+def _clone_navigation_cache_value(value):
+    if isinstance(value, np.ndarray):
+        return np.array(value, copy=True)
+    if isinstance(value, dict):
+        return {key: _clone_navigation_cache_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_clone_navigation_cache_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_clone_navigation_cache_value(item) for item in value)
+    return value
+
+
+def _get_cached_navigation_case(
+    scene: BlockMixingPlantScene,
+    difficulty: str,
+    seed: int | None,
+) -> Optional[tuple[list[float], list[float], dict]]:
+    cached_case = scene.metadata.get("_cached_navigation_case")
+    if not isinstance(cached_case, dict):
+        return None
+    if str(cached_case.get("difficulty")) != str(difficulty):
+        return None
+    if cached_case.get("seed") != _effective_navigation_case_seed(scene, seed):
+        return None
+    return (
+        list(cached_case["start"]),
+        list(cached_case["dest"]),
+        _clone_navigation_cache_value(cached_case["nav_meta"]),
+    )
+
+
+def _set_cached_navigation_case(
+    scene: BlockMixingPlantScene,
+    difficulty: str,
+    seed: int | None,
+    start: list[float],
+    dest: list[float],
+    nav_meta: dict,
+) -> None:
+    scene.metadata["_cached_navigation_case"] = {
+        "difficulty": str(difficulty),
+        "seed": _effective_navigation_case_seed(scene, seed),
+        "start": list(start),
+        "dest": list(dest),
+        "nav_meta": _clone_navigation_cache_value(nav_meta),
+    }
 
 
 def _blocking_poly(obstacles: list) -> Polygon:
@@ -1208,6 +1587,34 @@ def _obstacle_distance_steps(occupancy: np.ndarray) -> np.ndarray:
     return dist
 
 
+def _clearance_map_m(occupancy: np.ndarray, block_size: float) -> np.ndarray:
+    free_mask = occupancy == 0
+    step_size = max(float(block_size), 1e-6)
+    if distance_transform_edt is not None:
+        return np.asarray(distance_transform_edt(free_mask, sampling=step_size), dtype=np.float32)
+    return np.asarray(_obstacle_distance_steps(occupancy) * step_size, dtype=np.float32)
+
+
+def _scene_clearance_map_m(scene: BlockMixingPlantScene) -> np.ndarray:
+    cached = scene.metadata.get("_clearance_map_m")
+    if isinstance(cached, np.ndarray) and cached.shape == scene.occupancy_grid.shape:
+        return cached
+    clearance_map = _clearance_map_m(scene.occupancy_grid, float(scene.metadata["block_size"]))
+    scene.metadata["_clearance_map_m"] = clearance_map
+    return clearance_map
+
+
+def _scene_obstacle_distance_steps(scene: BlockMixingPlantScene) -> np.ndarray:
+    cached = scene.metadata.get("_obstacle_distance_steps")
+    if isinstance(cached, np.ndarray) and cached.shape == scene.occupancy_grid.shape:
+        return cached
+    clearance_map = _scene_clearance_map_m(scene)
+    block_size = max(float(scene.metadata["block_size"]), 1e-6)
+    obstacle_distance_steps = np.asarray(clearance_map / block_size, dtype=np.float32)
+    scene.metadata["_obstacle_distance_steps"] = obstacle_distance_steps
+    return obstacle_distance_steps
+
+
 def _astar_path(
     free_grid: np.ndarray,
     start: tuple[int, int],
@@ -1275,6 +1682,7 @@ def _scene_metrics_for_pair(
     start_cell: tuple[int, int],
     dest_cell: tuple[int, int],
     obstacle_distance_steps: np.ndarray | None = None,
+    clearance_map_m: np.ndarray | None = None,
 ) -> Optional[dict]:
     path = _astar_path(scene.free_grid, start_cell, dest_cell, obstacle_distance_steps=obstacle_distance_steps)
     if path is None or len(path) < 2:
@@ -1292,11 +1700,15 @@ def _scene_metrics_for_pair(
     block_size = float(scene.metadata["block_size"])
     endpoint_skip = max(1, int(math.ceil(float(LENGTH) / max(block_size, 1e-6))))
     endpoint_skip = min(endpoint_skip, max(1, (len(path_points_world) - 3) // 2))
-    if len(path_points_world) > (2 * endpoint_skip + 1):
-        clearance_points = path_points_world[endpoint_skip:-endpoint_skip]
+    if len(path) > (2 * endpoint_skip + 1):
+        clearance_cells = path[endpoint_skip:-endpoint_skip]
     else:
-        clearance_points = path_points_world
-    min_clearance = min(float(Point(float(px), float(py)).distance(free_boundary)) for px, py in clearance_points)
+        clearance_cells = path
+    if clearance_map_m is not None and clearance_map_m.shape == scene.occupancy_grid.shape:
+        min_clearance = min(float(clearance_map_m[int(cell[1]), int(cell[0])]) for cell in clearance_cells)
+    else:
+        clearance_points = np.array([_cell_center_world(scene.metadata, x, y) for x, y in clearance_cells], dtype=np.float64)
+        min_clearance = min(float(Point(float(px), float(py)).distance(free_boundary)) for px, py in clearance_points)
 
     def _pose_box_clearance(pose_xyz: list[float]) -> float:
         state = State([float(pose_xyz[0]), float(pose_xyz[1]), float(pose_xyz[2]), 0.0, 0.0])
@@ -1346,36 +1758,74 @@ def _scene_metrics_pass(level: str, metrics: dict) -> bool:
     return True
 
 
-def sample_navigation_case_from_scene(
+def _pose_endpoint_clearance(pose_xyz: list[float], blocking_poly) -> float:
+    state = State([float(pose_xyz[0]), float(pose_xyz[1]), float(pose_xyz[2]), 0.0, 0.0])
+    return float(min(float(body.distance(blocking_poly)) for body in state.create_box()))
+
+
+def _build_pose_candidate_pools(
     scene: BlockMixingPlantScene,
     difficulty: str,
-    seed: int | None = None,
-) -> tuple[list[float], list[float], dict]:
-    if len(scene.parking_bays) < 2:
-        raise RuntimeError("Block mixing plant scene has fewer than two parking bays")
-
-    rng = np.random.default_rng(seed if seed is not None else scene.metadata.get("attempt_seed"))
-    blocking_poly = _blocking_poly(list(scene.obstacle_polygons))
-    world_poly = box(WORLD_MIN, WORLD_MIN, WORLD_MAX, WORLD_MAX)
-    free_region = world_poly.difference(blocking_poly).buffer(0)
-    obstacle_distance_steps = _obstacle_distance_steps(scene.occupancy_grid)
-
+    blocking_poly,
+    clearance_map_m: np.ndarray,
+) -> tuple[list[_PoseCandidate], list[_PoseCandidate], list[_PoseCandidate], dict]:
     start_candidates: list[_PoseCandidate] = []
     dest_candidates: list[_PoseCandidate] = []
     dest_fallback_candidates: list[_PoseCandidate] = []
+    cfg = BLOCK_MIXING_PLANT_CONFIG.get(str(difficulty), {})
+    min_endpoint_clearance = float(
+        cfg.get(
+            "scene_metric_min_endpoint_clearance",
+            NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL.get(str(difficulty), 0.7),
+        )
+    )
+    soft_anchor_clearance = max(0.35, min_endpoint_clearance * 0.45)
+    rejected_for_clearance = 0
+
     for bay_index, bay in enumerate(scene.parking_bays):
+        anchor = None
+        if bay.access_cells:
+            anchor = bay.access_cells[len(bay.access_cells) // 2]
+        elif bay.grid_cells:
+            anchor = bay.grid_cells[len(bay.grid_cells) // 2]
+        if anchor is not None:
+            anchor_clearance = float(clearance_map_m[int(anchor[1]), int(anchor[0])])
+            if anchor_clearance < soft_anchor_clearance:
+                rejected_for_clearance += 1
+                continue
+
         canonical = _candidate_pose_from_bay(scene, bay, bay_index, blocking_poly, reverse=False)
         if canonical is not None:
             start_candidates.append(canonical)
             dest_candidates.append(canonical)
+
         reversed_pose = _candidate_pose_from_bay(scene, bay, bay_index, blocking_poly, reverse=True)
         if reversed_pose is not None:
-            start_candidates.append(reversed_pose)
-            dest_fallback_candidates.append(reversed_pose)
+            clearance = _pose_endpoint_clearance(reversed_pose.pose, blocking_poly)
+            if clearance >= soft_anchor_clearance:
+                start_candidates.append(reversed_pose)
+                dest_fallback_candidates.append(reversed_pose)
 
-    if len(dest_candidates) < 2 or len(start_candidates) < 2:
-        raise RuntimeError("Unable to sample enough collision-free parking bay poses")
+    stats = {
+        "start_pose_count": int(len(start_candidates)),
+        "dest_pose_count": int(len(dest_candidates)),
+        "dest_fallback_pose_count": int(len(dest_fallback_candidates)),
+        "bay_rejected_for_anchor_clearance": int(rejected_for_clearance),
+    }
+    return start_candidates, dest_candidates, dest_fallback_candidates, stats
 
+
+def _search_navigation_pair(
+    scene: BlockMixingPlantScene,
+    difficulty: str,
+    blocking_poly,
+    free_region,
+    obstacle_distance_steps: np.ndarray,
+    clearance_map_m: np.ndarray,
+    start_candidates: list[_PoseCandidate],
+    dest_candidates: list[_PoseCandidate],
+    dest_fallback_candidates: list[_PoseCandidate],
+) -> tuple[tuple[list[float], list[float], dict] | None, int]:
     max_attempts = int(BLOCK_MIXING_PLANT_CONFIG[str(difficulty)].get("max_pose_sample_attempts", 240))
 
     def _candidate_score(start_candidate: _PoseCandidate, dest_candidate: _PoseCandidate) -> tuple[float, float]:
@@ -1438,19 +1888,106 @@ def sample_navigation_case_from_scene(
                 start_candidate.anchor_cell,
                 dest_candidate.anchor_cell,
                 obstacle_distance_steps=obstacle_distance_steps,
+                clearance_map_m=clearance_map_m,
             )
             if not _scene_metrics_pass(str(difficulty), metrics):
                 continue
-            return _make_nav_meta(start_candidate, dest_candidate, metrics)
-        return None
+            return _make_nav_meta(start_candidate, dest_candidate, metrics), int(len(pair_candidates))
+        return None, int(len(pair_candidates))
 
-    result = _search_pairs(start_candidates, dest_candidates)
+    result, pair_count = _search_pairs(start_candidates, dest_candidates)
     if result is not None:
-        return result
+        return result, int(pair_count)
     if len(dest_fallback_candidates) > 0:
-        result = _search_pairs(start_candidates, dest_candidates + dest_fallback_candidates)
-        if result is not None:
-            return result
+        result, pair_count = _search_pairs(start_candidates, dest_candidates + dest_fallback_candidates)
+        return result, int(pair_count)
+    return None, int(pair_count)
+
+
+def _prime_navigation_case(scene: BlockMixingPlantScene, difficulty: str, seed: int | None = None) -> bool:
+    if len(scene.parking_bays) < 2:
+        scene.metadata["navigation_candidate_pose_count"] = 0
+        scene.metadata["navigation_candidate_pair_count"] = 0
+        return False
+    blocking_poly = _blocking_poly(list(scene.obstacle_polygons))
+    world_poly = box(WORLD_MIN, WORLD_MIN, WORLD_MAX, WORLD_MAX)
+    free_region = world_poly.difference(blocking_poly).buffer(0)
+    clearance_map_m = _scene_clearance_map_m(scene)
+    obstacle_distance_steps = _scene_obstacle_distance_steps(scene)
+    start_candidates, dest_candidates, dest_fallback_candidates, stats = _build_pose_candidate_pools(
+        scene,
+        str(difficulty),
+        blocking_poly,
+        clearance_map_m,
+    )
+    scene.metadata["navigation_candidate_pose_count"] = int(
+        stats["start_pose_count"] + stats["dest_pose_count"] + stats["dest_fallback_pose_count"]
+    )
+    scene.metadata["navigation_candidate_pool_stats"] = dict(stats)
+    result, pair_count = _search_navigation_pair(
+        scene,
+        str(difficulty),
+        blocking_poly,
+        free_region,
+        obstacle_distance_steps,
+        clearance_map_m,
+        start_candidates,
+        dest_candidates,
+        dest_fallback_candidates,
+    )
+    scene.metadata["navigation_candidate_pair_count"] = int(pair_count)
+    if result is None:
+        return False
+    start_pose, dest_pose, nav_meta = result
+    _set_cached_navigation_case(scene, difficulty, seed, start_pose, dest_pose, nav_meta)
+    return True
+
+
+def sample_navigation_case_from_scene(
+    scene: BlockMixingPlantScene,
+    difficulty: str,
+    seed: int | None = None,
+) -> tuple[list[float], list[float], dict]:
+    if len(scene.parking_bays) < 2:
+        raise RuntimeError("Block mixing plant scene has fewer than two parking bays")
+
+    cached_case = _get_cached_navigation_case(scene, difficulty, seed)
+    if cached_case is not None:
+        return cached_case
+
+    blocking_poly = _blocking_poly(list(scene.obstacle_polygons))
+    world_poly = box(WORLD_MIN, WORLD_MIN, WORLD_MAX, WORLD_MAX)
+    free_region = world_poly.difference(blocking_poly).buffer(0)
+    clearance_map_m = _scene_clearance_map_m(scene)
+    obstacle_distance_steps = _scene_obstacle_distance_steps(scene)
+    start_candidates, dest_candidates, dest_fallback_candidates, _stats = _build_pose_candidate_pools(
+        scene,
+        str(difficulty),
+        blocking_poly,
+        clearance_map_m,
+    )
+
+    if len(dest_candidates) < 2 or len(start_candidates) < 2:
+        raise RuntimeError("Unable to sample enough collision-free parking bay poses")
+
+    def _cache_and_return(result: tuple[list[float], list[float], dict]):
+        start_pose, dest_pose, nav_meta = result
+        _set_cached_navigation_case(scene, difficulty, seed, start_pose, dest_pose, nav_meta)
+        return result
+
+    result, _pair_count = _search_navigation_pair(
+        scene,
+        str(difficulty),
+        blocking_poly,
+        free_region,
+        obstacle_distance_steps,
+        clearance_map_m,
+        start_candidates,
+        dest_candidates,
+        dest_fallback_candidates,
+    )
+    if result is not None:
+        return _cache_and_return(result)
 
     raise RuntimeError(f"Failed to sample valid navigation pair for block mixing plant scene ({difficulty})")
 

@@ -15,6 +15,11 @@ class PrimitiveFamilySpec:
     mode: str = "normal"
     compound_split: Optional[float] = None
     compound_exit_gamma_scale: float = 0.0
+    motion_family_id: int = -1
+    motion_family_name: str = ""
+    speed_level_id: int = 0
+    speed_level_name: str = "full"
+    speed_level_scale: float = 1.0
 
 
 @dataclass(frozen=True)

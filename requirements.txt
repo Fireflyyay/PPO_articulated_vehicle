@@ -8,3 +8,4 @@ tensorboard
 heapdict
 einops
 tqdm
+scipy

@@ -2,6 +2,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
+from env.vehicle import Status
 from env.wrappers.macro_action_wrapper import MacroActionWrapper
 
 
@@ -78,3 +79,76 @@ def test_prefix_steps_respects_env_done():
     assert info["prefix_steps_used"] == 5  # requested prefix
     assert total_reward == 2.0
     assert terminated
+
+
+def test_soft_ray_auto_prefix_executes_safe_prefix_without_planner_queue():
+    env = DummyEnv()
+    actions = np.zeros((1, 10, 2), dtype=np.float64)
+    lib = DummyPrimitiveLib(actions)
+
+    w = MacroActionWrapper(env, lib, H=10, normalize_before_step=False)
+    w._action_mask_mode = "soft_ray"
+    w._soft_prefix_family_steps = {0: 3}
+    w._last_action_mask_debug = {
+        "min_lidar_m": 10.0,
+        "obs_density": 0.0,
+        "effective_action_count": 10,
+    }
+
+    obs, total_reward, terminated, truncated, info = w.step(0)
+
+    assert info["executed_steps"] == 3
+    assert info["prefix_steps_used"] == 3
+    assert info["prefix_steps_source"] == "soft_ray_auto"
+    assert info["soft_safe_prefix_steps"] == 3
+    assert total_reward == 3.0
+    assert (not terminated) and (not truncated)
+
+
+def test_soft_ray_dynamic_prefix_shortens_execution_in_narrow_scene():
+    env = DummyEnv()
+    actions = np.zeros((1, 10, 2), dtype=np.float64)
+    lib = DummyPrimitiveLib(actions)
+
+    w = MacroActionWrapper(env, lib, H=10, normalize_before_step=False)
+    w._action_mask_mode = "soft_ray"
+    w._soft_prefix_family_steps = {0: 10}
+    w._last_action_mask_debug = {
+        "min_lidar_m": 1.0,
+        "obs_density": 0.45,
+        "effective_action_count": 2,
+    }
+
+    obs, total_reward, terminated, truncated, info = w.step(0)
+
+    assert info["executed_steps"] == 1
+    assert info["prefix_steps_used"] == 1
+    assert info["prefix_steps_source"] == "soft_ray_auto"
+    assert info["soft_safe_prefix_steps"] == 10
+    assert total_reward == 1.0
+    assert (not terminated) and (not truncated)
+
+
+def test_soft_ray_zero_safe_prefix_truncates_episode_instead_of_spinning():
+    env = DummyEnv()
+    actions = np.zeros((1, 10, 2), dtype=np.float64)
+    lib = DummyPrimitiveLib(actions)
+
+    w = MacroActionWrapper(env, lib, H=10, normalize_before_step=False)
+    w._action_mask_mode = "soft_ray"
+    w._soft_prefix_family_steps = {0: 0}
+    w._last_action_mask_debug = {
+        "min_lidar_m": 0.5,
+        "obs_density": 0.8,
+        "effective_action_count": 1,
+    }
+
+    obs, total_reward, terminated, truncated, info = w.step(0)
+
+    assert info["executed_steps"] == 0
+    assert info["prefix_steps_used"] == 0
+    assert info["prefix_steps_source"] == "soft_ray_auto_blocked"
+    assert info["soft_ray_blocked"] is True
+    assert info["status"] == Status.OUTTIME
+    assert total_reward == 0.0
+    assert (not terminated) and truncated

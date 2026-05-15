@@ -89,6 +89,7 @@ class PrimitiveRaySafetyIndex:
             "safe_step_len_mean": float(np.mean(step_len)) if step_len.size else 0.0,
             "safe_step_len_min": float(np.min(step_len)) if step_len.size else 0.0,
             "safe_step_len_max": float(np.max(step_len)) if step_len.size else 0.0,
+            "safe_step_lens": np.asarray(step_len, dtype=np.int64),
             "soft_mask_min": float(np.min(soft)) if soft.size else 0.0,
             "soft_mask_max": float(np.max(soft)) if soft.size else 0.0,
             "soft_mask_mean": float(np.mean(soft)) if soft.size else 0.0,

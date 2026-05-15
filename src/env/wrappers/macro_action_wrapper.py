@@ -13,14 +13,11 @@ except Exception:  # pragma: no cover
     prep = None
 
 try:
-    from terminal_takeover_rhp import RecedingHorizonTakeoverPlanner
-except Exception:  # pragma: no cover
-    RecedingHorizonTakeoverPlanner = None
-
-try:
     from primitives.primitive_refinement import PrimitiveTrajectoryRefiner
 except Exception:  # pragma: no cover
     PrimitiveTrajectoryRefiner = None
+
+from env.vehicle import Status
 
 class MacroActionWrapper(gym.Wrapper):
     """
@@ -66,74 +63,60 @@ class MacroActionWrapper(gym.Wrapper):
         self._takeover_mode = "auto"
         self._takeover_fail_count = 0
         self._prefix_steps_queue = []  # next primitive(s) prefix steps, aligned with info['path_to_dest']
+        self._soft_prefix_family_steps = {}
+        self._last_obs = None
 
-        # Optional RHP takeover planner (paper-style fast prune + group scoring)
+        # Terminal takeover remains available, but this project should not invoke RHP.
         self._takeover_planner = None
+        self._takeover_use_rhp = False
         try:
             from configs import (
                 TAKEOVER_ENABLE,
-                TAKEOVER_USE_RHP,
                 LIDAR_NUM,
                 LIDAR_RANGE,
-                TAKEOVER_SCORE_WEIGHTS,
                 OCCUPANCY_INFLATION_RADIUS,
-                TAKEOVER_GROUP_SCORE_TOPK,
-                TAKEOVER_MAX_PREFIX_STEPS,
             )
 
             self._takeover_enabled = bool(TAKEOVER_ENABLE)
-            use_rhp = bool(TAKEOVER_USE_RHP)
         except Exception:
             self._takeover_enabled = True
-            use_rhp = False
             LIDAR_NUM = None
             LIDAR_RANGE = None
-            TAKEOVER_SCORE_WEIGHTS = None
             OCCUPANCY_INFLATION_RADIUS = 1.5
-            TAKEOVER_GROUP_SCORE_TOPK = 5
-            TAKEOVER_MAX_PREFIX_STEPS = None
+        self._mask_lidar_num = int(LIDAR_NUM) if LIDAR_NUM is not None else 120
+        self._mask_lidar_range = float(LIDAR_RANGE) if LIDAR_RANGE is not None else 30.0
+        self._mask_occupancy_inflation_radius = float(OCCUPANCY_INFLATION_RADIUS)
+        self._mask_grid_index = getattr(self.primitive_lib, 'grid_index', None)
+        if self._mask_grid_index is None:
+            try:
+                from primitives.primitive_index import build_approx_index_from_deltas
+                from configs import GRID_RESOLUTION
 
-        if use_rhp and RecedingHorizonTakeoverPlanner is not None:
-            self._takeover_use_rhp = True
-            grid_index = getattr(self.primitive_lib, "grid_index", None)
-            if grid_index is None:
-                # Degraded fallback: build an approximate index once from deltas.
-                # This keeps online complexity near O(#occupied_cells + #hits) and avoids per-step rollouts.
-                try:
-                    from primitives.primitive_index import build_approx_index_from_deltas
-                    from configs import GRID_RESOLUTION
-
-                    # same bounds as the offline script defaults (tuned for terminal 12m-ish range)
-                    grid_index = build_approx_index_from_deltas(
-                        actions=getattr(self.primitive_lib, "actions"),
-                        deltas=getattr(self.primitive_lib, "deltas"),
-                        grid_resolution=float(GRID_RESOLUTION),
-                        x_min=-6.0,
-                        x_max=12.0,
-                        y_min=-9.0,
-                        y_max=9.0,
-                        group_prefix_steps=max(1, int(round(self.H * 0.3))),
-                    )
-                except Exception:
-                    grid_index = None
-
-            if grid_index is not None:
-                try:
-                    self._takeover_planner = RecedingHorizonTakeoverPlanner(
-                        primitive_actions=getattr(self.primitive_lib, "actions"),
-                        primitive_deltas=getattr(self.primitive_lib, "deltas"),
-                        grid_index=grid_index,
-                        lidar_num=int(LIDAR_NUM) if LIDAR_NUM is not None else 120,
-                        lidar_range=float(LIDAR_RANGE) if LIDAR_RANGE is not None else 30.0,
-                        score_weights=TAKEOVER_SCORE_WEIGHTS or {},
-                        occupancy_inflation_radius=float(OCCUPANCY_INFLATION_RADIUS),
-                        group_score_topk=int(TAKEOVER_GROUP_SCORE_TOPK),
-                        max_prefix_steps=TAKEOVER_MAX_PREFIX_STEPS,
-                    )
-                except Exception:
-                    self._takeover_planner = None
+                self._mask_grid_index = build_approx_index_from_deltas(
+                    actions=getattr(self.primitive_lib, 'actions'),
+                    deltas=getattr(self.primitive_lib, 'deltas'),
+                    grid_resolution=float(GRID_RESOLUTION),
+                    x_min=-6.0,
+                    x_max=12.0,
+                    y_min=-9.0,
+                    y_max=9.0,
+                    group_prefix_steps=max(1, int(round(self.H * 0.3))),
+                )
+            except Exception:
+                self._mask_grid_index = None
+        self._mask_lidar_angles = np.linspace(0.0, 2.0 * math.pi, self._mask_lidar_num, endpoint=False)
+        if self._mask_grid_index is not None:
+            r = max(0.0, self._mask_occupancy_inflation_radius)
+            res = max(1e-6, float(self._mask_grid_index.grid_resolution))
+            rad = int(math.ceil(r / res))
+            offsets = []
+            for dx in range(-rad, rad + 1):
+                for dy in range(-rad, rad + 1):
+                    if (dx * dx + dy * dy) * (res * res) <= r * r + 1e-9:
+                        offsets.append((dx, dy))
+            self._mask_inflation_offsets = offsets
         else:
-            self._takeover_use_rhp = False
+            self._mask_inflation_offsets = []
 
         # Planner pruning (depth-2 search can be expensive). We use primitive library
         # deltas (precomputed under a canonical start) to rank candidates cheaply.
@@ -215,6 +198,40 @@ class MacroActionWrapper(gym.Wrapper):
         self._soft_mask_terminal_articulation_scale = float(SOFT_MASK_TERMINAL_ARTICULATION_SCALE)
         self._soft_mask_terminal_weight_min = float(SOFT_MASK_TERMINAL_WEIGHT_MIN)
         self._soft_mask_terminal_weight_max = float(SOFT_MASK_TERMINAL_WEIGHT_MAX)
+        try:
+            from configs import (
+                PPO_DYNAMIC_PREFIX_CRITICAL_ACTION_COUNT,
+                PPO_DYNAMIC_PREFIX_CRITICAL_MIN_LIDAR,
+                PPO_DYNAMIC_PREFIX_DENSE_OBS_HIGH,
+                PPO_DYNAMIC_PREFIX_DENSE_OBS_LOW,
+                PPO_DYNAMIC_PREFIX_ENABLE,
+                PPO_DYNAMIC_PREFIX_LOW_ACTION_COUNT,
+                PPO_DYNAMIC_PREFIX_MAX_STEPS,
+                PPO_DYNAMIC_PREFIX_MIN_STEPS,
+                PPO_DYNAMIC_PREFIX_NARROW_MIN_LIDAR,
+                PPO_DYNAMIC_PREFIX_NARROW_STEPS,
+            )
+        except Exception:
+            PPO_DYNAMIC_PREFIX_ENABLE = True
+            PPO_DYNAMIC_PREFIX_MIN_STEPS = 1
+            PPO_DYNAMIC_PREFIX_NARROW_STEPS = 2
+            PPO_DYNAMIC_PREFIX_MAX_STEPS = None
+            PPO_DYNAMIC_PREFIX_NARROW_MIN_LIDAR = 2.5
+            PPO_DYNAMIC_PREFIX_CRITICAL_MIN_LIDAR = 1.5
+            PPO_DYNAMIC_PREFIX_DENSE_OBS_LOW = 0.20
+            PPO_DYNAMIC_PREFIX_DENSE_OBS_HIGH = 0.35
+            PPO_DYNAMIC_PREFIX_LOW_ACTION_COUNT = 8
+            PPO_DYNAMIC_PREFIX_CRITICAL_ACTION_COUNT = 3
+        self._ppo_dynamic_prefix_enabled = bool(PPO_DYNAMIC_PREFIX_ENABLE)
+        self._ppo_dynamic_prefix_min_steps = max(1, int(PPO_DYNAMIC_PREFIX_MIN_STEPS))
+        self._ppo_dynamic_prefix_narrow_steps = max(1, int(PPO_DYNAMIC_PREFIX_NARROW_STEPS))
+        self._ppo_dynamic_prefix_max_steps = None if PPO_DYNAMIC_PREFIX_MAX_STEPS is None else max(1, int(PPO_DYNAMIC_PREFIX_MAX_STEPS))
+        self._ppo_dynamic_prefix_narrow_min_lidar = float(PPO_DYNAMIC_PREFIX_NARROW_MIN_LIDAR)
+        self._ppo_dynamic_prefix_critical_min_lidar = float(PPO_DYNAMIC_PREFIX_CRITICAL_MIN_LIDAR)
+        self._ppo_dynamic_prefix_dense_obs_low = float(PPO_DYNAMIC_PREFIX_DENSE_OBS_LOW)
+        self._ppo_dynamic_prefix_dense_obs_high = float(PPO_DYNAMIC_PREFIX_DENSE_OBS_HIGH)
+        self._ppo_dynamic_prefix_low_action_count = max(1, int(PPO_DYNAMIC_PREFIX_LOW_ACTION_COUNT))
+        self._ppo_dynamic_prefix_critical_action_count = max(1, int(PPO_DYNAMIC_PREFIX_CRITICAL_ACTION_COUNT))
         self._primitive_refiner = PrimitiveTrajectoryRefiner() if PrimitiveTrajectoryRefiner is not None else None
         self._planned_action_queue = []
         self._planned_primitive_queue = []
@@ -236,6 +253,31 @@ class MacroActionWrapper(gym.Wrapper):
             self._mask_obstacles_prepared = []
             self._mask_obstacles_bounds = []
 
+    def _build_mask_occupied_cells_from_lidar(self, lidar_norm: np.ndarray):
+        grid_index = getattr(self, '_mask_grid_index', None)
+        if grid_index is None:
+            return set()
+
+        lidar_norm = np.asarray(lidar_norm, dtype=np.float64).reshape(-1)
+        if lidar_norm.size > int(self._mask_lidar_num):
+            lidar_norm = lidar_norm[: int(self._mask_lidar_num)]
+
+        dist = np.clip(lidar_norm, 0.0, 1.0) * float(self._mask_lidar_range)
+        occupied = set()
+        hit_mask = dist < (0.98 * float(self._mask_lidar_range))
+        for i in np.nonzero(hit_mask)[0]:
+            d = float(dist[i])
+            a = float(self._mask_lidar_angles[i])
+            x = d * math.cos(a)
+            y = d * math.sin(a)
+            cell = grid_index.world_to_cell(x, y)
+            if cell is None:
+                continue
+            ix, iy = cell
+            for dx, dy in self._mask_inflation_offsets:
+                occupied.add((ix + dx, iy + dy))
+        return occupied
+
     def _get_mask_candidate_ids(self, obs_vec, n_actions: int):
         """Best-effort fast pruning via takeover planner's grid index.
 
@@ -245,24 +287,18 @@ class MacroActionWrapper(gym.Wrapper):
         if not bool(getattr(self, '_mask_use_fast_prune', True)):
             return None
 
-        planner = getattr(self, '_takeover_planner', None)
-        if planner is None or not hasattr(planner, 'index'):
+        grid_index = getattr(self, '_mask_grid_index', None)
+        if grid_index is None:
             return None
         if obs_vec is None:
             return None
 
         try:
             obs_vec = np.asarray(obs_vec, dtype=np.float64).reshape(-1)
-            try:
-                from configs import LIDAR_NUM
-
-                lidar_n = int(LIDAR_NUM)
-            except Exception:
-                lidar_n = int(getattr(planner, 'lidar_num', 120))
-
+            lidar_n = int(self._mask_lidar_num)
             lidar = obs_vec[:lidar_n]
-            occupied_cells, _ = planner._build_occupied_cells_from_lidar(lidar)
-            candidate_mask = planner.index.fast_prune_primitives(occupied_cells)
+            occupied_cells = self._build_mask_occupied_cells_from_lidar(lidar)
+            candidate_mask = grid_index.fast_prune_primitives(occupied_cells)
             candidate_mask = np.asarray(candidate_mask, dtype=np.bool_).reshape(-1)
 
             if candidate_mask.shape[0] != int(n_actions):
@@ -333,6 +369,7 @@ class MacroActionWrapper(gym.Wrapper):
             hard_mask = self._compute_hard_action_mask(obs_vec, mode_override="full").astype(np.float32)
             mask = np.clip(hard_mask, eps, 1.0).astype(np.float32)
             debug["fallback"] = "hard_family_mask"
+            self._soft_prefix_family_steps = {}
         else:
             try:
                 from configs import LIDAR_NUM, LIDAR_RANGE
@@ -343,6 +380,8 @@ class MacroActionWrapper(gym.Wrapper):
                 lidar_num = int(getattr(index, "lidar_num", 120))
                 lidar_range = float(getattr(index, "lidar_range", 30.0))
             lidar = np.asarray(obs_vec, dtype=np.float64).reshape(-1)[:lidar_num]
+            min_lidar = float(np.min(lidar)) * lidar_range if lidar.size > 0 else float(lidar_range)
+            obs_density = float(np.mean((lidar * lidar_range) < 3.0)) if lidar.size > 0 else 0.0
             variant_mask, mask_debug = index.compute_soft_mask(
                 lidar,
                 gamma=float(self._soft_mask_gamma),
@@ -350,11 +389,27 @@ class MacroActionWrapper(gym.Wrapper):
                 lidar_range=lidar_range,
             )
             debug.update(mask_debug)
+            debug["min_lidar_m"] = float(min_lidar)
+            debug["obs_density"] = float(obs_density)
+            safe_step_lens = np.asarray(
+                mask_debug.get("safe_step_lens", np.zeros((variant_mask.shape[0],), dtype=np.int64)),
+                dtype=np.int64,
+            ).reshape(-1)
             mask = np.full((n_actions,), eps, dtype=np.float32)
             self._family_resolution_cache = {}
+            self._soft_prefix_family_steps = {}
             for family_id in range(n_actions):
                 ref = self._resolve_family_ref(family_id, obs_vec=obs_vec)
                 mask[int(family_id)] = float(variant_mask[int(ref.flat_index)])
+                safe_prefix_steps = 0
+                if int(ref.flat_index) < safe_step_lens.shape[0]:
+                    safe_prefix_steps = int(np.clip(safe_step_lens[int(ref.flat_index)], 0, int(self.H)))
+                self._soft_prefix_family_steps[int(family_id)] = int(safe_prefix_steps)
+            if len(self._soft_prefix_family_steps) > 0:
+                family_safe_prefixes = np.asarray(list(self._soft_prefix_family_steps.values()), dtype=np.int64)
+                debug["family_safe_prefix_mean"] = float(np.mean(family_safe_prefixes))
+                debug["family_safe_prefix_min"] = int(np.min(family_safe_prefixes))
+                debug["family_safe_prefix_max"] = int(np.max(family_safe_prefixes))
 
         debug["soft_mask_ms"] = float((time.perf_counter() - t0) * 1000.0)
         debug["soft_mask_min"] = float(np.min(mask)) if mask.size else 0.0
@@ -570,6 +625,57 @@ class MacroActionWrapper(gym.Wrapper):
         self._family_resolution_cache[int(family_id)] = ref
         return ref
 
+    def _current_obs_snapshot(self):
+        if self._last_obs is not None:
+            try:
+                return np.asarray(self._last_obs).copy()
+            except Exception:
+                return copy.deepcopy(self._last_obs)
+        try:
+            obs = self.env._build_observation()
+        except Exception:
+            obs = None
+        if obs is None:
+            return None
+        try:
+            return np.asarray(obs).copy()
+        except Exception:
+            return copy.deepcopy(obs)
+
+    def _compute_soft_auto_prefix(self, family_id: int):
+        safe_prefix_steps = self._soft_prefix_family_steps.get(int(family_id), None)
+        if safe_prefix_steps is None:
+            return None, None
+
+        prefix_steps = max(0, min(int(self.H), int(safe_prefix_steps)))
+        if self._ppo_dynamic_prefix_max_steps is not None:
+            prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_max_steps))
+
+        if prefix_steps > 0 and self._ppo_dynamic_prefix_enabled:
+            debug = dict(getattr(self, '_last_action_mask_debug', {}) or {})
+            min_lidar = float(debug.get('min_lidar_m', np.inf))
+            obs_density = float(debug.get('obs_density', 0.0))
+            feasible_count = int(debug.get('effective_action_count', debug.get('family_feasible_count', int(self.action_space.n))))
+
+            if (
+                min_lidar <= self._ppo_dynamic_prefix_critical_min_lidar
+                or feasible_count <= self._ppo_dynamic_prefix_critical_action_count
+                or obs_density >= self._ppo_dynamic_prefix_dense_obs_high
+            ):
+                prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_min_steps))
+            elif (
+                min_lidar <= self._ppo_dynamic_prefix_narrow_min_lidar
+                or feasible_count <= self._ppo_dynamic_prefix_low_action_count
+                or obs_density >= self._ppo_dynamic_prefix_dense_obs_low
+            ):
+                prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_narrow_steps))
+
+        if prefix_steps <= 0:
+            return 0, 'soft_ray_auto_blocked'
+        if prefix_steps < int(self.H):
+            return int(prefix_steps), 'soft_ray_auto'
+        return None, None
+
     def _canonical_state_to_world(self, state0, canonical_state: np.ndarray):
         from env.vehicle import State
 
@@ -644,6 +750,7 @@ class MacroActionWrapper(gym.Wrapper):
         done = False
         info = {}
         steps_executed = 0
+        last_obs = self._current_obs_snapshot()
 
         # Optional execution trace for mining (low-level actions & states).
         # Stored in `info['macro_exec_trace']` as best-effort; callers can ignore.
@@ -670,21 +777,53 @@ class MacroActionWrapper(gym.Wrapper):
         except Exception:
             pass
 
-        last_obs = None
-
         # We need to handle potential 'truncated' from gymnasium if base env uses it.
         terminated = False
         truncated = False
 
         max_steps = min(self.H, int(actions.shape[0]))
         used_prefix_steps = None
+        used_prefix_source = None
         if len(self._prefix_steps_queue) > 0:
             try:
                 used_prefix_steps = self._prefix_steps_queue.pop(0)
                 if used_prefix_steps is not None:
                     max_steps = min(max_steps, int(used_prefix_steps))
+                    used_prefix_source = 'planner'
             except Exception:
                 used_prefix_steps = None
+                used_prefix_source = None
+        elif self._action_mask_mode == 'soft_ray':
+            auto_prefix_steps, auto_prefix_source = self._compute_soft_auto_prefix(family_id)
+            if auto_prefix_steps is not None:
+                used_prefix_steps = int(auto_prefix_steps)
+                used_prefix_source = str(auto_prefix_source)
+                max_steps = min(max_steps, int(auto_prefix_steps))
+
+        if max_steps <= 0:
+            info['family_id'] = int(family_id)
+            info['resolved_family_id'] = int(getattr(resolved_ref, 'family_id', family_id))
+            info['primitive_id'] = int(primitive_id)
+            info['resolved_variant_id'] = int(resolved_ref.variant_id)
+            info['resolved_gamma_bin_id'] = int(resolved_ref.gamma_bin_id)
+            info['resolved_mode'] = str(resolved_debug.get('mode', 'normal'))
+            info['resolved_is_compound'] = bool(resolved_debug.get('is_compound', False))
+            info['resolved_switch_index'] = int(resolved_debug.get('switch_index', -1))
+            info['resolved_family_name'] = str(resolved_debug.get('family_name', ''))
+            info['resolved_family_type'] = str(resolved_debug.get('family_type', 'normal'))
+            info['executed_steps'] = 0
+            info['prefix_steps_used'] = int(used_prefix_steps) if used_prefix_steps is not None else 0
+            if used_prefix_source is not None:
+                info['prefix_steps_source'] = str(used_prefix_source)
+            info['soft_safe_prefix_steps'] = int(self._soft_prefix_family_steps.get(int(family_id), self.H)) if len(self._soft_prefix_family_steps) > 0 else int(self.H)
+            info['macro_exec_trace'] = macro_exec_trace
+            info['takeover_active'] = False
+            info['takeover_triggered'] = False
+            info['path_to_dest'] = None
+            info['status'] = Status.OUTTIME
+            info['soft_ray_blocked'] = True
+            self._last_obs = None if last_obs is None else copy.deepcopy(last_obs)
+            return last_obs, 0.0, False, True, info
 
         for t in range(max_steps):
             # Execute one low-level step
@@ -759,6 +898,9 @@ class MacroActionWrapper(gym.Wrapper):
             info['refinement_plan_debug'] = cached_plan_debug
         if used_prefix_steps is not None:
             info['prefix_steps_used'] = int(used_prefix_steps)
+        if used_prefix_source is not None:
+            info['prefix_steps_source'] = str(used_prefix_source)
+        info['soft_safe_prefix_steps'] = int(self._soft_prefix_family_steps.get(int(family_id), self.H)) if len(self._soft_prefix_family_steps) > 0 else int(self.H)
 
         # attach trace (convert lists of arrays to stacked arrays when possible)
         try:
@@ -773,6 +915,7 @@ class MacroActionWrapper(gym.Wrapper):
         info['takeover_active'] = False
         info['takeover_triggered'] = False
         info['path_to_dest'] = None
+        self._last_obs = None if last_obs is None else copy.deepcopy(last_obs)
 
         # Return consistent with Gymnasium
         return last_obs, total_reward, terminated, truncated, info
@@ -1290,8 +1433,6 @@ class MacroActionWrapper(gym.Wrapper):
             soft_fallback = "hybrid_no_ray_safety"
 
         if (
-            effective_mode != "soft_ray"
-            and
             self._action_mask_update_every_k > 1
             and self._action_mask_cached is not None
             and self._action_mask_calls_since_update < (self._action_mask_update_every_k - 1)
@@ -1319,6 +1460,7 @@ class MacroActionWrapper(gym.Wrapper):
     def _compute_hard_action_mask(self, obs_vec=None, mode_override=None):
         n_actions = self.action_space.n
         mask = np.zeros(n_actions, dtype=np.int8)
+        self._soft_prefix_family_steps = {}
         self._family_resolution_cache = {}
         for family_id in range(n_actions):
             ref = self._resolve_family_ref(family_id, obs_vec=obs_vec)
@@ -1344,6 +1486,7 @@ class MacroActionWrapper(gym.Wrapper):
         self._takeover_mode = "auto"
         self._takeover_fail_count = 0
         self._prefix_steps_queue.clear()
+        self._soft_prefix_family_steps = {}
         self._clear_planned_action_cache()
 
         # Invalidate obstacle cache; it will be rebuilt lazily on first mask query.
@@ -1353,6 +1496,10 @@ class MacroActionWrapper(gym.Wrapper):
         self._action_mask_cached = None
         self._action_mask_calls_since_update = 0
         self._family_resolution_cache = {}
+        if isinstance(out, tuple) and len(out) > 0:
+            self._last_obs = copy.deepcopy(out[0])
+        else:
+            self._last_obs = None
         return out
 
 
@@ -1391,15 +1538,23 @@ def update_primitive_library(env_or_wrapper, new_lib, H: int = None):
     # refresh cached deltas used by approximate planner ranking
     w._primitive_deltas = getattr(new_lib, 'deltas', None)
     w._ray_safety_index = getattr(new_lib, 'ray_safety_index', None)
+    w._mask_grid_index = getattr(new_lib, 'grid_index', None)
     w._family_resolution_cache = {}
-
-    # refresh takeover planner index (best-effort)
-    try:
-        grid_index = getattr(new_lib, 'grid_index', None)
-        if getattr(w, '_takeover_planner', None) is not None and grid_index is not None:
-            w._takeover_planner.grid_index = grid_index
-    except Exception:
-        pass
+    if w._mask_grid_index is not None:
+        try:
+            r = max(0.0, float(getattr(w, '_mask_occupancy_inflation_radius', 0.0)))
+            res = max(1e-6, float(w._mask_grid_index.grid_resolution))
+            rad = int(math.ceil(r / res))
+            offsets = []
+            for dx in range(-rad, rad + 1):
+                for dy in range(-rad, rad + 1):
+                    if (dx * dx + dy * dy) * (res * res) <= r * r + 1e-9:
+                        offsets.append((dx, dy))
+            w._mask_inflation_offsets = offsets
+        except Exception:
+            w._mask_inflation_offsets = []
+    else:
+        w._mask_inflation_offsets = []
 
     # reset prepared caches to avoid stale references
     try:

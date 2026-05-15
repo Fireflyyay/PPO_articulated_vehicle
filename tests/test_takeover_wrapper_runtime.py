@@ -114,3 +114,35 @@ def test_soft_ray_without_ray_safety_falls_back_to_hybrid_mask():
     assert called["mode_override"] == "hybrid"
     assert wrapper._last_action_mask_debug["fallback"] == "hybrid_no_ray_safety"
     assert wrapper._last_action_mask_debug["effective_mode"] == "hybrid"
+
+
+def test_soft_ray_mask_uses_k_step_cache():
+    wrapper = object.__new__(MacroActionWrapper)
+    wrapper._takeover_active = False
+    wrapper._action_mask_mode = "soft_ray"
+    wrapper._ray_safety_index = object()
+    wrapper._action_mask_update_every_k = 3
+    wrapper._action_mask_cached = None
+    wrapper._action_mask_calls_since_update = 0
+    wrapper._last_action_mask_debug = {}
+    wrapper.action_space = SimpleNamespace(n=3)
+
+    calls = {"soft": 0}
+
+    def fake_soft(obs_vec=None):
+        calls["soft"] += 1
+        return np.array([0.5, 0.2, 1.0], dtype=np.float32)
+
+    wrapper._compute_soft_ray_action_mask = fake_soft
+
+    obs = np.array([0.0], dtype=np.float64)
+    mask1 = MacroActionWrapper.get_action_mask(wrapper, obs)
+    mask2 = MacroActionWrapper.get_action_mask(wrapper, obs)
+    mask3 = MacroActionWrapper.get_action_mask(wrapper, obs)
+    mask4 = MacroActionWrapper.get_action_mask(wrapper, obs)
+
+    assert np.array_equal(mask1, np.array([0.5, 0.2, 1.0], dtype=np.float32))
+    assert np.array_equal(mask2, mask1)
+    assert np.array_equal(mask3, mask1)
+    assert np.array_equal(mask4, mask1)
+    assert calls["soft"] == 2

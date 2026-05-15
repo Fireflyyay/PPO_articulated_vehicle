@@ -50,6 +50,16 @@ class PrimitiveLibrary:
 
         self.variant_flat_to_gamma = np.asarray(data["variant_flat_to_gamma"], dtype=np.int64).reshape(-1)
         self.variant_flat_to_family = np.asarray(data["variant_flat_to_family"], dtype=np.int64).reshape(-1)
+        self.variant_flat_to_motion_family = (
+            np.asarray(data["variant_flat_to_motion_family"], dtype=np.int64).reshape(-1)
+            if "variant_flat_to_motion_family" in data
+            else np.asarray(self.variant_flat_to_family, dtype=np.int64).copy()
+        )
+        self.variant_flat_to_speed_level = (
+            np.asarray(data["variant_flat_to_speed_level"], dtype=np.int64).reshape(-1)
+            if "variant_flat_to_speed_level" in data
+            else np.zeros_like(self.variant_flat_to_family, dtype=np.int64)
+        )
         self.variant_flat_to_variant = np.asarray(data["variant_flat_to_variant"], dtype=np.int64).reshape(-1)
         self.variant_flat_to_family_type = _object_array_to_str_list(data["variant_flat_to_family_type"])
         self.variant_flat_to_mode = _object_array_to_str_list(data["variant_flat_to_mode"])
@@ -57,11 +67,38 @@ class PrimitiveLibrary:
         self.gamma_bin_values = np.asarray(data["gamma_bin_values"], dtype=np.float64).reshape(-1)
         self.family_names = _object_array_to_str_list(data["family_names"])
         self.family_types = _object_array_to_str_list(data["family_types"])
+        self.family_to_motion_family = (
+            np.asarray(data["family_to_motion_family"], dtype=np.int64).reshape(-1)
+            if "family_to_motion_family" in data
+            else np.arange(len(self.family_names), dtype=np.int64)
+        )
+        self.family_to_speed_level = (
+            np.asarray(data["family_to_speed_level"], dtype=np.int64).reshape(-1)
+            if "family_to_speed_level" in data
+            else np.zeros((len(self.family_names),), dtype=np.int64)
+        )
+        self.motion_family_names = (
+            _object_array_to_str_list(data["motion_family_names"])
+            if "motion_family_names" in data
+            else list(self.family_names)
+        )
+        self.speed_level_names = (
+            _object_array_to_str_list(data["speed_level_names"])
+            if "speed_level_names" in data
+            else ["full"]
+        )
+        self.speed_level_scales = (
+            np.asarray(data["speed_level_scales"], dtype=np.float64).reshape(-1)
+            if "speed_level_scales" in data
+            else np.asarray([1.0], dtype=np.float64)
+        )
         self.index_table = np.asarray(data["index_table"], dtype=np.int64)
         self.variant_counts = np.asarray(data["variant_counts"], dtype=np.int64)
         self.default_variant_table = np.asarray(data["default_variant_table"], dtype=np.int64)
 
         self.family_count = int(data["family_count"]) if "family_count" in data else int(len(self.family_names))
+        self.motion_family_count = int(data["motion_family_count"]) if "motion_family_count" in data else int(len(self.motion_family_names))
+        self.speed_level_count = int(data["speed_level_count"]) if "speed_level_count" in data else int(len(self.speed_level_names))
         self.variant_count_per_family = int(data["variant_count_per_family"]) if "variant_count_per_family" in data else int(self.index_table.shape[-1])
         self.max_variant_horizon = int(self.actions.shape[1])
         self.step_seconds = float(data["step_seconds"]) if "step_seconds" in data else float(self.meta.get("step_seconds", 0.2))
@@ -251,6 +288,10 @@ class PrimitiveLibrary:
             "gamma_bin_value": float(self.gamma_bin_values[int(ref.gamma_bin_id)]),
             "family_id": int(ref.family_id),
             "family_name": str(self.family_names[int(ref.family_id)]),
+            "motion_family_id": int(self.variant_flat_to_motion_family[flat_index]),
+            "motion_family_name": str(self.motion_family_names[int(self.variant_flat_to_motion_family[flat_index])]),
+            "speed_level_id": int(self.variant_flat_to_speed_level[flat_index]),
+            "speed_level_name": str(self.speed_level_names[int(self.variant_flat_to_speed_level[flat_index])]),
             "family_type": str(self.variant_flat_to_family_type[flat_index]),
             "variant_id": int(ref.variant_id),
             "mode": str(self.variant_flat_to_mode[flat_index]),

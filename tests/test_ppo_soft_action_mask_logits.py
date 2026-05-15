@@ -35,3 +35,14 @@ def test_integer_action_mask_keeps_legacy_hard_mask():
     assert out[0, 1] < -1e9
     assert out[0, 0] == 0.0
     assert out[0, 2] == 0.0
+
+
+def test_decay_action_std_is_silent_by_default(capsys):
+    agent = _dummy_agent()
+    agent.action_std = 1.5
+
+    PPOAgent.decay_action_std(agent, 0.001, 0.1)
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert agent.action_std == 1.499

@@ -41,14 +41,14 @@ def build_gamma_bins(num_bins: int, gamma_max: float) -> np.ndarray:
     return np.linspace(-float(gamma_max), float(gamma_max), int(max(3, num_bins)), dtype=np.float64)
 
 
-def _variant_speed_scale(variant_id: int, variant_count: int) -> float:
-    scales = np.linspace(0.75, 1.25, int(max(1, variant_count)), dtype=np.float64)
+def _variant_control_scale(variant_id: int, variant_count: int) -> float:
+    scales = np.linspace(0.90, 1.10, int(max(1, variant_count)), dtype=np.float64)
     return float(scales[int(variant_id)])
 
 
 def _variant_duration(variant_id: int, variant_count: int, step_seconds: float, horizon: int) -> float:
-    scales = np.linspace(0.75, 1.25, int(max(1, variant_count)), dtype=np.float64)
-    return float(float(step_seconds) * float(horizon) * scales[int(variant_id)])
+    del variant_id, variant_count
+    return float(float(step_seconds) * float(horizon))
 
 
 def _initial_state_for_gamma(gamma0: float) -> State:
@@ -64,7 +64,7 @@ def _build_action_sequence(
 ) -> Tuple[np.ndarray, int]:
     max_speed = float(max(abs(float(VALID_SPEED[0])), abs(float(VALID_SPEED[1]))))
     max_rate = float(max(abs(float(VALID_STEER[0])), abs(float(VALID_STEER[1]))))
-    speed_scale = _variant_speed_scale(variant_id=variant_id, variant_count=variant_count)
+    control_scale = _variant_control_scale(variant_id=variant_id, variant_count=variant_count)
     actions = np.zeros((int(horizon), 2), dtype=np.float64)
 
     if spec.family_type == "straighten":
@@ -72,16 +72,16 @@ def _build_action_sequence(
         bias = 0.20 * float(spec.gamma_rate_scale) * max_rate
         for step_idx in range(int(horizon)):
             decay = 1.0 - 0.25 * float(step_idx) / float(max(1, horizon - 1))
-            omega = np.clip((-k_gamma * float(gamma0) + bias) * decay, VALID_STEER[0], VALID_STEER[1])
-            speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.45
+            omega = np.clip(((-k_gamma * float(gamma0) + bias) * decay) * control_scale, VALID_STEER[0], VALID_STEER[1])
+            speed = float(spec.speed_sign) * float(spec.speed_scale) * float(spec.speed_level_scale) * max_speed * 0.45
             actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
         return actions, -1
 
     if spec.family_type == "terminal":
         for step_idx in range(int(horizon)):
             taper = 1.0 - 0.35 * float(step_idx) / float(max(1, horizon - 1))
-            omega = np.clip(float(spec.gamma_rate_scale) * max_rate * 0.45 * taper, VALID_STEER[0], VALID_STEER[1])
-            speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.35
+            omega = np.clip(float(spec.gamma_rate_scale) * max_rate * 0.45 * taper * control_scale, VALID_STEER[0], VALID_STEER[1])
+            speed = float(spec.speed_sign) * float(spec.speed_scale) * float(spec.speed_level_scale) * max_speed * 0.35
             actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
         return actions, -1
 
@@ -90,19 +90,19 @@ def _build_action_sequence(
         switch_index = int(max(1, min(horizon - 1, round(split_ratio * horizon))))
         for step_idx in range(int(horizon)):
             if step_idx < switch_index:
-                omega = np.clip(float(spec.gamma_rate_scale) * max_rate * 0.80, VALID_STEER[0], VALID_STEER[1])
-                speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.55
+                omega = np.clip(float(spec.gamma_rate_scale) * max_rate * 0.80 * control_scale, VALID_STEER[0], VALID_STEER[1])
+                speed = float(spec.speed_sign) * float(spec.speed_scale) * float(spec.speed_level_scale) * max_speed * 0.55
             else:
                 blend = 1.0 - float(step_idx - switch_index) / float(max(1, horizon - switch_index))
-                omega = np.clip(float(spec.compound_exit_gamma_scale) * max_rate * 0.75 * max(0.35, blend), VALID_STEER[0], VALID_STEER[1])
-                speed = -float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed * 0.45
+                omega = np.clip(float(spec.compound_exit_gamma_scale) * max_rate * 0.75 * max(0.35, blend) * control_scale, VALID_STEER[0], VALID_STEER[1])
+                speed = -float(spec.speed_sign) * float(spec.speed_scale) * float(spec.speed_level_scale) * max_speed * 0.45
             actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
         return actions, int(switch_index)
 
     for step_idx in range(int(horizon)):
         taper = 1.0 - 0.10 * float(step_idx) / float(max(1, horizon - 1))
-        omega = np.clip(float(spec.gamma_rate_scale) * max_rate * taper, VALID_STEER[0], VALID_STEER[1])
-        speed = float(spec.speed_sign) * float(spec.speed_scale) * speed_scale * max_speed
+        omega = np.clip(float(spec.gamma_rate_scale) * max_rate * taper * control_scale, VALID_STEER[0], VALID_STEER[1])
+        speed = float(spec.speed_sign) * float(spec.speed_scale) * float(spec.speed_level_scale) * max_speed
         actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
     return actions, -1
 
@@ -177,6 +177,8 @@ def generate_primitives(
     flat_is_compound: List[int] = []
     flat_to_gamma: List[int] = []
     flat_to_family: List[int] = []
+    flat_to_motion_family: List[int] = []
+    flat_to_speed_level: List[int] = []
     flat_to_variant: List[int] = []
     flat_to_family_type: List[str] = []
     flat_to_mode: List[str] = []
@@ -205,9 +207,27 @@ def generate_primitives(
                 flat_is_compound.append(int(payload["is_compound"]))
                 flat_to_gamma.append(int(gamma_bin_id))
                 flat_to_family.append(int(spec.family_id))
+                flat_to_motion_family.append(int(spec.motion_family_id if spec.motion_family_id >= 0 else spec.family_id))
+                flat_to_speed_level.append(int(spec.speed_level_id))
                 flat_to_variant.append(int(variant_id))
                 flat_to_family_type.append(str(payload["family_type"]))
                 flat_to_mode.append(str(payload["mode"]))
+
+    motion_family_names = []
+    for motion_family_id in sorted({int(spec.motion_family_id if spec.motion_family_id >= 0 else spec.family_id) for spec in family_specs}):
+        match = next(spec for spec in family_specs if int(spec.motion_family_id if spec.motion_family_id >= 0 else spec.family_id) == int(motion_family_id))
+        motion_family_names.append(str(match.motion_family_name or match.name))
+    speed_level_specs = {}
+    for spec in family_specs:
+        speed_level_specs[int(spec.speed_level_id)] = (str(spec.speed_level_name), float(spec.speed_level_scale))
+    speed_level_ids_sorted = sorted(speed_level_specs.keys())
+    speed_level_names = [speed_level_specs[idx][0] for idx in speed_level_ids_sorted]
+    speed_level_scales = [speed_level_specs[idx][1] for idx in speed_level_ids_sorted]
+    family_to_motion_family = np.asarray(
+        [int(spec.motion_family_id if spec.motion_family_id >= 0 else spec.family_id) for spec in family_specs],
+        dtype=np.int64,
+    )
+    family_to_speed_level = np.asarray([int(spec.speed_level_id) for spec in family_specs], dtype=np.int64)
 
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     np.savez_compressed(
@@ -223,12 +243,21 @@ def generate_primitives(
         is_compound=np.asarray(flat_is_compound, dtype=np.int8),
         variant_flat_to_gamma=np.asarray(flat_to_gamma, dtype=np.int64),
         variant_flat_to_family=np.asarray(flat_to_family, dtype=np.int64),
+        variant_flat_to_motion_family=np.asarray(flat_to_motion_family, dtype=np.int64),
+        variant_flat_to_speed_level=np.asarray(flat_to_speed_level, dtype=np.int64),
         variant_flat_to_variant=np.asarray(flat_to_variant, dtype=np.int64),
         variant_flat_to_family_type=np.asarray(flat_to_family_type, dtype=object),
         variant_flat_to_mode=np.asarray(flat_to_mode, dtype=object),
         gamma_bin_values=np.asarray(gamma_bin_values, dtype=np.float64),
         family_names=np.asarray([spec.name for spec in family_specs], dtype=object),
         family_types=np.asarray([spec.family_type for spec in family_specs], dtype=object),
+        family_to_motion_family=np.asarray(family_to_motion_family, dtype=np.int64),
+        family_to_speed_level=np.asarray(family_to_speed_level, dtype=np.int64),
+        motion_family_names=np.asarray(motion_family_names, dtype=object),
+        motion_family_count=np.asarray(len(motion_family_names), dtype=np.int64),
+        speed_level_names=np.asarray(speed_level_names, dtype=object),
+        speed_level_scales=np.asarray(speed_level_scales, dtype=np.float64),
+        speed_level_count=np.asarray(len(speed_level_names), dtype=np.int64),
         family_count=np.asarray(int(family_count), dtype=np.int64),
         variant_count_per_family=np.asarray(int(variant_count), dtype=np.int64),
         index_table=np.asarray(index_table, dtype=np.int64),
@@ -244,6 +273,9 @@ def generate_primitives(
                 "trailer_length": float(TRAILER_LENGTH),
                 "hitch_offset": float(HITCH_OFFSET),
                 "step_seconds": float(STEP_LENGTH * NUM_STEP),
+                "motion_family_count": int(len(motion_family_names)),
+                "speed_level_names": list(speed_level_names),
+                "speed_level_scales": [float(v) for v in speed_level_scales],
                 "family_specs": [spec.__dict__.copy() for spec in family_specs],
             },
             dtype=object,

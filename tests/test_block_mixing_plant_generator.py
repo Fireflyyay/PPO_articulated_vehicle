@@ -52,6 +52,23 @@ def test_block_mixing_scene_validates_against_its_config():
         assert validate_scene(scene, BLOCK_MIXING_PLANT_CONFIG[level]) is True
 
 
+def test_block_mixing_scene_free_ratio_stays_within_config_across_seeds():
+    for level in ["Normal", "Complex", "Extrem"]:
+        cfg = BLOCK_MIXING_PLANT_CONFIG[level]
+        for seed in [0, 7, 11]:
+            scene = generate_block_mixing_plant_scene(level, seed=seed)
+            assert float(cfg["min_free_ratio"]) <= float(scene.metadata["free_ratio"]) <= float(cfg["max_free_ratio"])
+
+
+def test_block_mixing_scene_primes_navigation_candidates_during_generation():
+    for level in ["Normal", "Complex", "Extrem"]:
+        scene = generate_block_mixing_plant_scene(level, seed=11)
+        assert scene.metadata["corridor_generation_mode"] == "constructive_attachment"
+        assert int(scene.metadata["navigation_candidate_pose_count"]) >= 2
+        assert int(scene.metadata["navigation_candidate_pair_count"]) >= 1
+        assert isinstance(scene.metadata.get("_cached_navigation_case"), dict)
+
+
 def test_block_mixing_scene_matches_requested_corridor_and_bay_dimensions():
     for level in ["Normal", "Complex", "Extrem"]:
         scene = generate_block_mixing_plant_scene(level, seed=7)
@@ -138,3 +155,28 @@ def test_block_mixing_scene_can_sample_navigation_pair():
         assert nav_meta["scene_metrics"] is not None
         assert nav_meta["guidance_path_points"] is not None
         assert len(nav_meta["guidance_path_points"]) >= 2
+
+
+def test_block_mixing_scene_reuses_cached_navigation_pair(monkeypatch):
+    scene = generate_block_mixing_plant_scene("Normal", seed=11)
+    cached_case = scene.metadata.get("_cached_navigation_case")
+
+    assert isinstance(cached_case, dict)
+
+    def _unexpected_blocking_poly(_obstacles):
+        raise AssertionError("expected cached navigation pair to bypass blocking polygon rebuild")
+
+    monkeypatch.setattr(
+        "env.scene_generators.block_mixing_plant_generator._blocking_poly",
+        _unexpected_blocking_poly,
+    )
+
+    start, dest, nav_meta = sample_navigation_case_from_scene(scene, "Normal")
+
+    assert start == list(cached_case["start"])
+    assert dest == list(cached_case["dest"])
+    assert nav_meta is not cached_case["nav_meta"]
+    assert nav_meta["start_bay_index"] == cached_case["nav_meta"]["start_bay_index"]
+    assert nav_meta["dest_bay_index"] == cached_case["nav_meta"]["dest_bay_index"]
+    assert np.array_equal(nav_meta["free_grid"], cached_case["nav_meta"]["free_grid"])
+    assert nav_meta["free_grid"] is not cached_case["nav_meta"]["free_grid"]

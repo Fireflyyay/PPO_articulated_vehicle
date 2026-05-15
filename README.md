@@ -76,6 +76,49 @@ python src/evaluation/visualize_path.py --episodes 5 --level Complex
 
 仓库已提供 data/ 下的 primitive 库文件。
 
+### 重新生成 motion primitive 库
+
+如果你修改了 motion primitive 的生成逻辑、family catalog、gamma bins 或 variant 数量，需要先重新生成 primitive 库本体，再重建对应的 sidecar 缓存。
+
+当前仓库里生成 family primitive 库的脚本是 [src/primitives/generate_primitives.py](src/primitives/generate_primitives.py)：
+
+```bash
+python src/primitives/generate_primitives.py \
+  --H 3 \
+  --S 11 \
+  --gamma-bins 31 \
+  --variant-count 3 \
+  --family-preset main
+```
+
+这条命令会默认写出：
+
+- data/primitives_family_main_G31_V3.npz
+
+如果你想生成其他 preset 或参数组合，可以改下面这些参数：
+
+- `--family-preset small|main|large`
+- `--gamma-bins <N>`
+- `--variant-count <N>`
+- `--H <horizon>`
+
+注意：这里的 `--S` 目前保留为兼容参数，脚本内部不会再使用它的值，但调用时仍建议显式保留。
+
+### 生成完 primitive 库后，记得重建 sidecar
+
+primitive 库生成后，建议按下面顺序重新生成 sidecar：
+
+```bash
+python scripts/build_primitive_grid_index.py \
+  --library data/primitives_family_main_G31_V3.npz \
+  --index_mode swept_cells
+
+python scripts/build_primitive_ray_safety.py \
+  --library data/primitives_family_main_G31_V3.npz
+```
+
+如果你生成的是其他文件名，也把 `--library` 改成对应的 .npz 路径即可。
+
 ## 训练增强机制
 
 除了 primitive 宏动作外，当前默认训练链路还依赖以下几个机制：
@@ -137,6 +180,69 @@ python scripts/build_primitive_grid_index.py \
 ```
 
 输出默认写回到与 library 同目录同名的 .grid_index.npz，并会在运行时被自动加载。
+
+## Action mask 缓存与 sidecar 重新生成
+
+如果你修改了 action mask 相关配置，尤其是以下参数：
+
+- ACTION_MASK_MODE
+- ACTION_MASK_UPDATE_EVERY_K
+- SOFT_MASK_GAMMA / SOFT_MASK_EPS / SOFT_MASK_LOGIT_LAMBDA
+- SOFT_MASK_SAFETY_MARGIN / SOFT_MASK_REVERSE_MARGIN_SCALE
+- LIDAR_NUM / LIDAR_RANGE
+
+建议重新生成 primitive sidecar 缓存，避免训练继续读取旧缓存导致行为不一致。
+
+### 1) 重新生成 mask index
+
+mask index 由 [scripts/build_primitive_grid_index.py](scripts/build_primitive_grid_index.py) 生成。当前 action mask 使用的是 swept-cells 风格的保守索引，因此应使用 `--index_mode swept_cells`：
+
+```bash
+python scripts/build_primitive_grid_index.py \
+  --library data/primitives_family_main_G31_V3.npz \
+  --index_mode swept_cells
+```
+
+如果你还在使用其他 primitive 库，也需要对对应的 .npz 文件各自重建一次，例如：
+
+```bash
+python scripts/build_primitive_grid_index.py \
+  --library data/primitives_articulated_H4_S11.npz \
+  --index_mode swept_cells
+
+python scripts/build_primitive_grid_index.py \
+  --library data/primitives_articulated_H20_S11.npz \
+  --index_mode swept_cells
+```
+
+输出文件会默认写成同目录同名的 .mask_index.npz，例如：
+
+- data/primitives_family_main_G31_V3.mask_index.npz
+
+### 2) 重新生成 ray safety sidecar
+
+soft-ray action mask 依赖 .ray_safety.npz sidecar，由 [scripts/build_primitive_ray_safety.py](scripts/build_primitive_ray_safety.py) 生成：
+
+```bash
+python scripts/build_primitive_ray_safety.py \
+  --library data/primitives_family_main_G31_V3.npz
+```
+
+如果你修改了 LIDAR_NUM、LIDAR_RANGE 或 SOFT_MASK_SAFETY_MARGIN 等参数，也应该对所有实际训练会加载的 primitive 库重新生成 ray safety sidecar。
+
+### 3) 推荐的重建顺序
+
+如果你只是改了 action mask 配置，通常建议按下面顺序重建：
+
+1. 先生成 .mask_index.npz
+2. 再生成 .ray_safety.npz
+3. 最后重新启动训练或评估进程，确保新的 sidecar 被重新加载
+
+### 4) 需要注意的点
+
+- PrimitiveLibrary 会优先尝试加载与 .npz 同名的 sidecar 文件，所以重建后直接覆盖原文件即可。
+- 如果训练时使用的是自适应 primitive 库，也要对当前 active version 对应的 library 重新生成 sidecar。
+- 如果 sidecar 缺失，系统会回退到更慢的在线构建或硬 mask 路径，但这通常会影响训练吞吐。
 
 ## 自适应 primitive 扩展（Adaptive Primitive Expansion）
 

@@ -74,6 +74,34 @@ def _to_scalar(value, default: float = 0.0) -> float:
     return float(default)
 
 
+def _maybe_print_episode_heartbeat(
+    verbose: bool,
+    episode_idx: int,
+    total_episodes: int,
+    step_num: int,
+    total_reward: float,
+    update_count: int,
+    memory_len: int,
+    batch_size: int,
+    heartbeat_steps: int,
+    last_report_step: int,
+) -> int:
+    if not verbose:
+        return int(last_report_step)
+    if heartbeat_steps <= 0:
+        return int(last_report_step)
+    if step_num - last_report_step < heartbeat_steps:
+        return int(last_report_step)
+
+    print(
+        f"Episode {episode_idx}/{total_episodes} in progress | "
+        f"Steps: {step_num} | Reward: {total_reward:.2f} | "
+        f"Updates: {update_count} | Buffer: {memory_len}/{batch_size}"
+    )
+    sys.stdout.flush()
+    return int(step_num)
+
+
 def _run_eval_episodes(env, parking_agent, n_episodes: int, scene_schedule: list, deterministic: bool = True):
     """Lightweight evaluation (no learning). Returns dict metrics."""
     succ = []
@@ -948,6 +976,7 @@ if __name__=="__main__":
     reward_info_list = []
     succ_record = []
     best_success_rate = [0.0, 0.0, 0.0]
+    progress_heartbeat_steps = max(250, int(parking_agent.agent.configs.batch_size) // 4)
 
     for i in range(args.train_episode):
         scene_chosen = scene_chooser.choose_case()
@@ -958,6 +987,8 @@ if __name__=="__main__":
         total_reward = 0
         step_num = 0
         reward_info = []
+        episode_update_count = 0
+        last_progress_report_step = 0
 
         # ---- EpisodeTrace buffers (macro-step aligned) ----
         ep_obs_trace = []
@@ -1035,6 +1066,19 @@ if __name__=="__main__":
             else:
                 parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs))
 
+            last_progress_report_step = _maybe_print_episode_heartbeat(
+                verbose=verbose,
+                episode_idx=i,
+                total_episodes=args.train_episode,
+                step_num=step_num,
+                total_reward=float(total_reward),
+                update_count=episode_update_count,
+                memory_len=len(parking_agent.agent.memory),
+                batch_size=int(parking_agent.agent.configs.batch_size),
+                heartbeat_steps=progress_heartbeat_steps,
+                last_report_step=last_progress_report_step,
+            )
+
             obs = next_obs
 
             # Update agent
@@ -1046,8 +1090,10 @@ if __name__=="__main__":
                 # Decay action std
                 parking_agent.agent.decay_action_std(
                     parking_agent.agent.configs.action_std_decay_rate,
-                    parking_agent.agent.configs.min_action_std
+                    parking_agent.agent.configs.min_action_std,
+                    verbose=False,
                 )
+                episode_update_count += 1
 
                 writer.add_scalar("actor_loss", actor_loss, i)
                 writer.add_scalar("critic_loss", critic_loss, i)
@@ -1140,6 +1186,10 @@ if __name__=="__main__":
         if (i+1) % 2000 == 0:
             parking_agent.agent.save("%s/PPO2_%s.pt" % (save_path, i),params_only=True)
 
+        if verbose:
+            print(f"Episode {i}/{args.train_episode} | Reward: {total_reward:.2f} | Steps: {step_num} | Success Rate: {np.mean(succ_record[-100:]):.2f} | Updates: {episode_update_count}")
+            sys.stdout.flush()
+
         if verbose and i%10==0:
             episodes = [j for j in range(len(reward_list))]
             mean_reward = [np.mean(reward_list[max(0,j-50):j+1]) for j in range(len(reward_list))]
@@ -1151,10 +1201,6 @@ if __name__=="__main__":
             plt.title(f'Training Reward (Episode {i})')
             plt.savefig('%s/reward.png'%save_path)
             plt.close()
-
-            # Print progress
-            print(f"Episode {i}/{args.train_episode} | Reward: {total_reward:.2f} | Steps: {step_num} | Success Rate: {np.mean(succ_record[-100:]):.2f}")
-            sys.stdout.flush()
 
         # ---- Build and store EpisodeTrace for mining ----
         if adaptive_enabled and EpisodeTrace is not None:

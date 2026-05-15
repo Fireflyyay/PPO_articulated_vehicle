@@ -154,12 +154,13 @@ class PPOAgent(AgentBase):
     def set_action_std(self, new_action_std):
         self.action_std = new_action_std
 
-    def decay_action_std(self, decay_rate, min_std):
+    def decay_action_std(self, decay_rate, min_std, verbose: bool = False):
         self.action_std = self.action_std - decay_rate
         self.action_std = round(self.action_std, 4)
         if self.action_std <= min_std:
             self.action_std = min_std
-        print(f"Action std decayed to: {self.action_std}")
+        if verbose:
+            print(f"Action std decayed to: {self.action_std}")
 
     def set_action_logit_bias(self, bias: np.ndarray):
         """Set a per-action bias to subtract from logits (discrete only).

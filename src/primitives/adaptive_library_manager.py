@@ -89,15 +89,18 @@ class AdaptivePrimitiveLibraryManager:
         lib = PrimitiveLibrary(base_path)
         self._load_records_from_library(lib, meta_list=None)
 
-        info = self._save_version_internal(
+        # Keep the shipped base library as the in-memory active version.
+        # Re-serializing the whole library and rebuilding sidecars here makes
+        # training startup dominated by offline preprocessing before episode 0.
+        self._active_version = LibraryVersionInfo(
             version_id="base",
             parent_version_id=None,
-            temporary=False,
+            created_time=time.time(),
+            library_path=base_path,
+            meta_path="",
         )
-        self._active_version = info
-        self._library = PrimitiveLibrary(info.library_path)
+        self._library = lib
         self._pending_tmp_version = None
-        self._write_active_version(save_dir, info.version_id)
 
     def get_active_library(self) -> PrimitiveLibrary:
         assert self._library is not None, "Library manager not loaded"

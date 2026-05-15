@@ -273,8 +273,15 @@ class ProfileRuntime:
         parking_map_mod.generate_navigation_case = self._wrap_generate_navigation_case(
             parking_map_mod.generate_navigation_case
         )
-        parking_map_mod._generate_navigation_case_once = self._wrap_generate_case_once(
-            parking_map_mod._generate_navigation_case_once
+        generate_case_once_name = "_generate_block_mixing_navigation_case_once"
+        generate_case_once = getattr(parking_map_mod, generate_case_once_name, None)
+        if generate_case_once is None:
+            generate_case_once_name = "_generate_navigation_case_once"
+            generate_case_once = parking_map_mod._generate_navigation_case_once
+        setattr(
+            parking_map_mod,
+            generate_case_once_name,
+            self._wrap_generate_case_once(generate_case_once),
         )
         parking_map_mod._plan_guidance_path_for_scene = self._wrap_scene_guidance_validate(
             parking_map_mod._plan_guidance_path_for_scene
@@ -707,7 +714,8 @@ def run_profile(max_episodes: int, max_macro_steps: int, seed: int):
             if total_macro_steps >= int(max_macro_steps):
                 break
 
-        succ_record.append(1 if info.get("status", None).name == "ARRIVED" else 0)
+        status = info.get("status") if isinstance(info, dict) else None
+        succ_record.append(1 if getattr(status, "name", None) == "ARRIVED" else 0)
         if total_macro_steps >= int(max_macro_steps):
             break
 

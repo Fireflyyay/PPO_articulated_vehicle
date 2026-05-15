@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from primitives.adaptive_library_manager import AdaptivePrimitiveLibraryManager
+from primitives.primitive_index import build_mask_index_from_library, primitive_grid_index_to_payload
+from primitives.primitive_ray_safety import build_ray_safety_index_from_library, save_ray_safety_index
 from primitives.trajectory_miner import CandidatePrimitive
 
 
@@ -76,20 +78,65 @@ def _write_base_library(path):
     )
 
 
-def test_adaptive_library_persistent_versions_generate_sidecars(tmp_path):
+def _write_base_sidecars(path):
+    data = np.load(path, allow_pickle=True)
+    actions = np.asarray(data["actions"], dtype=np.float64)
+    deltas = np.asarray(data["deltas"], dtype=np.float64)
+    horizon = int(actions.shape[1])
+
+    mask_index = build_mask_index_from_library(
+        actions=actions,
+        grid_resolution=0.6,
+        x_min=-6.0,
+        x_max=12.0,
+        y_min=-9.0,
+        y_max=9.0,
+        sample_stride=1,
+        num_step=4,
+        group_prefix_steps=max(1, min(horizon, int(round(float(horizon) * 0.3)))),
+    )
+    np.savez_compressed(
+        os.path.splitext(path)[0] + ".mask_index.npz",
+        **primitive_grid_index_to_payload(mask_index),
+    )
+
+    ray_index = build_ray_safety_index_from_library(
+        actions=actions,
+        deltas=deltas,
+        lidar_num=120,
+        lidar_range=30.0,
+        safety_margin=0.25,
+        reverse_margin_scale=1.2,
+        sample_stride=2,
+        num_step=4,
+    )
+    save_ray_safety_index(os.path.splitext(path)[0] + ".ray_safety.npz", ray_index)
+
+
+def test_adaptive_library_load_reuses_base_sidecars_without_persisting_base_version(tmp_path):
     base_path = tmp_path / "base_primitives.npz"
     _write_base_library(base_path)
+    _write_base_sidecars(base_path)
 
     mgr = AdaptivePrimitiveLibraryManager(verbose=False)
     mgr.load(base_path=str(base_path), save_dir=str(tmp_path))
 
     base_lib = mgr.get_active_library()
-    base_npz = os.path.splitext(base_lib.npz_path)[0]
+    versions_dir = tmp_path / "adaptive_primitives" / "versions"
 
-    assert os.path.exists(base_npz + ".mask_index.npz")
-    assert os.path.exists(base_npz + ".ray_safety.npz")
+    assert base_lib.npz_path == str(base_path)
     assert base_lib.grid_index is not None
     assert base_lib.ray_safety_index is not None
+    assert not any(versions_dir.glob("primitives_vbase*"))
+
+
+def test_adaptive_library_persistent_versions_generate_sidecars(tmp_path):
+    base_path = tmp_path / "base_primitives.npz"
+    _write_base_library(base_path)
+    _write_base_sidecars(base_path)
+
+    mgr = AdaptivePrimitiveLibraryManager(verbose=False)
+    mgr.load(base_path=str(base_path), save_dir=str(tmp_path))
 
     candidate = CandidatePrimitive(
         actions_raw=np.array([[0.1, 1.0]], dtype=np.float64),
