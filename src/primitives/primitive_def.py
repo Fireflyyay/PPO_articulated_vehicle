@@ -13,6 +13,17 @@ class PrimitiveFamilySpec:
     speed_scale: float
     gamma_rate_scale: float
     mode: str = "normal"
+    mode_id: int = 0
+    semantic_slot_id: int = -1
+    semantic_slot_name: str = ""
+    semantic_group: str = "normal"
+    pattern: str = "single"
+    horizon_scale: float = 1.0
+    secondary_speed_sign: int = 0
+    secondary_gamma_rate_scale: float = 0.0
+    recover_gain: float = 0.0
+    recover_bias_scale: float = 0.0
+    articulation_target: float = 0.0
     compound_split: Optional[float] = None
     compound_exit_gamma_scale: float = 0.0
     motion_family_id: int = -1
@@ -54,6 +65,7 @@ class PrimitiveFamilyLibraryMeta:
     variant_count_per_family: int
     horizon: int
     step_seconds: float
+    mode_names: List[str] = field(default_factory=list)
     meta: Dict = field(default_factory=dict)
 
 

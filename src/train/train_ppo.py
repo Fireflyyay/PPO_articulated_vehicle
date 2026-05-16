@@ -72,6 +72,57 @@ def _to_scalar(value, default: float = 0.0) -> float:
     except Exception:
         pass
     return float(default)
+def _episode_info_scalars(ep_infos, key: str):
+    vals = []
+    for info in ep_infos:
+        if isinstance(info, dict) and info.get(key, None) is not None:
+            vals.append(_to_scalar(info.get(key), 0.0))
+    return vals
+
+def _log_motion_primitive_episode_runtime(writer, episode_idx: int, ep_infos: list):
+    if writer is None or ep_infos is None or len(ep_infos) == 0:
+        return
+
+    mode_names = tuple(getattr(cfg, "PRIMITIVE_MODE_NAMES", ("normal",)))
+    selected_modes = [str(info.get('selected_mode')) for info in ep_infos if isinstance(info, dict) and info.get('selected_mode') is not None]
+    mode_total = float(max(1, len(selected_modes)))
+    for mode_name in mode_names:
+        writer.add_scalar(
+            f"primitive_mode/ratio_{mode_name}",
+            float(sum(1 for mode in selected_modes if mode == str(mode_name))) / mode_total,
+            episode_idx,
+        )
+
+    last_info = ep_infos[-1] if isinstance(ep_infos[-1], dict) else {}
+    last_status = last_info.get('status', None)
+    collision_part = str(last_info.get('collision_part', '')) if last_info.get('collision_part', None) is not None else ''
+
+    writer.add_scalar("primitive_mode/transition_count", _to_scalar(last_info.get('mode_transition_count', 0.0), 0.0), episode_idx)
+    writer.add_scalar("mask/selected_action_mask_value_mean", _safe_mean(_episode_info_scalars(ep_infos, 'selected_action_mask_value')), episode_idx)
+    writer.add_scalar("mask/valid_action_ratio_mean", _safe_mean(_episode_info_scalars(ep_infos, 'valid_action_ratio')), episode_idx)
+    writer.add_scalar("mask/valid_action_count_mean", _safe_mean(_episode_info_scalars(ep_infos, 'effective_action_count')), episode_idx)
+    writer.add_scalar(
+        "mask/all_invalid_fallback_rate",
+        _safe_mean([1.0 if isinstance(info, dict) and info.get('all_invalid_fallback_family_id', None) is not None else 0.0 for info in ep_infos]),
+        episode_idx,
+    )
+    writer.add_scalar(
+        "mask/soft_ray_blocked_rate",
+        _safe_mean([1.0 if isinstance(info, dict) and bool(info.get('soft_ray_blocked', False)) else 0.0 for info in ep_infos]),
+        episode_idx,
+    )
+    writer.add_scalar("prefix/steps_used_mean", _safe_mean(_episode_info_scalars(ep_infos, 'prefix_steps_used')), episode_idx)
+    writer.add_scalar("prefix/soft_safe_steps_mean", _safe_mean(_episode_info_scalars(ep_infos, 'soft_safe_prefix_steps')), episode_idx)
+    writer.add_scalar("terminal/front_overlap", _to_scalar(last_info.get('terminal_front_overlap', last_info.get('front_overlap', 0.0)), 0.0), episode_idx)
+    writer.add_scalar("terminal/rear_overlap", _to_scalar(last_info.get('terminal_rear_overlap', last_info.get('rear_overlap', 0.0)), 0.0), episode_idx)
+    writer.add_scalar("terminal/mean_overlap", _to_scalar(last_info.get('terminal_mean_overlap', last_info.get('mean_overlap', 0.0)), 0.0), episode_idx)
+    writer.add_scalar("terminal/heading_error_deg", _to_scalar(last_info.get('heading_error_deg', 0.0), 0.0), episode_idx)
+    writer.add_scalar("terminal/dist_to_dest", _to_scalar(last_info.get('dist_to_dest', 0.0), 0.0), episode_idx)
+    writer.add_scalar("failure/collision_front", 1.0 if collision_part == 'front' else 0.0, episode_idx)
+    writer.add_scalar("failure/collision_rear", 1.0 if collision_part == 'rear' else 0.0, episode_idx)
+    writer.add_scalar("failure/collision_front_and_rear", 1.0 if collision_part == 'front_and_rear' else 0.0, episode_idx)
+    writer.add_scalar("failure/outbound", 1.0 if last_status == Status.OUTBOUND else 0.0, episode_idx)
+    writer.add_scalar("failure/outtime", 1.0 if last_status == Status.OUTTIME else 0.0, episode_idx)
 
 
 def _maybe_print_episode_heartbeat(
@@ -635,6 +686,10 @@ if __name__=="__main__":
     # NOTE: keep per-run copies to avoid mutating global configs.
     actor_params = dict(ACTOR_CONFIGS)
     critic_params = dict(CRITIC_CONFIGS)
+    observation_shape = env.observation_shape if hasattr(env, 'observation_shape') else base_env.observation_shape
+    obs_input_dim = int(np.prod(observation_shape))
+    actor_params['input_dim'] = obs_input_dim
+    critic_params['input_dim'] = obs_input_dim
 
     motion_action_dim = int(getattr(primitive_lib, 'action_dim', env.action_space.n)) if USE_MOTION_PRIMITIVES else None
 
@@ -649,7 +704,7 @@ if __name__=="__main__":
 
     configs = {
         "discrete": USE_MOTION_PRIMITIVES,
-        "observation_shape": env.observation_shape if hasattr(env, 'observation_shape') else base_env.observation_shape,
+        "observation_shape": observation_shape,
         # env.observation_shape might not be exposed by wrapper.
         # CarParking has observation_shape attribute.
         # Gym Wrapper forwards getattr usually, but let's be safe.
@@ -1121,6 +1176,7 @@ if __name__=="__main__":
                 bool(USE_PRIMITIVE_REFINEMENT),
                 ep_refinement_stats,
             )
+            _log_motion_primitive_episode_runtime(writer, i, ep_infos_trace)
 
         for type_id, scene_name in scene_chooser.scene_types.items():
             rec = scene_chooser.success_record[int(type_id)]

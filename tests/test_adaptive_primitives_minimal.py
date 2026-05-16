@@ -72,6 +72,23 @@ def test_family_action_dim_stays_fixed_when_gamma_bins_and_variants_change(tmp_p
     assert last.out_features == lib_a.action_dim
 
 
+def test_family_action_dim_stays_fixed_when_mode_axis_is_enabled(tmp_path):
+    path_a = tmp_path / "family_main_g5_v1.npz"
+    path_b = tmp_path / "family_main_g5_v3.npz"
+
+    generate_primitives(H=1, S=11, output_path=str(path_a), gamma_bins=5, variant_count=1, family_preset="main")
+    generate_primitives(H=1, S=11, output_path=str(path_b), gamma_bins=5, variant_count=3, family_preset="main")
+
+    lib_a = PrimitiveLibrary(str(path_a), load_sidecars=False)
+    lib_b = PrimitiveLibrary(str(path_b), load_sidecars=False)
+
+    assert lib_a.mode_count == lib_b.mode_count == 3
+    assert lib_a.index_table.ndim == lib_b.index_table.ndim == 4
+    assert lib_a.action_dim == lib_b.action_dim == 48
+    assert lib_a.family_count == lib_b.family_count == 48
+    assert lib_a.size != lib_b.size
+
+
 def test_compute_novelty_uses_delta_difference_when_actions_match():
     miner = TrajectoryMiner()
     library = SimpleNamespace(

@@ -93,7 +93,7 @@ python src/primitives/generate_primitives.py \
 
 这条命令会默认写出：
 
-- data/primitives_family_main_G31_V3.npz
+- data/primitives_family_semantic_main_G31_M3_V3.npz
 
 如果你想生成其他 preset 或参数组合，可以改下面这些参数：
 
@@ -110,11 +110,11 @@ primitive 库生成后，建议按下面顺序重新生成 sidecar：
 
 ```bash
 python scripts/build_primitive_grid_index.py \
-  --library data/primitives_family_main_G31_V3.npz \
+  --library data/primitives_family_semantic_main_G31_M3_V3.npz \
   --index_mode swept_cells
 
 python scripts/build_primitive_ray_safety.py \
-  --library data/primitives_family_main_G31_V3.npz
+  --library data/primitives_family_semantic_main_G31_M3_V3.npz
 ```
 
 如果你生成的是其他文件名，也把 `--library` 改成对应的 .npz 路径即可。
@@ -199,7 +199,7 @@ mask index 由 [scripts/build_primitive_grid_index.py](scripts/build_primitive_g
 
 ```bash
 python scripts/build_primitive_grid_index.py \
-  --library data/primitives_family_main_G31_V3.npz \
+  --library data/primitives_family_semantic_main_G31_M3_V3.npz \
   --index_mode swept_cells
 ```
 
@@ -225,7 +225,7 @@ soft-ray action mask 依赖 .ray_safety.npz sidecar，由 [scripts/build_primiti
 
 ```bash
 python scripts/build_primitive_ray_safety.py \
-  --library data/primitives_family_main_G31_V3.npz
+  --library data/primitives_family_semantic_main_G31_M3_V3.npz
 ```
 
 如果你修改了 LIDAR_NUM、LIDAR_RANGE 或 SOFT_MASK_SAFETY_MARGIN 等参数，也应该对所有实际训练会加载的 primitive 库重新生成 ray safety sidecar。

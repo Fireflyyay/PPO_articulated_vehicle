@@ -85,51 +85,54 @@ def test_takeover_respects_runtime_config_when_patched_before_init(monkeypatch):
 
 
 def test_soft_ray_without_ray_safety_falls_back_to_hybrid_mask():
-    wrapper = object.__new__(MacroActionWrapper)
-    wrapper._takeover_active = False
+    env = DummyEnv()
+    lib = DummyPrimitiveLib(np.zeros((3, 1, 2), dtype=np.float64))
+    wrapper = MacroActionWrapper(env, lib, H=1, normalize_before_step=False)
     wrapper._action_mask_mode = "soft_ray"
     wrapper._ray_safety_index = None
     wrapper._action_mask_update_every_k = 1
     wrapper._action_mask_cached = None
     wrapper._action_mask_calls_since_update = 0
     wrapper._last_action_mask_debug = {}
-    wrapper.action_space = SimpleNamespace(n=3)
 
     called = {}
 
-    def fake_hard(obs_vec=None, mode_override=None):
+    def fake_hard(obs_vec=None, mode_override=None, primitive_mode=None, mode_debug=None):
         called["mode_override"] = mode_override
         return np.array([1, 0, 1], dtype=np.int8)
 
     wrapper._compute_hard_action_mask = fake_hard
 
-    def fail_soft(obs_vec=None):
+    def fail_soft(obs_vec=None, primitive_mode=None, mode_debug=None):
         raise AssertionError("soft ray path should not run without ray safety")
 
     wrapper._compute_soft_ray_action_mask = fail_soft
 
     mask = MacroActionWrapper.get_action_mask(wrapper, np.array([0.0], dtype=np.float64))
 
-    assert np.array_equal(mask, np.array([1, 0, 1], dtype=np.int8))
+    assert mask.shape == (3,)
+    assert float(mask[0]) == 1.0
+    assert float(mask[2]) == 1.0
+    assert np.isclose(float(mask[1]), float(wrapper._soft_mask_small_value))
     assert called["mode_override"] == "hybrid"
     assert wrapper._last_action_mask_debug["fallback"] == "hybrid_no_ray_safety"
     assert wrapper._last_action_mask_debug["effective_mode"] == "hybrid"
 
 
 def test_soft_ray_mask_uses_k_step_cache():
-    wrapper = object.__new__(MacroActionWrapper)
-    wrapper._takeover_active = False
+    env = DummyEnv()
+    lib = DummyPrimitiveLib(np.zeros((3, 1, 2), dtype=np.float64))
+    wrapper = MacroActionWrapper(env, lib, H=1, normalize_before_step=False)
     wrapper._action_mask_mode = "soft_ray"
     wrapper._ray_safety_index = object()
     wrapper._action_mask_update_every_k = 3
     wrapper._action_mask_cached = None
     wrapper._action_mask_calls_since_update = 0
     wrapper._last_action_mask_debug = {}
-    wrapper.action_space = SimpleNamespace(n=3)
 
     calls = {"soft": 0}
 
-    def fake_soft(obs_vec=None):
+    def fake_soft(obs_vec=None, primitive_mode=None, mode_debug=None):
         calls["soft"] += 1
         return np.array([0.5, 0.2, 1.0], dtype=np.float32)
 

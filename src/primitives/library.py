@@ -63,6 +63,11 @@ class PrimitiveLibrary:
         self.variant_flat_to_variant = np.asarray(data["variant_flat_to_variant"], dtype=np.int64).reshape(-1)
         self.variant_flat_to_family_type = _object_array_to_str_list(data["variant_flat_to_family_type"])
         self.variant_flat_to_mode = _object_array_to_str_list(data["variant_flat_to_mode"])
+        self.variant_flat_to_mode_id = (
+            np.asarray(data["variant_flat_to_mode_id"], dtype=np.int64).reshape(-1)
+            if "variant_flat_to_mode_id" in data
+            else np.zeros_like(self.variant_flat_to_family, dtype=np.int64)
+        )
 
         self.gamma_bin_values = np.asarray(data["gamma_bin_values"], dtype=np.float64).reshape(-1)
         self.family_names = _object_array_to_str_list(data["family_names"])
@@ -92,9 +97,21 @@ class PrimitiveLibrary:
             if "speed_level_scales" in data
             else np.asarray([1.0], dtype=np.float64)
         )
+        self.mode_names = (
+            _object_array_to_str_list(data["mode_names"])
+            if "mode_names" in data
+            else ["normal"]
+        )
+        self.mode_count = int(data["mode_count"]) if "mode_count" in data else int(len(self.mode_names) or 1)
+        self.default_mode_id = int(data["default_mode_id"]) if "default_mode_id" in data else 0
         self.index_table = np.asarray(data["index_table"], dtype=np.int64)
         self.variant_counts = np.asarray(data["variant_counts"], dtype=np.int64)
         self.default_variant_table = np.asarray(data["default_variant_table"], dtype=np.int64)
+        self.has_mode_axis = bool(self.index_table.ndim == 4)
+        if not self.has_mode_axis:
+            self.mode_names = ["normal"]
+            self.mode_count = 1
+            self.default_mode_id = 0
 
         self.family_count = int(data["family_count"]) if "family_count" in data else int(len(self.family_names))
         self.motion_family_count = int(data["motion_family_count"]) if "motion_family_count" in data else int(len(self.motion_family_names))
@@ -110,6 +127,7 @@ class PrimitiveLibrary:
             variant_count_per_family=int(self.variant_count_per_family),
             horizon=int(self.max_variant_horizon),
             step_seconds=float(self.step_seconds),
+            mode_names=list(self.mode_names),
             meta=dict(self.meta),
         )
 
@@ -204,13 +222,39 @@ class PrimitiveLibrary:
         gids = np.asarray(self.index_table[int(gamma_bin_id), int(family_id)], dtype=np.int64).reshape(-1)
         return gids[gids >= 0]
 
-    def get_default_variant_index(self, gamma_bin_id: int, family_id: int) -> int:
-        idx = int(self.default_variant_table[int(gamma_bin_id), int(family_id)])
+    def mode_to_id(self, primitive_mode: Optional[str | int]) -> int:
+        if primitive_mode is None:
+            return int(self.default_mode_id)
+        if isinstance(primitive_mode, (int, np.integer)):
+            mode_id = int(primitive_mode)
+            if 0 <= mode_id < int(self.mode_count):
+                return mode_id
+            raise IndexError(f"primitive_mode out of range: {mode_id}")
+
+        mode_name = str(primitive_mode).strip().lower()
+        for idx, name in enumerate(self.mode_names):
+            if str(name).strip().lower() == mode_name:
+                return int(idx)
+        raise KeyError(f"Unknown primitive_mode={primitive_mode!r}; available={self.mode_names}")
+
+    def family_variant_indices_for_mode(self, gamma_bin_id: int, family_id: int, primitive_mode: Optional[str | int] = None) -> np.ndarray:
+        if not self.has_mode_axis:
+            return self.family_variant_indices(gamma_bin_id=gamma_bin_id, family_id=family_id)
+        mode_id = self.mode_to_id(primitive_mode)
+        gids = np.asarray(self.index_table[int(gamma_bin_id), int(mode_id), int(family_id)], dtype=np.int64).reshape(-1)
+        return gids[gids >= 0]
+
+    def get_default_variant_index(self, gamma_bin_id: int, family_id: int, primitive_mode: Optional[str | int] = None) -> int:
+        if self.has_mode_axis:
+            mode_id = self.mode_to_id(primitive_mode)
+            idx = int(self.default_variant_table[int(gamma_bin_id), int(mode_id), int(family_id)])
+        else:
+            idx = int(self.default_variant_table[int(gamma_bin_id), int(family_id)])
         if idx >= 0:
             return idx
-        candidates = self.family_variant_indices(gamma_bin_id, family_id)
+        candidates = self.family_variant_indices_for_mode(gamma_bin_id, family_id, primitive_mode=primitive_mode)
         if candidates.size == 0:
-            raise IndexError(f"No variants available for gamma_bin={gamma_bin_id}, family={family_id}")
+            raise IndexError(f"No variants available for gamma_bin={gamma_bin_id}, family={family_id}, mode={primitive_mode}")
         return int(candidates[0])
 
     def _variant_local_score(self, flat_index: int, goal_repr: Optional[Dict]) -> float:
@@ -251,23 +295,40 @@ class PrimitiveLibrary:
         self,
         family_id: int,
         gamma: float,
+        primitive_mode: Optional[str | int] = None,
         goal_repr: Optional[Dict] = None,
+        selection_context: Optional[Dict] = None,
     ) -> PrimitiveVariantRef:
         fid = int(family_id)
         if fid < 0 or fid >= int(self.family_count):
             raise IndexError(f"family_id out of range: {fid}")
 
         gamma_bin_id = self.gamma_to_bin(gamma)
-        candidates = self.family_variant_indices(gamma_bin_id, fid)
+        mode_id = self.mode_to_id(primitive_mode) if self.has_mode_axis else 0
+        candidates = self.family_variant_indices_for_mode(gamma_bin_id, fid, primitive_mode=primitive_mode)
         if candidates.size == 0:
-            flat_index = self.get_default_variant_index(gamma_bin_id, fid)
+            flat_index = self.get_default_variant_index(gamma_bin_id, fid, primitive_mode=primitive_mode)
         elif goal_repr is None:
-            flat_index = self.get_default_variant_index(gamma_bin_id, fid)
+            flat_index = self.get_default_variant_index(gamma_bin_id, fid, primitive_mode=primitive_mode)
         else:
             best_index = None
             best_score = None
             for idx in candidates.tolist():
                 score = self._variant_local_score(int(idx), goal_repr=goal_repr)
+                if isinstance(selection_context, dict):
+                    progress_bias = float(selection_context.get("progress_bias", 0.0))
+                    safety_bias = float(selection_context.get("safety_bias", 0.0))
+                    articulation_bias = float(selection_context.get("articulation_bias", 0.0))
+                    terminal_bias = float(selection_context.get("terminal_bias", 0.0))
+                    family_type = str(self.variant_flat_to_family_type[int(idx)])
+                    if family_type == "terminal":
+                        score += terminal_bias
+                    elif family_type == "straighten":
+                        score += articulation_bias
+                    elif family_type == "compound":
+                        score += safety_bias * 0.5
+                    else:
+                        score += progress_bias
                 if best_index is None or score > best_score:
                     best_index = int(idx)
                     best_score = float(score)
@@ -295,6 +356,7 @@ class PrimitiveLibrary:
             "family_type": str(self.variant_flat_to_family_type[flat_index]),
             "variant_id": int(ref.variant_id),
             "mode": str(self.variant_flat_to_mode[flat_index]),
+            "mode_id": int(self.variant_flat_to_mode_id[flat_index]) if self.variant_flat_to_mode_id.size > flat_index else 0,
             "speed_sign": int(self.speed_signs[flat_index]),
             "duration": float(self.durations[flat_index]),
             "effective_horizon": int(self.variant_horizons[flat_index]),

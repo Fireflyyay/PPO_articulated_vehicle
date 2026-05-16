@@ -188,7 +188,7 @@ BLOCK_MIXING_PLANT_CONFIG = {
         "block_size": 1.0,
 
         "corridor_width_range": (8, 8),
-        "main_corridor_count": 3,
+        "main_corridor_count": 2,
         "branch_count_range": (3, 5),
         "loop_count_range": (1, 1),
         "dead_end_count_range": (1, 2),
@@ -389,9 +389,41 @@ PRIMITIVE_FAMILY_PRESET = "main"
 PRIMITIVE_GAMMA_BINS = 31
 PRIMITIVE_VARIANTS_PER_FAMILY = 3
 PRIMITIVE_GAMMA_MAX = float(np.deg2rad(36.0))
-PRIMITIVE_SPEED_LEVEL_COUNT = 3
-PRIMITIVE_FAMILY_ACTION_DIM = 81
-PRIMITIVE_LIBRARY_PATH = "../data/primitives_family_main_G31_V3.npz"
+PRIMITIVE_SPEED_LEVEL_COUNT = 1
+PRIMITIVE_MODE_NAMES = ("normal", "narrow_escape", "terminal")
+PRIMITIVE_MODE_COUNT = len(PRIMITIVE_MODE_NAMES)
+PRIMITIVE_THREE_LEVEL_ENABLE = True
+PRIMITIVE_MODE_OBS_ENABLE = True
+PRIMITIVE_MODE_OBS_INCLUDE_ONE_HOT = True
+PRIMITIVE_MODE_OBS_INCLUDE_SCORES = True
+PRIMITIVE_MODE_OBS_FEATURE_DIM = (PRIMITIVE_MODE_COUNT if PRIMITIVE_MODE_OBS_INCLUDE_ONE_HOT else 0) + (4 if PRIMITIVE_MODE_OBS_INCLUDE_SCORES else 0)
+PRIMITIVE_MODE_SELECTOR_WEIGHTS = {
+    "clearance": 0.30,
+    "valid_action": 0.28,
+    "occupancy": 0.10,
+    "stuck": 0.18,
+    "articulation": 0.14,
+}
+PRIMITIVE_MODE_SELECTOR_HIGH = 0.58
+PRIMITIVE_MODE_SELECTOR_LOW = 0.36
+PRIMITIVE_MODE_HYSTERESIS_STEPS = 3
+PRIMITIVE_MODE_PROGRESS_WINDOW = 6
+PRIMITIVE_MODE_STUCK_STEPS = 5
+PRIMITIVE_MODE_CLEARANCE_SAFE = 1.2
+PRIMITIVE_MODE_CLEARANCE_FREE = 4.0
+PRIMITIVE_MODE_ARTICULATION_MARGIN = 0.85
+PRIMITIVE_TERMINAL_DIST = 4.0
+PRIMITIVE_TERMINAL_OVERLAP = 0.58
+PRIMITIVE_TERMINAL_HEADING_DEG = 20.0
+PRIMITIVE_PREFIX_MIN_BY_MODE = {
+    "normal": 1,
+    "narrow_escape": 2,
+    "terminal": 1,
+}
+PRIMITIVE_PREFIX_COMPOUND_RATIO = 0.55
+PRIMITIVE_ALL_INVALID_FALLBACK_ENABLE = True
+PRIMITIVE_FAMILY_ACTION_DIM = 48
+PRIMITIVE_LIBRARY_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "primitives_family_semantic_main_G31_M3_V3.npz"))
 PRIMITIVE_ADAPTIVE_MAX_VARIANTS_PER_FAMILY = 4
 PRIMITIVE_ADAPTIVE_SLOT_POLICY = "replace_low_utility"
 
@@ -567,7 +599,7 @@ ATTENTION_CONFIG = {
 USE_ATTENTION = True
 
 ACTOR_CONFIGS = {
-    'input_dim': LIDAR_NUM + 7 + 2 + (GUIDANCE_FEATURE_DIM if ENABLE_GLOBAL_SOFT_GUIDANCE else 0), # Lidar + Target + Velocity + Guidance
+    'input_dim': LIDAR_NUM + 7 + 2 + (GUIDANCE_FEATURE_DIM if ENABLE_GLOBAL_SOFT_GUIDANCE else 0) + (PRIMITIVE_MODE_OBS_FEATURE_DIM if USE_MOTION_PRIMITIVES and PRIMITIVE_MODE_OBS_ENABLE else 0), # Lidar + Target + Velocity + Guidance + Primitive mode features
     'hidden_size': 400,
     'output_size': 2,
     'use_tanh_output': True,
@@ -575,7 +607,7 @@ ACTOR_CONFIGS = {
 }
 
 CRITIC_CONFIGS = {
-    'input_dim': LIDAR_NUM + 7 + 2 + (GUIDANCE_FEATURE_DIM if ENABLE_GLOBAL_SOFT_GUIDANCE else 0),
+    'input_dim': LIDAR_NUM + 7 + 2 + (GUIDANCE_FEATURE_DIM if ENABLE_GLOBAL_SOFT_GUIDANCE else 0) + (PRIMITIVE_MODE_OBS_FEATURE_DIM if USE_MOTION_PRIMITIVES and PRIMITIVE_MODE_OBS_ENABLE else 0),
     'hidden_size': 400,
     'output_size': 1,
     'use_tanh_output': False,

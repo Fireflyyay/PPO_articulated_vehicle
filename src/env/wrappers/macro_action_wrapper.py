@@ -4,6 +4,7 @@ import numpy as np
 import copy
 import math
 import time
+from collections import deque
 from types import SimpleNamespace
 from shapely.geometry import Polygon
 from shapely.affinity import affine_transform
@@ -65,6 +66,108 @@ class MacroActionWrapper(gym.Wrapper):
         self._prefix_steps_queue = []  # next primitive(s) prefix steps, aligned with info['path_to_dest']
         self._soft_prefix_family_steps = {}
         self._last_obs = None
+        self._last_base_obs = None
+
+        base_obs_shape = getattr(getattr(self.env, 'observation_space', None), 'shape', None)
+        self._base_obs_dim = int(np.prod(base_obs_shape)) if base_obs_shape is not None else 0
+        try:
+            from configs import (
+                PRIMITIVE_ALL_INVALID_FALLBACK_ENABLE,
+                PRIMITIVE_MODE_ARTICULATION_MARGIN,
+                PRIMITIVE_MODE_CLEARANCE_FREE,
+                PRIMITIVE_MODE_CLEARANCE_SAFE,
+                PRIMITIVE_MODE_HYSTERESIS_STEPS,
+                PRIMITIVE_MODE_NAMES,
+                PRIMITIVE_MODE_OBS_ENABLE,
+                PRIMITIVE_MODE_OBS_INCLUDE_ONE_HOT,
+                PRIMITIVE_MODE_OBS_INCLUDE_SCORES,
+                PRIMITIVE_MODE_PROGRESS_WINDOW,
+                PRIMITIVE_MODE_SELECTOR_HIGH,
+                PRIMITIVE_MODE_SELECTOR_LOW,
+                PRIMITIVE_MODE_SELECTOR_WEIGHTS,
+                PRIMITIVE_MODE_STUCK_STEPS,
+                PRIMITIVE_PREFIX_COMPOUND_RATIO,
+                PRIMITIVE_PREFIX_MIN_BY_MODE,
+                PRIMITIVE_TERMINAL_DIST,
+                PRIMITIVE_TERMINAL_HEADING_DEG,
+                PRIMITIVE_TERMINAL_OVERLAP,
+            )
+        except Exception:
+            PRIMITIVE_MODE_NAMES = ("normal", "narrow_escape", "terminal")
+            PRIMITIVE_MODE_OBS_ENABLE = True
+            PRIMITIVE_MODE_OBS_INCLUDE_ONE_HOT = True
+            PRIMITIVE_MODE_OBS_INCLUDE_SCORES = True
+            PRIMITIVE_MODE_SELECTOR_WEIGHTS = {
+                "clearance": 0.30,
+                "valid_action": 0.28,
+                "occupancy": 0.10,
+                "stuck": 0.18,
+                "articulation": 0.14,
+            }
+            PRIMITIVE_MODE_SELECTOR_HIGH = 0.58
+            PRIMITIVE_MODE_SELECTOR_LOW = 0.36
+            PRIMITIVE_MODE_HYSTERESIS_STEPS = 3
+            PRIMITIVE_MODE_PROGRESS_WINDOW = 6
+            PRIMITIVE_MODE_STUCK_STEPS = 5
+            PRIMITIVE_TERMINAL_DIST = 4.0
+            PRIMITIVE_TERMINAL_OVERLAP = 0.58
+            PRIMITIVE_TERMINAL_HEADING_DEG = 20.0
+            PRIMITIVE_MODE_CLEARANCE_SAFE = 1.2
+            PRIMITIVE_MODE_CLEARANCE_FREE = 4.0
+            PRIMITIVE_MODE_ARTICULATION_MARGIN = 0.85
+            PRIMITIVE_PREFIX_MIN_BY_MODE = {"normal": 1, "narrow_escape": 2, "terminal": 1}
+            PRIMITIVE_PREFIX_COMPOUND_RATIO = 0.55
+            PRIMITIVE_ALL_INVALID_FALLBACK_ENABLE = True
+        self._primitive_mode_names = [str(name) for name in list(PRIMITIVE_MODE_NAMES)]
+        self._mode_obs_enable = bool(PRIMITIVE_MODE_OBS_ENABLE)
+        self._mode_obs_include_one_hot = bool(PRIMITIVE_MODE_OBS_INCLUDE_ONE_HOT)
+        self._mode_obs_include_scores = bool(PRIMITIVE_MODE_OBS_INCLUDE_SCORES)
+        self._mode_selector_weights = dict(PRIMITIVE_MODE_SELECTOR_WEIGHTS)
+        self._mode_selector_high = float(PRIMITIVE_MODE_SELECTOR_HIGH)
+        self._mode_selector_low = float(PRIMITIVE_MODE_SELECTOR_LOW)
+        self._mode_hysteresis_steps = max(1, int(PRIMITIVE_MODE_HYSTERESIS_STEPS))
+        self._mode_selector_progress_window = max(2, int(PRIMITIVE_MODE_PROGRESS_WINDOW))
+        self._mode_selector_stuck_steps = max(2, int(PRIMITIVE_MODE_STUCK_STEPS))
+        self._terminal_dist = float(PRIMITIVE_TERMINAL_DIST)
+        self._terminal_overlap = float(PRIMITIVE_TERMINAL_OVERLAP)
+        self._terminal_heading = float(np.deg2rad(PRIMITIVE_TERMINAL_HEADING_DEG))
+        self._mode_clearance_safe = float(PRIMITIVE_MODE_CLEARANCE_SAFE)
+        self._mode_clearance_free = float(PRIMITIVE_MODE_CLEARANCE_FREE)
+        self._mode_articulation_margin = float(PRIMITIVE_MODE_ARTICULATION_MARGIN)
+        self._mode_prefix_min_by_mode = {str(k): max(1, int(v)) for k, v in dict(PRIMITIVE_PREFIX_MIN_BY_MODE).items()}
+        self._mode_prefix_compound_ratio = float(PRIMITIVE_PREFIX_COMPOUND_RATIO)
+        self._all_invalid_fallback_enabled = bool(PRIMITIVE_ALL_INVALID_FALLBACK_ENABLE)
+        self._current_primitive_mode = str(self._primitive_mode_names[0])
+        self._pending_mode_debug = None
+        self._last_mode_debug = {}
+        self._mode_transition_count = 0
+        self._mode_hold_steps = 0
+        self._progress_history = deque(maxlen=self._mode_selector_progress_window)
+        self._last_progress_metrics = None
+        self._no_progress_steps = 0
+        self._last_family_mask = None
+        self._all_invalid_fallback_count = 0
+        self._mode_feature_dim = 0
+        if self._mode_obs_enable:
+            if self._mode_obs_include_one_hot:
+                self._mode_feature_dim += len(self._primitive_mode_names)
+            if self._mode_obs_include_scores:
+                self._mode_feature_dim += 4
+        if self._mode_obs_enable and self._base_obs_dim > 0:
+            self.observation_shape = (int(self._base_obs_dim + self._mode_feature_dim),)
+            self.observation_space = spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=self.observation_shape,
+                dtype=np.float64,
+            )
+        else:
+            self.observation_shape = getattr(self.env, 'observation_shape', (self._base_obs_dim,))
+            self.observation_space = getattr(
+                self.env,
+                'observation_space',
+                spaces.Box(low=-np.inf, high=np.inf, shape=self.observation_shape, dtype=np.float64),
+            )
 
         # Terminal takeover remains available, but this project should not invoke RHP.
         self._takeover_planner = None
@@ -353,7 +456,7 @@ class MacroActionWrapper(gym.Wrapper):
             float(self._soft_mask_terminal_weight_max),
         ).astype(np.float32)
 
-    def _compute_soft_ray_action_mask(self, obs_vec=None) -> np.ndarray:
+    def _compute_soft_ray_action_mask(self, obs_vec=None, primitive_mode=None, mode_debug=None, write_debug: bool = True, return_debug: bool = False) -> np.ndarray:
         t0 = time.perf_counter()
         n_actions = int(self.action_space.n)
         eps = float(self._soft_mask_eps)
@@ -363,11 +466,14 @@ class MacroActionWrapper(gym.Wrapper):
             "ray_safety_available": index is not None,
             "terminal_reweight_applied": False,
             "fallback": None,
+            "selected_mode": str(self._mode_name(primitive_mode)),
         }
 
-        if obs_vec is None or index is None:
-            hard_mask = self._compute_hard_action_mask(obs_vec, mode_override="full").astype(np.float32)
-            mask = np.clip(hard_mask, eps, 1.0).astype(np.float32)
+        base_obs = self._extract_base_obs(obs_vec)
+        if base_obs is None or index is None:
+            hard_mask, hard_debug = self._compute_hard_action_mask(base_obs, mode_override="full", primitive_mode=primitive_mode, mode_debug=mode_debug, write_debug=False, return_debug=True)
+            mask = np.clip(np.asarray(hard_mask, dtype=np.float32), eps, 1.0).astype(np.float32)
+            debug.update(hard_debug or {})
             debug["fallback"] = "hard_family_mask"
             self._soft_prefix_family_steps = {}
         else:
@@ -379,7 +485,7 @@ class MacroActionWrapper(gym.Wrapper):
             except Exception:
                 lidar_num = int(getattr(index, "lidar_num", 120))
                 lidar_range = float(getattr(index, "lidar_range", 30.0))
-            lidar = np.asarray(obs_vec, dtype=np.float64).reshape(-1)[:lidar_num]
+            lidar = np.asarray(base_obs, dtype=np.float64).reshape(-1)[:lidar_num]
             min_lidar = float(np.min(lidar)) * lidar_range if lidar.size > 0 else float(lidar_range)
             obs_density = float(np.mean((lidar * lidar_range) < 3.0)) if lidar.size > 0 else 0.0
             variant_mask, mask_debug = index.compute_soft_mask(
@@ -398,8 +504,9 @@ class MacroActionWrapper(gym.Wrapper):
             mask = np.full((n_actions,), eps, dtype=np.float32)
             self._family_resolution_cache = {}
             self._soft_prefix_family_steps = {}
+            selection_context = self._variant_selection_context(mode_debug)
             for family_id in range(n_actions):
-                ref = self._resolve_family_ref(family_id, obs_vec=obs_vec)
+                ref = self._resolve_family_ref(family_id, obs_vec=base_obs, primitive_mode=primitive_mode, selection_context=selection_context)
                 mask[int(family_id)] = float(variant_mask[int(ref.flat_index)])
                 safe_prefix_steps = 0
                 if int(ref.flat_index) < safe_step_lens.shape[0]:
@@ -415,8 +522,11 @@ class MacroActionWrapper(gym.Wrapper):
         debug["soft_mask_min"] = float(np.min(mask)) if mask.size else 0.0
         debug["soft_mask_max"] = float(np.max(mask)) if mask.size else 0.0
         debug["soft_mask_mean"] = float(np.mean(mask)) if mask.size else 0.0
-        debug["effective_action_count"] = int(np.count_nonzero(mask > (float(np.min(mask)) + 1e-6)))
-        self._last_action_mask_debug = debug
+        debug["effective_action_count"] = int(np.count_nonzero(mask > max(eps, 0.05)))
+        if write_debug:
+            self._last_action_mask_debug = debug
+        if return_debug:
+            return mask.astype(np.float32), debug
         return mask.astype(np.float32)
 
     def _physical_to_normalized_action(self, action_phys: np.ndarray) -> np.ndarray:
@@ -544,10 +654,296 @@ class MacroActionWrapper(gym.Wrapper):
             return 0.0
         return self._wrap_pi(float(state.heading) - float(getattr(state, 'rear_heading', state.heading)))
 
+    def _mode_name(self, primitive_mode=None) -> str:
+        if primitive_mode is None:
+            return str(self._current_primitive_mode)
+        if isinstance(primitive_mode, (int, np.integer)):
+            idx = int(primitive_mode)
+            if 0 <= idx < len(self._primitive_mode_names):
+                return str(self._primitive_mode_names[idx])
+        mode_name = str(primitive_mode)
+        for name in self._primitive_mode_names:
+            if str(name).lower() == mode_name.lower():
+                return str(name)
+        return str(self._primitive_mode_names[0])
+
+    def _mode_id(self, primitive_mode=None) -> int:
+        name = self._mode_name(primitive_mode)
+        for idx, candidate in enumerate(self._primitive_mode_names):
+            if str(candidate) == name:
+                return int(idx)
+        return 0
+
+    def _extract_base_obs(self, obs_vec):
+        if obs_vec is None:
+            return None
+        arr = np.asarray(obs_vec, dtype=np.float64).reshape(-1)
+        base_obs_dim = int(getattr(self, '_base_obs_dim', 0) or 0)
+        mode_obs_dim = int(getattr(self, '_mode_obs_dim', 0) or 0)
+        if base_obs_dim <= 0 or arr.size <= base_obs_dim:
+            return arr
+        if mode_obs_dim > 0 and arr.size == (base_obs_dim + mode_obs_dim):
+            return arr[:base_obs_dim]
+        return arr
+
+    def _mode_one_hot(self, primitive_mode: str) -> np.ndarray:
+        one_hot = np.zeros((len(self._primitive_mode_names),), dtype=np.float64)
+        one_hot[self._mode_id(primitive_mode)] = 1.0
+        return one_hot
+
+    def _goal_alignment_metrics(self):
+        state = self._current_vehicle_state()
+        base_env = self.env
+        world_map = getattr(base_env, 'map', None)
+        dest = getattr(world_map, 'dest', None) if world_map is not None else None
+        if state is None or dest is None:
+            return {
+                "dist": 0.0,
+                "heading_error": 0.0,
+                "front_overlap": 0.0,
+                "rear_overlap": 0.0,
+                "mean_overlap": 0.0,
+            }
+
+        heading_error = abs(self._wrap_pi(float(state.heading) - float(dest.heading)))
+        ego_boxes = state.create_box()
+        dest_boxes = dest.create_box()
+        front_box_ego = Polygon(ego_boxes[0])
+        rear_box_ego = Polygon(ego_boxes[1])
+        front_box_dest = Polygon(dest_boxes[0])
+        rear_box_dest = Polygon(dest_boxes[1])
+        front_overlap = float(front_box_ego.intersection(front_box_dest).area) / (float(front_box_dest.area) + 1e-9)
+        rear_overlap = float(rear_box_ego.intersection(rear_box_dest).area) / (float(rear_box_dest.area) + 1e-9)
+        return {
+            "dist": float(state.loc.distance(dest.loc)),
+            "heading_error": float(heading_error),
+            "front_overlap": float(front_overlap),
+            "rear_overlap": float(rear_overlap),
+            "mean_overlap": float(0.5 * (front_overlap + rear_overlap)),
+        }
+
+    def _lidar_clearance_metrics(self, obs_vec=None):
+        base_obs = self._extract_base_obs(obs_vec)
+        if base_obs is None:
+            return {
+                "front_clearance": float(self._mask_lidar_range),
+                "rear_clearance": float(self._mask_lidar_range),
+                "obs_density": 0.0,
+            }
+
+        lidar = np.asarray(base_obs, dtype=np.float64).reshape(-1)[: int(self._mask_lidar_num)]
+        if lidar.size == 0:
+            return {
+                "front_clearance": float(self._mask_lidar_range),
+                "rear_clearance": float(self._mask_lidar_range),
+                "obs_density": 0.0,
+            }
+
+        angles = self._mask_lidar_angles[: lidar.size]
+        dist = np.clip(lidar, 0.0, 1.0) * float(self._mask_lidar_range)
+        front_mask = np.abs(np.arctan2(np.sin(angles), np.cos(angles))) <= float(np.deg2rad(35.0))
+        rear_angles = (angles - np.pi + np.pi) % (2.0 * np.pi) - np.pi
+        rear_mask = np.abs(np.arctan2(np.sin(rear_angles), np.cos(rear_angles))) <= float(np.deg2rad(35.0))
+        front_clearance = float(np.min(dist[front_mask])) if np.any(front_mask) else float(np.min(dist))
+        rear_clearance = float(np.min(dist[rear_mask])) if np.any(rear_mask) else float(np.min(dist))
+        obs_density = float(np.mean(dist < 3.0)) if dist.size else 0.0
+        return {
+            "front_clearance": float(front_clearance),
+            "rear_clearance": float(rear_clearance),
+            "obs_density": float(obs_density),
+        }
+
+    def _selector_progress_ok(self) -> bool:
+        if len(self._progress_history) < max(2, self._mode_selector_progress_window // 2):
+            return False
+        start = self._progress_history[0]
+        end = self._progress_history[-1]
+        dist_gain = float(start.get("dist", 0.0) - end.get("dist", 0.0))
+        overlap_gain = float(end.get("front_overlap", 0.0) - start.get("front_overlap", 0.0))
+        heading_gain = float(start.get("heading_error", 0.0) - end.get("heading_error", 0.0))
+        return bool(dist_gain > 0.25 or overlap_gain > 0.02 or heading_gain > float(np.deg2rad(4.0)))
+
+    def _update_progress_tracking(self):
+        metrics = self._goal_alignment_metrics()
+        self._progress_history.append(dict(metrics))
+        if self._last_progress_metrics is None:
+            self._last_progress_metrics = dict(metrics)
+            self._no_progress_steps = 0
+            return metrics
+
+        prev = self._last_progress_metrics
+        dist_gain = float(prev.get("dist", 0.0) - metrics.get("dist", 0.0))
+        overlap_gain = float(metrics.get("front_overlap", 0.0) - prev.get("front_overlap", 0.0))
+        heading_gain = float(prev.get("heading_error", 0.0) - metrics.get("heading_error", 0.0))
+        if dist_gain < 0.10 and overlap_gain < 0.01 and heading_gain < float(np.deg2rad(2.0)):
+            self._no_progress_steps += 1
+        else:
+            self._no_progress_steps = 0
+        self._last_progress_metrics = dict(metrics)
+        return metrics
+
+    def _mode_observation_features(self, mode_debug=None) -> np.ndarray:
+        if not self._mode_obs_enable:
+            return np.zeros((0,), dtype=np.float64)
+        debug = dict(mode_debug or self._last_mode_debug or {})
+        feats = []
+        if self._mode_obs_include_one_hot:
+            feats.append(self._mode_one_hot(debug.get("selected_mode", self._current_primitive_mode)))
+        if self._mode_obs_include_scores:
+            feats.append(
+                np.asarray(
+                    [
+                        float(debug.get("congestion_score", 0.0)),
+                        float(debug.get("valid_action_ratio", 0.0)),
+                        float(debug.get("mean_soft_mask", 0.0)),
+                        float(debug.get("abs_phi_ratio", 0.0)),
+                    ],
+                    dtype=np.float64,
+                )
+            )
+        if len(feats) == 0:
+            return np.zeros((0,), dtype=np.float64)
+        return np.concatenate(feats, axis=0)
+
+    def _augment_observation(self, obs_vec, mode_debug=None):
+        base_obs = self._extract_base_obs(obs_vec)
+        if base_obs is None:
+            return None
+        if not self._mode_obs_enable:
+            return np.asarray(base_obs, dtype=np.float64).copy()
+        debug = mode_debug if isinstance(mode_debug, dict) else self._estimate_mode_state(base_obs, update_state=False)
+        extras = self._mode_observation_features(debug)
+        return np.concatenate([np.asarray(base_obs, dtype=np.float64), extras], axis=0)
+
+    def _variant_selection_context(self, mode_debug=None):
+        primitive_mode = self._mode_name((mode_debug or {}).get("selected_mode")) if isinstance(mode_debug, dict) else self._mode_name()
+        if primitive_mode == "terminal":
+            return {
+                "progress_bias": 0.10,
+                "safety_bias": 0.35,
+                "articulation_bias": 0.30,
+                "terminal_bias": 0.75,
+            }
+        if primitive_mode == "narrow_escape":
+            return {
+                "progress_bias": 0.15,
+                "safety_bias": 0.60,
+                "articulation_bias": 0.55,
+                "terminal_bias": 0.10,
+            }
+        return {
+            "progress_bias": 0.50,
+            "safety_bias": 0.25,
+            "articulation_bias": 0.15,
+            "terminal_bias": 0.05,
+        }
+
+    def _estimate_mode_state(self, obs_vec=None, update_state: bool = False):
+        base_obs = self._extract_base_obs(obs_vec)
+        safety_mask = None
+        if self._ray_safety_index is not None and base_obs is not None:
+            try:
+                lidar = np.asarray(base_obs, dtype=np.float64).reshape(-1)[: int(self._mask_lidar_num)]
+                safety_mask, _ = self._ray_safety_index.compute_soft_mask(
+                    lidar,
+                    gamma=float(self._soft_mask_gamma),
+                    eps=float(self._soft_mask_eps),
+                    lidar_range=float(self._mask_lidar_range),
+                )
+                safety_mask = np.asarray(safety_mask, dtype=np.float32).reshape(-1)
+            except Exception:
+                safety_mask = None
+        if safety_mask is None:
+            n_actions = int(self.action_space.n)
+            safety_mask = np.ones((n_actions,), dtype=np.float32)
+
+        goal_metrics = self._goal_alignment_metrics()
+        clearance_metrics = self._lidar_clearance_metrics(base_obs)
+        valid_action_ratio = float(np.mean(safety_mask > max(float(self._soft_mask_eps), 0.05))) if safety_mask.size else 0.0
+        mean_soft_mask = float(np.mean(safety_mask)) if safety_mask.size else 0.0
+        phi_abs = abs(self._current_articulation())
+        phi_max = float(max(1e-6, np.max(np.abs(getattr(self.primitive_lib, 'gamma_bin_values', np.asarray([np.deg2rad(36.0)]))))))
+        abs_phi_ratio = float(np.clip(phi_abs / phi_max, 0.0, 1.5))
+        min_clearance = float(min(clearance_metrics["front_clearance"], clearance_metrics["rear_clearance"]))
+        clearance_score = 1.0 - float(np.clip((min_clearance - self._mode_clearance_safe) / max(1e-6, self._mode_clearance_free - self._mode_clearance_safe), 0.0, 1.0))
+        valid_score = 1.0 - float(np.clip(valid_action_ratio, 0.0, 1.0))
+        occupancy_score = float(np.clip(clearance_metrics["obs_density"], 0.0, 1.0))
+        stuck_score = float(np.clip(self._no_progress_steps / max(1.0, float(self._mode_selector_stuck_steps)), 0.0, 1.0))
+        phi_score = float(np.clip(abs_phi_ratio / max(self._mode_articulation_margin, 1e-6), 0.0, 1.25))
+        congestion_score = float(np.clip(
+            self._mode_selector_weights.get("clearance", 0.0) * clearance_score
+            + self._mode_selector_weights.get("valid_action", 0.0) * valid_score
+            + self._mode_selector_weights.get("occupancy", 0.0) * occupancy_score
+            + self._mode_selector_weights.get("stuck", 0.0) * stuck_score
+            + self._mode_selector_weights.get("articulation", 0.0) * phi_score,
+            0.0,
+            1.5,
+        ))
+        near_goal = bool(
+            goal_metrics["dist"] <= self._terminal_dist
+            or goal_metrics["front_overlap"] >= self._terminal_overlap
+            or (
+                goal_metrics["heading_error"] <= self._terminal_heading
+                and goal_metrics["front_overlap"] >= max(0.45, self._terminal_overlap - 0.15)
+            )
+        )
+        prev_mode = str(self._current_primitive_mode)
+        selected_mode = prev_mode
+        if prev_mode == "terminal":
+            if near_goal or goal_metrics["dist"] <= (self._terminal_dist + 1.0):
+                selected_mode = "terminal"
+            elif congestion_score > self._mode_selector_high:
+                selected_mode = "narrow_escape"
+            else:
+                selected_mode = "normal"
+        elif near_goal:
+            selected_mode = "terminal"
+        elif stuck_score >= 1.0 or congestion_score > self._mode_selector_high:
+            selected_mode = "narrow_escape"
+        elif prev_mode == "narrow_escape":
+            if congestion_score < self._mode_selector_low and self._selector_progress_ok():
+                selected_mode = "normal"
+            else:
+                selected_mode = "narrow_escape"
+        else:
+            selected_mode = "normal"
+
+        mode_transitioned = bool(selected_mode != prev_mode)
+        transition_count = int(self._mode_transition_count)
+        if update_state:
+            if mode_transitioned:
+                self._mode_transition_count += 1
+                self._mode_hold_steps = 0
+            else:
+                self._mode_hold_steps += 1
+            self._current_primitive_mode = str(selected_mode)
+            transition_count = int(self._mode_transition_count)
+
+        return {
+            "selected_mode": str(selected_mode),
+            "selected_mode_id": int(self._mode_id(selected_mode)),
+            "previous_mode": str(prev_mode),
+            "mode_transitioned": bool(mode_transitioned),
+            "mode_transition_count": int(transition_count),
+            "congestion_score": float(congestion_score),
+            "valid_action_ratio": float(valid_action_ratio),
+            "mean_soft_mask": float(mean_soft_mask),
+            "abs_phi_ratio": float(np.clip(abs_phi_ratio, 0.0, 1.5)),
+            "stuck_score": float(stuck_score),
+            "front_clearance": float(clearance_metrics["front_clearance"]),
+            "rear_clearance": float(clearance_metrics["rear_clearance"]),
+            "goal_dist": float(goal_metrics["dist"]),
+            "goal_heading_error": float(goal_metrics["heading_error"]),
+            "front_overlap": float(goal_metrics["front_overlap"]),
+            "rear_overlap": float(goal_metrics["rear_overlap"]),
+            "mean_overlap": float(goal_metrics["mean_overlap"]),
+            "terminal_triggered": bool(near_goal),
+        }
+
     def _goal_repr_from_env_state(self, obs_vec=None) -> dict:
         if obs_vec is not None:
             try:
-                return self._parse_goal_repr_from_obs(obs_vec)
+                return self._parse_goal_repr_from_obs(self._extract_base_obs(obs_vec))
             except Exception:
                 pass
 
@@ -613,24 +1009,33 @@ class MacroActionWrapper(gym.Wrapper):
             "switch_index": -1,
         }
 
-    def _resolve_family_ref(self, family_id: int, obs_vec=None):
+    def _resolve_family_ref(self, family_id: int, obs_vec=None, primitive_mode=None, selection_context=None):
+        cache_key = (int(family_id), str(self._mode_name(primitive_mode)))
+        if cache_key in self._family_resolution_cache:
+            return self._family_resolution_cache[cache_key]
         if not hasattr(self.primitive_lib, 'resolve_family_variant'):
             ref = self._legacy_flat_variant_ref(family_id)
-            self._family_resolution_cache[int(family_id)] = ref
+            self._family_resolution_cache[cache_key] = ref
             return ref
 
         goal_repr = self._goal_repr_from_env_state(obs_vec=obs_vec)
         gamma = self._current_articulation()
-        ref = self.primitive_lib.resolve_family_variant(int(family_id), gamma=float(gamma), goal_repr=goal_repr)
-        self._family_resolution_cache[int(family_id)] = ref
+        ref = self.primitive_lib.resolve_family_variant(
+            int(family_id),
+            gamma=float(gamma),
+            primitive_mode=self._mode_name(primitive_mode),
+            goal_repr=goal_repr,
+            selection_context=selection_context,
+        )
+        self._family_resolution_cache[cache_key] = ref
         return ref
 
     def _current_obs_snapshot(self):
-        if self._last_obs is not None:
+        if self._last_base_obs is not None:
             try:
-                return np.asarray(self._last_obs).copy()
+                return np.asarray(self._last_base_obs).copy()
             except Exception:
-                return copy.deepcopy(self._last_obs)
+                return copy.deepcopy(self._last_base_obs)
         try:
             obs = self.env._build_observation()
         except Exception:
@@ -642,14 +1047,22 @@ class MacroActionWrapper(gym.Wrapper):
         except Exception:
             return copy.deepcopy(obs)
 
-    def _compute_soft_auto_prefix(self, family_id: int):
+    def _compute_soft_auto_prefix(self, family_id: int, resolved_debug=None):
         safe_prefix_steps = self._soft_prefix_family_steps.get(int(family_id), None)
         if safe_prefix_steps is None:
             return None, None
 
+        primitive_mode = self._mode_name((resolved_debug or {}).get('mode', self._last_mode_debug.get('selected_mode', self._current_primitive_mode)))
         prefix_steps = max(0, min(int(self.H), int(safe_prefix_steps)))
         if self._ppo_dynamic_prefix_max_steps is not None:
             prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_max_steps))
+
+        min_mode_prefix = int(self._mode_prefix_min_by_mode.get(primitive_mode, 1))
+        if bool((resolved_debug or {}).get('is_compound', False)):
+            compound_min = int(max(min_mode_prefix, round(float((resolved_debug or {}).get('effective_horizon', self.H)) * self._mode_prefix_compound_ratio)))
+            if int((resolved_debug or {}).get('switch_index', -1)) > 0:
+                compound_min = max(compound_min, int((resolved_debug or {}).get('switch_index', -1)))
+            min_mode_prefix = compound_min
 
         if prefix_steps > 0 and self._ppo_dynamic_prefix_enabled:
             debug = dict(getattr(self, '_last_action_mask_debug', {}) or {})
@@ -670,11 +1083,115 @@ class MacroActionWrapper(gym.Wrapper):
             ):
                 prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_narrow_steps))
 
+        if prefix_steps > 0:
+            prefix_steps = max(prefix_steps, min_mode_prefix)
+
         if prefix_steps <= 0:
             return 0, 'soft_ray_auto_blocked'
         if prefix_steps < int(self.H):
             return int(prefix_steps), 'soft_ray_auto'
         return None, None
+
+    def _mode_preference_weights(self, primitive_mode: str) -> np.ndarray:
+        weights = np.ones((int(self.action_space.n),), dtype=np.float32)
+        primitive_mode = self._mode_name(primitive_mode)
+        for family_id in range(int(self.action_space.n)):
+            family_name = str(getattr(self.primitive_lib, 'family_name', lambda fid: f"family-{fid}")(family_id))
+            family_type = str(getattr(self.primitive_lib, 'family_type', lambda fid: 'normal')(family_id))
+            weight = 1.0
+            is_escape = family_name.startswith('escape-')
+            is_terminal = family_name.startswith('terminal-') or family_type == 'terminal'
+            is_recovery = family_type == 'straighten' or family_name.startswith('articulation-') or 'phi' in family_name or 'jackknife' in family_name
+            is_reverse = family_name.startswith('reverse') or '-reverse-' in family_name or family_name.startswith('escape-reverse') or family_name.endswith('-reverse')
+            is_large = 'large' in family_name or 'tight' in family_name
+            if primitive_mode == 'normal':
+                if is_escape:
+                    weight *= 0.58
+                if is_terminal:
+                    weight *= 0.72
+                if is_recovery:
+                    weight *= 0.86
+                if is_reverse:
+                    weight *= 0.90
+            elif primitive_mode == 'narrow_escape':
+                if is_escape:
+                    weight *= 1.28
+                if is_recovery:
+                    weight *= 1.18
+                if is_reverse:
+                    weight *= 1.10
+                if is_large and family_name.startswith('forward'):
+                    weight *= 0.82
+                if is_terminal:
+                    weight *= 0.80
+            elif primitive_mode == 'terminal':
+                if is_terminal:
+                    weight = 1.80
+                elif is_recovery:
+                    weight = 0.45
+                elif is_escape:
+                    weight = 0.18
+                elif is_reverse:
+                    weight = 0.15
+                else:
+                    weight = 0.08
+                if is_large:
+                    weight *= 0.50
+            weights[family_id] = float(np.clip(weight, 0.05, 2.00))
+        return weights
+
+    def _articulation_preference_weights(self, primitive_mode: str, obs_vec=None) -> np.ndarray:
+        phi = self._current_articulation()
+        phi_abs = abs(phi)
+        phi_max = float(max(1e-6, np.max(np.abs(getattr(self.primitive_lib, 'gamma_bin_values', np.asarray([np.deg2rad(36.0)]))))))
+        ratio = float(np.clip(phi_abs / phi_max, 0.0, 1.5))
+        weights = np.ones((int(self.action_space.n),), dtype=np.float32)
+        if ratio < float(self._mode_articulation_margin):
+            return weights
+
+        severity = float(np.clip((ratio - self._mode_articulation_margin) / max(1e-6, 1.0 - self._mode_articulation_margin), 0.0, 1.0))
+        selection_context = self._variant_selection_context({"selected_mode": primitive_mode})
+        for family_id in range(int(self.action_space.n)):
+            ref = self._resolve_family_ref(family_id, obs_vec=obs_vec, primitive_mode=primitive_mode, selection_context=selection_context)
+            delta = np.asarray(self.primitive_lib.get_delta(int(ref.flat_index)), dtype=np.float64).reshape(-1)
+            delta_gamma = float(delta[3]) if delta.size > 3 else 0.0
+            family_name = str(getattr(self.primitive_lib, 'family_name', lambda fid: f"family-{fid}")(family_id))
+            family_type = str(getattr(self.primitive_lib, 'family_type', lambda fid: 'normal')(family_id))
+            weight = 1.0
+            if phi > 0.0 and delta_gamma > 0.04:
+                weight *= max(0.12, 1.0 - 1.05 * severity)
+            elif phi < 0.0 and delta_gamma < -0.04:
+                weight *= max(0.12, 1.0 - 1.05 * severity)
+            else:
+                if abs(delta_gamma) > 0.02:
+                    weight *= 1.0 + 0.32 * severity
+            if family_type == 'straighten' or family_name.startswith('articulation-') or 'phi' in family_name or 'jackknife' in family_name:
+                weight *= 1.0 + 0.42 * severity
+            weights[family_id] = float(np.clip(weight, 0.08, 1.65))
+        return weights
+
+    def _choose_all_invalid_fallback(self, primitive_mode: str, safety_mask: np.ndarray, mode_weights: np.ndarray, articulation_weights: np.ndarray, obs_vec=None):
+        best_family = 0
+        best_score = None
+        selection_context = self._variant_selection_context({"selected_mode": primitive_mode})
+        for family_id in range(int(self.action_space.n)):
+            ref = self._resolve_family_ref(family_id, obs_vec=obs_vec, primitive_mode=primitive_mode, selection_context=selection_context)
+            family_name = str(getattr(self.primitive_lib, 'family_name', lambda fid: f"family-{fid}")(family_id))
+            family_type = str(getattr(self.primitive_lib, 'family_type', lambda fid: 'normal')(family_id))
+            variant_horizons = np.asarray(getattr(self.primitive_lib, 'variant_horizons', np.full((int(self.action_space.n),), int(self.H), dtype=np.int64)), dtype=np.int64).reshape(-1)
+            horizon = int(variant_horizons[int(ref.flat_index)]) if int(ref.flat_index) < variant_horizons.size else int(self.H)
+            bonus = 0.0
+            if family_type == 'straighten' or family_name.startswith('articulation-'):
+                bonus += 0.55
+            if family_name in ('forward-straight', 'reverse-straight'):
+                bonus += 0.25
+            if primitive_mode == 'terminal' and family_name.startswith('terminal-'):
+                bonus += 0.35
+            score = float(safety_mask[family_id]) * 1.4 + float(mode_weights[family_id]) * 0.4 + float(articulation_weights[family_id]) * 0.4 + bonus - 0.03 * float(horizon)
+            if best_score is None or score > best_score:
+                best_score = score
+                best_family = int(family_id)
+        return int(best_family)
 
     def _canonical_state_to_world(self, state0, canonical_state: np.ndarray):
         from env.vehicle import State
@@ -736,7 +1253,17 @@ class MacroActionWrapper(gym.Wrapper):
             family_id = family_id.item()
 
         family_id = int(family_id)
-        resolved_ref = self._resolve_family_ref(family_id)
+        base_obs_for_mode = self._current_obs_snapshot()
+        mode_debug = dict(self._pending_mode_debug or self._estimate_mode_state(base_obs_for_mode, update_state=True))
+        self._last_mode_debug = dict(mode_debug)
+        self._pending_mode_debug = None
+        primitive_mode = str(mode_debug.get('selected_mode', self._current_primitive_mode))
+        resolved_ref = self._resolve_family_ref(
+            family_id,
+            obs_vec=base_obs_for_mode,
+            primitive_mode=primitive_mode,
+            selection_context=self._variant_selection_context(mode_debug),
+        )
         resolved_debug = self._resolved_variant_debug(resolved_ref)
         primitive_id = int(resolved_ref.flat_index)
         actions = self.primitive_lib.get_actions(primitive_id)
@@ -794,7 +1321,7 @@ class MacroActionWrapper(gym.Wrapper):
                 used_prefix_steps = None
                 used_prefix_source = None
         elif self._action_mask_mode == 'soft_ray':
-            auto_prefix_steps, auto_prefix_source = self._compute_soft_auto_prefix(family_id)
+            auto_prefix_steps, auto_prefix_source = self._compute_soft_auto_prefix(family_id, resolved_debug=resolved_debug)
             if auto_prefix_steps is not None:
                 used_prefix_steps = int(auto_prefix_steps)
                 used_prefix_source = str(auto_prefix_source)
@@ -807,6 +1334,21 @@ class MacroActionWrapper(gym.Wrapper):
             info['resolved_variant_id'] = int(resolved_ref.variant_id)
             info['resolved_gamma_bin_id'] = int(resolved_ref.gamma_bin_id)
             info['resolved_mode'] = str(resolved_debug.get('mode', 'normal'))
+            info['selected_mode'] = str(primitive_mode)
+            info['mode_transitioned'] = bool(mode_debug.get('mode_transitioned', False))
+            info['mode_transition_count'] = int(mode_debug.get('mode_transition_count', self._mode_transition_count))
+            info['congestion_score'] = float(mode_debug.get('congestion_score', 0.0))
+            info['valid_action_ratio'] = float(mode_debug.get('valid_action_ratio', 0.0))
+            info['mean_soft_mask'] = float(mode_debug.get('mean_soft_mask', 0.0))
+            info['abs_phi_ratio'] = float(mode_debug.get('abs_phi_ratio', 0.0))
+            info['front_clearance_m'] = float(mode_debug.get('front_clearance', 0.0))
+            info['rear_clearance_m'] = float(mode_debug.get('rear_clearance', 0.0))
+            info['goal_heading_error'] = float(mode_debug.get('goal_heading_error', 0.0))
+            info['front_overlap_ratio'] = float(mode_debug.get('front_overlap', 0.0))
+            info['rear_overlap_ratio'] = float(mode_debug.get('rear_overlap', 0.0))
+            info['all_invalid_fallback_count'] = int(self._all_invalid_fallback_count)
+            if self._last_family_mask is not None and int(family_id) < len(self._last_family_mask):
+                info['selected_action_mask_value'] = float(self._last_family_mask[int(family_id)])
             info['resolved_is_compound'] = bool(resolved_debug.get('is_compound', False))
             info['resolved_switch_index'] = int(resolved_debug.get('switch_index', -1))
             info['resolved_family_name'] = str(resolved_debug.get('family_name', ''))
@@ -822,8 +1364,10 @@ class MacroActionWrapper(gym.Wrapper):
             info['path_to_dest'] = None
             info['status'] = Status.OUTTIME
             info['soft_ray_blocked'] = True
-            self._last_obs = None if last_obs is None else copy.deepcopy(last_obs)
-            return last_obs, 0.0, False, True, info
+            returned_obs = self._augment_observation(last_obs, mode_debug=mode_debug)
+            self._last_base_obs = None if last_obs is None else copy.deepcopy(last_obs)
+            self._last_obs = None if returned_obs is None else copy.deepcopy(returned_obs)
+            return returned_obs, 0.0, False, True, info
 
         for t in range(max_steps):
             # Execute one low-level step
@@ -888,6 +1432,21 @@ class MacroActionWrapper(gym.Wrapper):
         info['resolved_variant_id'] = int(resolved_ref.variant_id)
         info['resolved_gamma_bin_id'] = int(resolved_ref.gamma_bin_id)
         info['resolved_mode'] = str(resolved_debug.get('mode', 'normal'))
+        info['selected_mode'] = str(primitive_mode)
+        info['mode_transitioned'] = bool(mode_debug.get('mode_transitioned', False))
+        info['mode_transition_count'] = int(mode_debug.get('mode_transition_count', self._mode_transition_count))
+        info['congestion_score'] = float(mode_debug.get('congestion_score', 0.0))
+        info['valid_action_ratio'] = float(mode_debug.get('valid_action_ratio', 0.0))
+        info['mean_soft_mask'] = float(mode_debug.get('mean_soft_mask', 0.0))
+        info['abs_phi_ratio'] = float(mode_debug.get('abs_phi_ratio', 0.0))
+        info['front_clearance_m'] = float(mode_debug.get('front_clearance', 0.0))
+        info['rear_clearance_m'] = float(mode_debug.get('rear_clearance', 0.0))
+        info['goal_heading_error'] = float(mode_debug.get('goal_heading_error', 0.0))
+        info['front_overlap_ratio'] = float(mode_debug.get('front_overlap', 0.0))
+        info['rear_overlap_ratio'] = float(mode_debug.get('rear_overlap', 0.0))
+        info['all_invalid_fallback_count'] = int(self._all_invalid_fallback_count)
+        if self._last_family_mask is not None and int(family_id) < len(self._last_family_mask):
+            info['selected_action_mask_value'] = float(self._last_family_mask[int(family_id)])
         info['resolved_is_compound'] = bool(resolved_debug.get('is_compound', False))
         info['resolved_switch_index'] = int(resolved_debug.get('switch_index', -1))
         info['resolved_family_name'] = str(resolved_debug.get('family_name', ''))
@@ -915,14 +1474,18 @@ class MacroActionWrapper(gym.Wrapper):
         info['takeover_active'] = False
         info['takeover_triggered'] = False
         info['path_to_dest'] = None
-        self._last_obs = None if last_obs is None else copy.deepcopy(last_obs)
+        progress_metrics = self._update_progress_tracking()
+        info['terminal_mean_overlap'] = float(progress_metrics.get('mean_overlap', 0.0))
+        returned_obs = self._augment_observation(last_obs, mode_debug=mode_debug)
+        self._last_base_obs = None if last_obs is None else copy.deepcopy(last_obs)
+        self._last_obs = None if returned_obs is None else copy.deepcopy(returned_obs)
 
         # Return consistent with Gymnasium
-        return last_obs, total_reward, terminated, truncated, info
+        return returned_obs, total_reward, terminated, truncated, info
 
     def _parse_goal_repr_from_obs(self, obs_vec: np.ndarray) -> dict:
         """Decode goal representation in ego frame from CarParking observation vector."""
-        obs_vec = np.asarray(obs_vec, dtype=np.float64).reshape(-1)
+        obs_vec = np.asarray(self._extract_base_obs(obs_vec), dtype=np.float64).reshape(-1)
         try:
             from configs import LIDAR_NUM, MAX_DIST_TO_DEST
 
@@ -935,6 +1498,13 @@ class MacroActionWrapper(gym.Wrapper):
         # target_obs layout (CarParking.step):
         # [dist_norm, cos(rel_angle), sin(rel_angle), cos(rel_heading), sin(rel_heading), cos(art), sin(art)]
         target = obs_vec[lidar_n : lidar_n + 7]
+        if target.size < 7:
+            return {
+                "dist": float(max_dist),
+                "rel_angle": 0.0,
+                "rel_heading": 0.0,
+                "articulation": 0.0,
+            }
         dist = float(target[0]) * max_dist
         rel_angle = math.atan2(float(target[2]), float(target[1]))
         rel_heading = math.atan2(float(target[4]), float(target[3]))
@@ -1420,6 +1990,11 @@ class MacroActionWrapper(gym.Wrapper):
 
     def get_action_mask(self, obs_vec=None):
         """Return a family-level action mask with shape [family_count]."""
+        base_obs = self._extract_base_obs(obs_vec)
+        mode_debug = self._estimate_mode_state(base_obs, update_state=True)
+        self._last_mode_debug = dict(mode_debug)
+        self._pending_mode_debug = dict(mode_debug)
+        primitive_mode = str(mode_debug.get('selected_mode', self._current_primitive_mode))
         requested_mode = getattr(self, "_action_mask_mode", "hybrid")
         soft_ray_available = not (
             requested_mode == "soft_ray"
@@ -1441,41 +2016,74 @@ class MacroActionWrapper(gym.Wrapper):
             return self._action_mask_cached.copy()
 
         if effective_mode == "soft_ray":
-            mask = self._compute_soft_ray_action_mask(obs_vec)
-            self._action_mask_cached = mask.copy()
-            self._action_mask_calls_since_update = 0
-            return mask
+            safety_mask = self._compute_soft_ray_action_mask(base_obs, primitive_mode=primitive_mode, mode_debug=mode_debug)
+        else:
+            safety_mask = self._compute_hard_action_mask(base_obs, mode_override=effective_mode, primitive_mode=primitive_mode, mode_debug=mode_debug)
 
-        mask = self._compute_hard_action_mask(obs_vec, mode_override=effective_mode)
+        safety_mask = np.asarray(safety_mask, dtype=np.float32).reshape(-1)
+        mode_weights = self._mode_preference_weights(primitive_mode)
+        articulation_weights = self._articulation_preference_weights(primitive_mode, obs_vec=base_obs)
+        mask = np.clip(safety_mask * mode_weights * articulation_weights, float(self._soft_mask_small_value), 1.0).astype(np.float32)
+        fallback_family_id = None
+        if self._all_invalid_fallback_enabled and np.all(mask <= float(self._soft_mask_eps) + 1e-6):
+            fallback_family_id = self._choose_all_invalid_fallback(primitive_mode, safety_mask, mode_weights, articulation_weights, obs_vec=base_obs)
+            mask = np.full_like(mask, float(self._soft_mask_small_value), dtype=np.float32)
+            mask[int(fallback_family_id)] = 1.0
+            self._all_invalid_fallback_count += 1
+
+        self._action_mask_cached = mask.copy()
+        self._action_mask_calls_since_update = 0
+        self._last_family_mask = mask.copy()
+        final_debug = dict(self._last_action_mask_debug or {})
         if soft_fallback is not None:
-            self._last_action_mask_debug = {
-                "mode": "soft_ray",
-                "ray_safety_available": False,
-                "fallback": soft_fallback,
-                "effective_mode": effective_mode,
-                "hard_feasible_count": int(np.count_nonzero(mask)),
+            final_debug["fallback"] = soft_fallback
+            final_debug["effective_mode"] = effective_mode
+        final_debug.update(
+            {
+                "selected_mode": str(primitive_mode),
+                "mode_transitioned": bool(mode_debug.get('mode_transitioned', False)),
+                "mode_transition_count": int(mode_debug.get('mode_transition_count', self._mode_transition_count)),
+                "congestion_score": float(mode_debug.get('congestion_score', 0.0)),
+                "valid_action_ratio": float(mode_debug.get('valid_action_ratio', 0.0)),
+                "mean_soft_mask": float(mode_debug.get('mean_soft_mask', 0.0)),
+                "abs_phi_ratio": float(mode_debug.get('abs_phi_ratio', 0.0)),
+                "front_clearance_m": float(mode_debug.get('front_clearance', 0.0)),
+                "rear_clearance_m": float(mode_debug.get('rear_clearance', 0.0)),
+                "final_mask_min": float(np.min(mask)) if mask.size else 0.0,
+                "final_mask_max": float(np.max(mask)) if mask.size else 0.0,
+                "final_mask_mean": float(np.mean(mask)) if mask.size else 0.0,
+                "effective_action_count": int(np.count_nonzero(mask > max(float(self._soft_mask_eps), 0.05))),
+                "all_invalid_fallback": fallback_family_id is not None,
+                "all_invalid_fallback_family_id": int(fallback_family_id) if fallback_family_id is not None else None,
+                "all_invalid_fallback_count": int(self._all_invalid_fallback_count),
             }
+        )
+        self._last_action_mask_debug = final_debug
         return mask
 
-    def _compute_hard_action_mask(self, obs_vec=None, mode_override=None):
+    def _compute_hard_action_mask(self, obs_vec=None, mode_override=None, primitive_mode=None, mode_debug=None, write_debug: bool = True, return_debug: bool = False):
         n_actions = self.action_space.n
         mask = np.zeros(n_actions, dtype=np.int8)
         self._soft_prefix_family_steps = {}
         self._family_resolution_cache = {}
+        base_obs = self._extract_base_obs(obs_vec)
+        selection_context = self._variant_selection_context(mode_debug)
         for family_id in range(n_actions):
-            ref = self._resolve_family_ref(family_id, obs_vec=obs_vec)
+            ref = self._resolve_family_ref(family_id, obs_vec=base_obs, primitive_mode=primitive_mode, selection_context=selection_context)
             mask[int(family_id)] = 1 if self._variant_rollout_is_safe(int(ref.flat_index)) else 0
+            variant_horizons = np.asarray(getattr(self.primitive_lib, 'variant_horizons', np.full((n_actions,), int(self.H), dtype=np.int64)), dtype=np.int64).reshape(-1)
+            horizon = int(variant_horizons[int(ref.flat_index)]) if int(ref.flat_index) < variant_horizons.size else int(self.H)
+            self._soft_prefix_family_steps[int(family_id)] = int(horizon if mask[int(family_id)] > 0 else 0)
 
-        if mask.sum() == 0:
-            mask[:] = 1
-
-        self._action_mask_cached = mask.copy()
-        self._action_mask_calls_since_update = 0
-        self._last_action_mask_debug = {
+        debug = {
             "mode": str(mode_override or getattr(self, "_action_mask_mode", "hybrid")),
+            "selected_mode": str(self._mode_name(primitive_mode)),
             "family_feasible_count": int(np.count_nonzero(mask)),
         }
-
+        if write_debug:
+            self._last_action_mask_debug = debug
+        if return_debug:
+            return mask, debug
         return mask
 
     def reset(self, **kwargs):
@@ -1497,8 +2105,22 @@ class MacroActionWrapper(gym.Wrapper):
         self._action_mask_calls_since_update = 0
         self._family_resolution_cache = {}
         if isinstance(out, tuple) and len(out) > 0:
-            self._last_obs = copy.deepcopy(out[0])
+            base_obs = copy.deepcopy(out[0])
+            self._last_base_obs = copy.deepcopy(base_obs)
+            self._progress_history.clear()
+            self._last_progress_metrics = None
+            self._no_progress_steps = 0
+            self._mode_transition_count = 0
+            self._mode_hold_steps = 0
+            self._current_primitive_mode = str(self._primitive_mode_names[0])
+            initial_mode_debug = self._estimate_mode_state(base_obs, update_state=False)
+            self._last_mode_debug = dict(initial_mode_debug)
+            self._pending_mode_debug = None
+            self._last_obs = self._augment_observation(base_obs, mode_debug=initial_mode_debug)
+            self._update_progress_tracking()
+            out = (self._last_obs, out[1]) if len(out) > 1 else (self._last_obs,)
         else:
+            self._last_base_obs = None
             self._last_obs = None
         return out
 
