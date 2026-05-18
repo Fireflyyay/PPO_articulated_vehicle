@@ -11,7 +11,7 @@ from configs import (
 from env.parking_map_normal import ParkingMapNormal
 
 
-@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+@pytest.mark.parametrize("level", ["Warmup", "Normal", "Complex", "Extrem"])
 def test_navigation_scene_pool_preserves_scene_filter_constraints(level):
     parking_map = ParkingMapNormal(level, enable_scene_pool=True, scene_pool_size=3)
     cfg = BLOCK_MIXING_PLANT_CONFIG[level]

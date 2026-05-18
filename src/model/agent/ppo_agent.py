@@ -263,6 +263,10 @@ class PPOAgent(AgentBase):
                 lambda_mask = float(getattr(self.configs, "soft_mask_logit_lambda", 1.0))
                 small_value = float(getattr(self.configs, "soft_mask_small_value", 1e-8))
                 masked_logits = logits + lambda_mask * torch.log(torch.clamp(soft_mask, min=small_value))
+                invalid = soft_mask <= 0.0
+                if torch.any(invalid):
+                    masked_logits = masked_logits.clone()
+                    masked_logits[invalid] = -1e10
             else:
                 mask = mask.to(dtype=torch.bool)
                 masked_logits = logits.clone()
@@ -650,7 +654,7 @@ class PPOAgent(AgentBase):
             except TypeError:
                 checkpoint = torch.load(path, map_location=self.device)
             except Exception:
-                checkpoint = torch.load(path, map_location=self.device)
+                checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
             allowed_names = None
             if load_params_only:

@@ -80,7 +80,24 @@ def _load_checkpoint(path: str, map_location: str = 'cpu'):
     try:
         return torch.load(path, map_location=map_location, weights_only=True)
     except Exception:
-        return torch.load(path, map_location=map_location)
+        return torch.load(path, map_location=map_location, weights_only=False)
+
+
+def _find_latest_checkpoint(default_path: str) -> Optional[str]:
+    search_roots = [
+        os.path.abspath(os.path.join(os.path.dirname(__file__), '../log/exp')),
+        os.path.abspath(os.path.join(os.path.dirname(__file__), '../ckpt')),
+    ]
+    candidates = []
+    for root in search_roots:
+        if not os.path.exists(root):
+            continue
+        for candidate in glob.glob(os.path.join(root, '**', 'PPO_best.pt'), recursive=True):
+            candidates.append(candidate)
+    if not candidates:
+        return default_path if os.path.exists(default_path) else None
+    candidates.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+    return candidates[0]
 
 
 def _extract_checkpoint_configs(checkpoint: object) -> dict:
@@ -112,73 +129,13 @@ def _infer_primitive_size(npz_path: str) -> Optional[int]:
     return None
 
 
-def _resolve_adaptive_library_from_checkpoint_dir(checkpoint_path: str) -> Optional[str]:
-    """Resolve active adaptive primitive library next to checkpoint if present."""
-    ckpt_dir = os.path.dirname(os.path.abspath(checkpoint_path))
-    active_path = os.path.join(ckpt_dir, 'adaptive_primitives', 'active_version.json')
-    if not os.path.exists(active_path):
-        return None
-    try:
-        import json
-
-        with open(active_path, 'r', encoding='utf-8') as f:
-            obj = json.load(f)
-        version_id = str(obj.get('version_id', '')).strip()
-        if not version_id:
-            return None
-        candidate = os.path.join(ckpt_dir, 'adaptive_primitives', 'versions', f'primitives_v{version_id}.npz')
-        if os.path.exists(candidate):
-            return candidate
-    except Exception:
-        return None
-    return None
-
-
-def _find_matching_primitive_library(src_dir: str, expected_size: int, preferred_dir: Optional[str] = None) -> Optional[str]:
-    """Find a primitive library whose action count matches checkpoint actor output size."""
-    candidates = []
-
-    if preferred_dir and os.path.exists(preferred_dir):
-        for p in glob.glob(os.path.join(preferred_dir, '**', '*.npz'), recursive=True):
-            candidates.append(p)
-
-    # Default configured library first
-    cfg_lib = os.path.normpath(os.path.join(src_dir, cfg.PRIMITIVE_LIBRARY_PATH))
-    if os.path.exists(cfg_lib):
-        candidates.append(cfg_lib)
-    elif os.path.exists(cfg.PRIMITIVE_LIBRARY_PATH):
-        candidates.append(cfg.PRIMITIVE_LIBRARY_PATH)
-
-    # Search experiment outputs where adaptive versions are stored.
-    for p in glob.glob(os.path.join(src_dir, 'log', 'exp', '**', 'adaptive_primitives', 'versions', '*.npz'), recursive=True):
-        candidates.append(p)
-
-    # Deduplicate while keeping order
-    seen = set()
-    uniq = []
-    for p in candidates:
-        ap = os.path.abspath(p)
-        if ap in seen:
-            continue
-        seen.add(ap)
-        uniq.append(ap)
-
-    matched = []
-    for p in uniq:
-        n = _infer_primitive_size(p)
-        if n is None:
-            continue
-        if int(n) == int(expected_size):
-            try:
-                mtime = os.path.getmtime(p)
-            except Exception:
-                mtime = 0.0
-            matched.append((mtime, p))
-
-    if not matched:
-        return None
-    matched.sort(key=lambda x: x[0], reverse=True)
-    return matched[0][1]
+def _resolve_current_primitive_library(src_dir: str) -> str:
+    candidate = os.path.normpath(os.path.join(src_dir, cfg.PRIMITIVE_LIBRARY_PATH))
+    if os.path.exists(candidate):
+        return candidate
+    if os.path.exists(cfg.PRIMITIVE_LIBRARY_PATH):
+        return cfg.PRIMITIVE_LIBRARY_PATH
+    raise FileNotFoundError(f"Current primitive library not found: {cfg.PRIMITIVE_LIBRARY_PATH}")
 
 
 def _infer_actor_output_size(checkpoint: object) -> Optional[int]:
@@ -272,7 +229,7 @@ def plot_vehicle(ax, state, alpha=0.3, is_final=False):
     ax.plot(x, y, color=color_rear, alpha=alpha, linewidth=1)
     ax.fill(x, y, color=color_rear, alpha=alpha/2)
 
-def visualize(episodes: int = 10, level: Optional[str] = None):
+def visualize(episodes: int = 10, level: Optional[str] = None, checkpoint_path: Optional[str] = None, primitive_library_path: Optional[str] = None):
     from env.car_parking_base import CarParking
     from model.agent.ppo_agent import PPOAgent as PPO
 
@@ -281,7 +238,8 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
 
     # Locate checkpoint
     default_ckpt = os.path.abspath(os.path.join(os.path.dirname(__file__), '../ckpt/PPO_best.pt'))
-    checkpoint_path = _find_checkpoint(default_ckpt)
+    if checkpoint_path is None:
+        checkpoint_path = _find_latest_checkpoint(default_ckpt)
     if checkpoint_path is None:
         print(f"No checkpoint found under {os.path.dirname(default_ckpt)}. Exiting.")
         return
@@ -304,22 +262,7 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
 
         src_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
-        preferred_lib = _resolve_adaptive_library_from_checkpoint_dir(checkpoint_path)
-        expected_action_dim = int(ckpt_cfg.get('action_dim', inferred_actor_out if inferred_actor_out is not None else 0))
-
-        lib_full_path = None
-        if preferred_lib is not None:
-            if expected_action_dim <= 0 or _infer_primitive_size(preferred_lib) == expected_action_dim:
-                lib_full_path = preferred_lib
-
-        if lib_full_path is None and expected_action_dim > 0:
-            preferred_dir = os.path.dirname(preferred_lib) if preferred_lib is not None else None
-            lib_full_path = _find_matching_primitive_library(src_dir, expected_action_dim, preferred_dir=preferred_dir)
-
-        if lib_full_path is None:
-            lib_full_path = os.path.normpath(os.path.join(src_dir, cfg.PRIMITIVE_LIBRARY_PATH))
-            if not os.path.exists(lib_full_path) and os.path.exists(cfg.PRIMITIVE_LIBRARY_PATH):
-                lib_full_path = cfg.PRIMITIVE_LIBRARY_PATH
+        lib_full_path = os.path.abspath(primitive_library_path) if primitive_library_path is not None else _resolve_current_primitive_library(src_dir)
 
         primitive_lib = load_library(lib_full_path)
         primitive_h = getattr(primitive_lib, 'horizon', cfg.PRIMITIVE_H)
@@ -522,6 +465,13 @@ def visualize(episodes: int = 10, level: Optional[str] = None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--episodes', type=int, default=10)
-    parser.add_argument('--level', type=str, default=None, choices=["Normal", "Complex", "Extrem"])
+    parser.add_argument('--level', type=str, default=None, choices=["Warmup", "Normal", "Complex", "Extrem"])
+    parser.add_argument('--checkpoint', type=str, default=None, help='Optional checkpoint path to visualize')
+    parser.add_argument('--primitive-library', type=str, default=None, help='Optional primitive library npz path')
     args = parser.parse_args()
-    visualize(episodes=args.episodes, level=args.level)
+    visualize(
+        episodes=args.episodes,
+        level=args.level,
+        checkpoint_path=args.checkpoint,
+        primitive_library_path=args.primitive_library,
+    )

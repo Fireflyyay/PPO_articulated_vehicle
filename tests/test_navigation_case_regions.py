@@ -17,7 +17,7 @@ def _world_to_cell(scene_meta: dict, pose_xyz) -> tuple[int, int]:
     return gx, gy
 
 
-@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+@pytest.mark.parametrize("level", ["Warmup", "Normal", "Complex", "Extrem"])
 def test_navigation_case_block_scene_metadata_matches_config(level):
     start, dest, obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
 
@@ -43,7 +43,7 @@ def test_navigation_case_block_scene_metadata_matches_config(level):
     assert occupancy[dy, dx] == 0
 
 
-@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+@pytest.mark.parametrize("level", ["Warmup", "Normal", "Complex", "Extrem"])
 def test_navigation_case_scene_metrics_respect_block_filter_gate(level):
     _start, _dest, _obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
     metrics = scene_meta["scene_metrics"]
@@ -55,7 +55,7 @@ def test_navigation_case_scene_metrics_respect_block_filter_gate(level):
     assert float(metrics["min_endpoint_clearance"]) >= float(cfg["scene_metric_min_endpoint_clearance"]) - 1e-6
 
 
-@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+@pytest.mark.parametrize("level", ["Warmup", "Normal", "Complex", "Extrem"])
 def test_navigation_case_parking_bays_have_access_to_free_corridor(level):
     _start, _dest, _obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
     occupancy = scene_meta["occupancy_grid"]
@@ -71,7 +71,7 @@ def test_navigation_case_parking_bays_have_access_to_free_corridor(level):
             assert occupancy[ay, ax] == 0
 
 
-@pytest.mark.parametrize("level", ["Normal", "Complex", "Extrem"])
+@pytest.mark.parametrize("level", ["Warmup", "Normal", "Complex", "Extrem"])
 def test_navigation_case_parking_bays_keep_far_side_wall_intact(level):
     _start, _dest, _obstacles, scene_meta = generate_navigation_case(level, return_regions=True)
     occupancy = scene_meta["occupancy_grid"]

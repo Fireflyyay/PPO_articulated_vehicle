@@ -3,7 +3,7 @@
 Run:
   python src/debug/check_navigation_difficulty.py --n 200
 
-It samples scenes for each level (Normal/Complex/Extrem) using
+It samples scenes for each level (Warmup/Normal/Complex/Extrem) using
 `generate_navigation_case(level)` and asserts:
 - distance constraints (meters)
 - heading-difference constraints (degrees)
@@ -52,7 +52,7 @@ def main():
     np.random.seed(int(args.seed))
     pyrandom.seed(int(args.seed))
 
-    rng_levels = ["Normal", "Complex", "Extrem"]
+    rng_levels = ["Warmup", "Normal", "Complex", "Extrem"]
 
     for level in rng_levels:
         (dmin, dmax), (amin, amax) = _constraints(level)

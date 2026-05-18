@@ -16,6 +16,8 @@ class Status(Enum):
     COLLIDED = 3
     OUTBOUND = 4
     OUTTIME = 5
+    STUCK = 6
+    BLOCKED_ACTION = 7
 
 
 class State:

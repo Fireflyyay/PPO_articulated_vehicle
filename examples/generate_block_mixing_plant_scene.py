@@ -25,16 +25,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Generate block-based mixing plant navigation scenes.")
     parser.add_argument(
         "--difficulty",
-        choices=["Normal", "Complex", "Extrem", "All"],
+        choices=["Warmup", "Normal", "Complex", "Extrem", "All"],
         default="All",
-        help="Which difficulty to render. Use All to generate all three levels.",
+        help="Which difficulty to render. Use All to generate all levels.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for deterministic scene generation.")
     parser.add_argument("--output", type=str, default=None, help="Optional explicit output path. Only valid for a single difficulty.")
     parser.add_argument("--show-parking-bays", action="store_true", help="Overlay parking bay outlines for debugging.")
     args = parser.parse_args()
 
-    difficulties = [args.difficulty] if args.difficulty != "All" else ["Normal", "Complex", "Extrem"]
+    difficulties = [args.difficulty] if args.difficulty != "All" else ["Warmup", "Normal", "Complex", "Extrem"]
     if args.output is not None and len(difficulties) != 1:
         raise ValueError("--output can only be used when a single difficulty is selected")
 
@@ -43,10 +43,10 @@ def main() -> None:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         scene = generate_block_mixing_plant_scene(difficulty=difficulty, seed=int(args.seed))
-        start, dest, nav_meta = sample_navigation_case_from_scene(scene, difficulty, seed=int(args.seed))
+        start, dest, nav_meta = sample_navigation_case_from_scene(scene, difficulty, seed=None)
         render_scene(
             scene,
-            show_parking_bays=True,
+            show_parking_bays=bool(args.show_parking_bays),
             start_pose=start,
             dest_pose=dest,
             start_bay_index=int(nav_meta.get("start_bay_index", -1)),

@@ -76,10 +76,10 @@ class CarParking(gym.Env):
         self._map_cache = {}
 
         if bool(NAVIGATION_PRELOAD_ALL_LEVEL_MAPS):
-            for cache_level in ['Normal', 'Complex', 'Extrem']:
+            for cache_level in list(NAVIGATION_DIFFICULTY_LEVELS):
                 self._get_or_create_map(cache_level)
 
-        if self.level in ['Normal', 'Complex', 'Extrem']:
+        if self.level in list(NAVIGATION_DIFFICULTY_LEVELS):
             self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
         #     self.map = ParkingMapDLP()
@@ -108,6 +108,13 @@ class CarParking(gym.Env):
         self.accum_turn_count = 0
         self.accum_turn_degree = 0.0
         self.accum_dist = 0.0
+
+        # ---- Diagnostic: episode-level tracking (A-class, no behaviour change) ----
+        self._diag_min_goal_dist = float('inf')
+        self._diag_max_front_overlap = 0.0
+        self._diag_min_heading_error = float('inf')
+        self._diag_step_count = 0
+        # ---- End diagnostic ----
 
         self.action_space = spaces.Box(
             np.array([VALID_STEER[0], VALID_SPEED[0]]).astype(np.float32),
@@ -157,7 +164,7 @@ class CarParking(gym.Env):
             self.map = self._map_cache[self.level]
             return
         self.level = level
-        if self.level in ['Normal', 'Complex', 'Extrem',]:
+        if self.level in list(NAVIGATION_DIFFICULTY_LEVELS):
             self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
         #     self.map = ParkingMapDLP()
@@ -182,6 +189,13 @@ class CarParking(gym.Env):
         self.accum_turn_count = 0
         self.accum_turn_degree = 0.0
         self.accum_dist = 0.0
+
+        # ---- Diagnostic: reset episode-level tracking (A-class) ----
+        self._diag_min_goal_dist = float('inf')
+        self._diag_max_front_overlap = 0.0
+        self._diag_min_heading_error = float('inf')
+        self._diag_step_count = 0
+        # ---- End diagnostic ----
 
         if level is not None:
             self.set_level(level)
@@ -343,9 +357,27 @@ class CarParking(gym.Env):
 
         obs = self._build_observation()
 
+        # ---- Diagnostic: update episode-level tracking (A-class) ----
+        self._diag_step_count += 1
+        # ---- End diagnostic ----
+
         # calculate reward (HOPE-style shaping)
         reward, done, info = self.get_reward(action, prev_state=prev_state)
         self.reward = reward
+
+        # ---- Diagnostic: update episode-best metrics from terminal state (A-class) ----
+        if info is not None:
+            tm = info
+            dist = float(tm.get('dist_to_dest', float('inf')))
+            overlap = float(tm.get('front_overlap', 0.0))
+            heading_err = float(tm.get('heading_error', float('inf')))
+            if dist < self._diag_min_goal_dist:
+                self._diag_min_goal_dist = dist
+            if overlap > self._diag_max_front_overlap:
+                self._diag_max_front_overlap = overlap
+            if heading_err < self._diag_min_heading_error:
+                self._diag_min_heading_error = heading_err
+        # ---- End diagnostic ----
 
         terminated = False
         truncated = False
@@ -415,6 +447,37 @@ class CarParking(gym.Env):
         t = max(0.0, min(1.0, t))
         return float(y0 + t * (y1 - y0))
 
+    def _guidance_arc_progress(self, state: State) -> Optional[float]:
+        """Project state to coarse guidance path and return arc-length progress."""
+        guide = self.global_guidance
+        if guide is None:
+            return None
+        pts = getattr(guide, 'path_points_world', None)
+        s_vals = getattr(guide, 'path_s', None)
+        if pts is None or s_vals is None:
+            return None
+        pts = np.asarray(pts, dtype=np.float64)
+        s_vals = np.asarray(s_vals, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] < 2 or pts.shape[1] != 2:
+            return None
+        if s_vals.ndim != 1 or s_vals.shape[0] != pts.shape[0]:
+            return None
+
+        p = np.array([float(state.loc.x), float(state.loc.y)], dtype=np.float64)
+        seg = pts[1:] - pts[:-1]
+        seg_len2 = np.sum(seg * seg, axis=1)
+        valid = seg_len2 > 1e-12
+        if not np.any(valid):
+            return None
+
+        rel = p - pts[:-1]
+        t = np.zeros((seg.shape[0],), dtype=np.float64)
+        t[valid] = np.clip(np.sum(rel[valid] * seg[valid], axis=1) / seg_len2[valid], 0.0, 1.0)
+        proj = pts[:-1] + seg * t[:, None]
+        d2 = np.sum((proj - p) ** 2, axis=1)
+        best = int(np.argmin(d2))
+        return float(s_vals[best] + t[best] * max(0.0, float(s_vals[best + 1] - s_vals[best])))
+
     def _estimate_angle_gate_distance_ref(self) -> float:
         """Estimate distance reference from corridor size and central open-space size."""
         level = getattr(self, "level", MAP_LEVEL)
@@ -479,11 +542,24 @@ class CarParking(gym.Env):
             time_cost = -1.0
         rs_dist_reward = 0.0
 
-        # Distance progress reward (normalized)
-        dist_diff = float(curr_state.loc.distance(self.map.dest.loc))
-        prev_dist_diff = float(prev_state.loc.distance(self.map.dest.loc))
-        dist_norm_ratio = max(self.initial_dist, 10.0)
-        dist_reward = prev_dist_diff / dist_norm_ratio - dist_diff / dist_norm_ratio
+        # Path-progress reward on coarse A* guidance arc length (normalized).
+        curr_path_progress = self._guidance_arc_progress(curr_state)
+        prev_path_progress = self._guidance_arc_progress(prev_state)
+        if curr_path_progress is not None and prev_path_progress is not None:
+            path_total = 0.0
+            if self.global_guidance is not None and getattr(self.global_guidance, 'path_s', None) is not None:
+                try:
+                    path_total = float(np.asarray(self.global_guidance.path_s, dtype=np.float64)[-1])
+                except Exception:
+                    path_total = 0.0
+            progress_norm_ratio = max(path_total, self.initial_dist, 10.0)
+            dist_reward = (curr_path_progress - prev_path_progress) / progress_norm_ratio
+        else:
+            # Fallback for rare cases where guidance path is unavailable.
+            dist_diff = float(curr_state.loc.distance(self.map.dest.loc))
+            prev_dist_diff = float(prev_state.loc.distance(self.map.dest.loc))
+            dist_norm_ratio = max(self.initial_dist, 10.0)
+            dist_reward = prev_dist_diff / dist_norm_ratio - dist_diff / dist_norm_ratio
 
         # Heading alignment progress reward (optional; keep weight at 0 by default)
         angle_diff = self._get_angle_diff(curr_state.heading, self.map.dest.heading)
@@ -620,6 +696,12 @@ class CarParking(gym.Env):
         info['path_to_dest'] = None
         info['collision_part'] = collision_part
         info.update(terminal_metrics)
+        # ---- Diagnostic: attach episode-best values to every step's info (A-class) ----
+        info['diag_ep_min_goal_dist'] = float(self._diag_min_goal_dist)
+        info['diag_ep_max_front_overlap'] = float(self._diag_max_front_overlap)
+        info['diag_ep_min_heading_error'] = float(self._diag_min_heading_error)
+        info['diag_ep_step_count'] = int(self._diag_step_count)
+        # ---- End diagnostic ----
 
         return reward, done, info
 

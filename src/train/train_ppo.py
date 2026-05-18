@@ -17,6 +17,7 @@ matplotlib.use('Agg') # Use non-interactive backend
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.tensorboard import SummaryWriter
+import json
 
 import configs as cfg
 from train.lr_schedule import build_scaled_learning_rates, compute_post_expand_restore_scale
@@ -72,6 +73,65 @@ def _to_scalar(value, default: float = 0.0) -> float:
     except Exception:
         pass
     return float(default)
+
+def _write_episode_jsonl(jsonl_path: str, episode_idx: int, ep_infos: list, total_reward: float, step_num: int, scene_level: str):
+    """Append one JSON line summarizing episode-level diagnostics (A-class, no behaviour change)."""
+    if jsonl_path is None or ep_infos is None or len(ep_infos) == 0:
+        return
+    try:
+        last_info = ep_infos[-1] if isinstance(ep_infos[-1], dict) else {}
+        status_name = str(getattr(last_info.get('status', None), 'name', str(last_info.get('status', 'UNKNOWN'))))
+
+        # episode-best metrics from base env tracking
+        diag_min_goal = _to_scalar(last_info.get('diag_ep_min_goal_dist', float('nan')), float('nan'))
+        diag_max_overlap = _to_scalar(last_info.get('diag_ep_max_front_overlap', float('nan')), float('nan'))
+        diag_min_heading = _to_scalar(last_info.get('diag_ep_min_heading_error', float('nan')), float('nan'))
+
+        # mode ratios
+        selected_modes = [str(info.get('selected_mode', '')) for info in ep_infos if isinstance(info, dict)]
+        mode_total = float(max(1, len(selected_modes)))
+        mode_ratios = {}
+        for mode_name in ('normal', 'narrow_escape', 'terminal'):
+            mode_ratios[mode_name] = float(sum(1 for m in selected_modes if str(m) == mode_name)) / mode_total
+
+        # mask stats
+        valid_ratios = [_to_scalar(info.get('valid_action_ratio', 0.0), 0.0) for info in ep_infos if isinstance(info, dict)]
+        blocked_rates = [1.0 if isinstance(info, dict) and bool(info.get('soft_ray_blocked', False)) else 0.0 for info in ep_infos]
+
+        # stuck snapshot if stuck
+        stuck_snapshot = None
+        if status_name == 'STUCK':
+            stuck_keys = [k for k in last_info.keys() if k.startswith('diag_stuck_')]
+            if stuck_keys:
+                stuck_snapshot = {k: last_info[k] for k in stuck_keys}
+
+        # family selection histogram
+        family_ids = [int(info.get('family_id', -1)) for info in ep_infos if isinstance(info, dict) and info.get('family_id') is not None]
+        family_hist = {}
+        for fid in family_ids:
+            family_hist[str(fid)] = family_hist.get(str(fid), 0) + 1
+
+        record = {
+            'episode': int(episode_idx),
+            'scene_level': str(scene_level),
+            'status': status_name,
+            'total_reward': float(total_reward),
+            'step_num': int(step_num),
+            'diag_min_goal_dist': diag_min_goal,
+            'diag_max_front_overlap': diag_max_overlap,
+            'diag_min_heading_error': diag_min_heading,
+            'mode_ratios': mode_ratios,
+            'avg_valid_action_ratio': _safe_mean(valid_ratios),
+            'avg_soft_ray_blocked_rate': _safe_mean(blocked_rates),
+            'family_select_hist': family_hist,
+            'stuck_snapshot': stuck_snapshot,
+            'collision_part': str(last_info.get('collision_part', '')),
+        }
+        os.makedirs(os.path.dirname(jsonl_path), exist_ok=True)
+        with open(jsonl_path, 'a') as f:
+            f.write(json.dumps(record, default=str) + '\n')
+    except Exception:
+        pass  # never let logging crash training
 def _episode_info_scalars(ep_infos, key: str):
     vals = []
     for info in ep_infos:
@@ -96,11 +156,15 @@ def _log_motion_primitive_episode_runtime(writer, episode_idx: int, ep_infos: li
     last_info = ep_infos[-1] if isinstance(ep_infos[-1], dict) else {}
     last_status = last_info.get('status', None)
     collision_part = str(last_info.get('collision_part', '')) if last_info.get('collision_part', None) is not None else ''
+    terminal_metrics_valid = bool(last_info.get('terminal_metrics_valid', False))
+    mode_to_id = {str(name): idx for idx, name in enumerate(mode_names)}
 
     writer.add_scalar("primitive_mode/transition_count", _to_scalar(last_info.get('mode_transition_count', 0.0), 0.0), episode_idx)
     writer.add_scalar("mask/selected_action_mask_value_mean", _safe_mean(_episode_info_scalars(ep_infos, 'selected_action_mask_value')), episode_idx)
     writer.add_scalar("mask/valid_action_ratio_mean", _safe_mean(_episode_info_scalars(ep_infos, 'valid_action_ratio')), episode_idx)
     writer.add_scalar("mask/valid_action_count_mean", _safe_mean(_episode_info_scalars(ep_infos, 'effective_action_count')), episode_idx)
+    writer.add_scalar("mask/valid_action_count_after_fallback", _safe_mean(_episode_info_scalars(ep_infos, 'mask_valid_action_count_after_fallback')), episode_idx)
+    writer.add_scalar("mask/valid_action_ratio_after_fallback", _safe_mean(_episode_info_scalars(ep_infos, 'mask_valid_action_ratio_after_fallback')), episode_idx)
     writer.add_scalar(
         "mask/all_invalid_fallback_rate",
         _safe_mean([1.0 if isinstance(info, dict) and info.get('all_invalid_fallback_family_id', None) is not None else 0.0 for info in ep_infos]),
@@ -113,16 +177,61 @@ def _log_motion_primitive_episode_runtime(writer, episode_idx: int, ep_infos: li
     )
     writer.add_scalar("prefix/steps_used_mean", _safe_mean(_episode_info_scalars(ep_infos, 'prefix_steps_used')), episode_idx)
     writer.add_scalar("prefix/soft_safe_steps_mean", _safe_mean(_episode_info_scalars(ep_infos, 'soft_safe_prefix_steps')), episode_idx)
-    writer.add_scalar("terminal/front_overlap", _to_scalar(last_info.get('terminal_front_overlap', last_info.get('front_overlap', 0.0)), 0.0), episode_idx)
-    writer.add_scalar("terminal/rear_overlap", _to_scalar(last_info.get('terminal_rear_overlap', last_info.get('rear_overlap', 0.0)), 0.0), episode_idx)
-    writer.add_scalar("terminal/mean_overlap", _to_scalar(last_info.get('terminal_mean_overlap', last_info.get('mean_overlap', 0.0)), 0.0), episode_idx)
-    writer.add_scalar("terminal/heading_error_deg", _to_scalar(last_info.get('heading_error_deg', 0.0), 0.0), episode_idx)
-    writer.add_scalar("terminal/dist_to_dest", _to_scalar(last_info.get('dist_to_dest', 0.0), 0.0), episode_idx)
+    writer.add_scalar("terminal/metrics_valid", 1.0 if terminal_metrics_valid else 0.0, episode_idx)
+    if terminal_metrics_valid:
+        writer.add_scalar("terminal/front_overlap", _to_scalar(last_info.get('terminal_front_overlap', last_info.get('front_overlap', 0.0)), 0.0), episode_idx)
+        writer.add_scalar("terminal/rear_overlap", _to_scalar(last_info.get('terminal_rear_overlap', last_info.get('rear_overlap', 0.0)), 0.0), episode_idx)
+        writer.add_scalar("terminal/mean_overlap", _to_scalar(last_info.get('terminal_mean_overlap', last_info.get('mean_overlap', 0.0)), 0.0), episode_idx)
+        writer.add_scalar("terminal/heading_error_deg", _to_scalar(last_info.get('heading_error_deg', 0.0), 0.0), episode_idx)
+        writer.add_scalar("terminal/dist_to_dest", _to_scalar(last_info.get('dist_to_dest', 0.0), 0.0), episode_idx)
+
+    # ---- Diagnostic: episode-best metrics and mask distribution (A-class) ----
+    writer.add_scalar("diag/ep_min_goal_dist", _to_scalar(last_info.get('diag_ep_min_goal_dist', float('nan')), float('nan')), episode_idx)
+    writer.add_scalar("diag/ep_max_front_overlap", _to_scalar(last_info.get('diag_ep_max_front_overlap', float('nan')), float('nan')), episode_idx)
+    writer.add_scalar("diag/ep_min_heading_error", _to_scalar(last_info.get('diag_ep_min_heading_error', float('nan')), float('nan')), episode_idx)
+    writer.add_scalar("diag/ep_step_count", _to_scalar(last_info.get('diag_ep_step_count', 0), 0), episode_idx)
+    mask_debug = ep_infos[-1] if ep_infos else {}
+    if isinstance(mask_debug, dict):
+        for key in ('family_mask_zero_count', 'family_mask_low_count', 'family_mask_mid_count', 'family_mask_high_count'):
+            writer.add_scalar(f"diag/{key}", _to_scalar(mask_debug.get(key, 0), 0), episode_idx)
+    # ---- End diagnostic ----
+
+    writer.add_scalar("planning/zero_prefix_blocked", _safe_mean(_episode_info_scalars(ep_infos, 'planning_zero_prefix_blocked')), episode_idx)
+    writer.add_scalar("planning/consecutive_blocked_actions", _to_scalar(last_info.get('planning_consecutive_blocked_actions', 0), 0.0), episode_idx)
+    writer.add_scalar("planning/all_modes_invalid", _safe_mean(_episode_info_scalars(ep_infos, 'planning_all_modes_invalid')), episode_idx)
+    writer.add_scalar("planning/fallback_to_finer_mode", _safe_mean(_episode_info_scalars(ep_infos, 'planning_fallback_to_finer_mode')), episode_idx)
+    writer.add_scalar("planning/effective_primitive_mode", float(mode_to_id.get(str(last_info.get('planning_effective_primitive_mode', last_info.get('selected_mode', ''))), 0)), episode_idx)
+    writer.add_scalar("planning/selected_action_safe_steps", _safe_mean(_episode_info_scalars(ep_infos, 'planning_selected_action_safe_steps')), episode_idx)
+    writer.add_scalar("planning/min_safe_steps", _safe_mean(_episode_info_scalars(ep_infos, 'planning_min_safe_steps')), episode_idx)
+    writer.add_scalar("planning/max_safe_steps", _safe_mean(_episode_info_scalars(ep_infos, 'planning_max_safe_steps')), episode_idx)
+    writer.add_scalar("planning/mean_safe_steps", _safe_mean(_episode_info_scalars(ep_infos, 'planning_mean_safe_steps')), episode_idx)
+
     writer.add_scalar("failure/collision_front", 1.0 if collision_part == 'front' else 0.0, episode_idx)
     writer.add_scalar("failure/collision_rear", 1.0 if collision_part == 'rear' else 0.0, episode_idx)
     writer.add_scalar("failure/collision_front_and_rear", 1.0 if collision_part == 'front_and_rear' else 0.0, episode_idx)
     writer.add_scalar("failure/outbound", 1.0 if last_status == Status.OUTBOUND else 0.0, episode_idx)
     writer.add_scalar("failure/outtime", 1.0 if last_status == Status.OUTTIME else 0.0, episode_idx)
+    writer.add_scalar("failure/stuck", 1.0 if last_status == Status.STUCK else 0.0, episode_idx)
+
+    # ---- Diagnostic: per-family selection counts (A-class, no behaviour change) ----
+    family_ids = [
+        int(info.get('family_id', -1))
+        for info in ep_infos
+        if isinstance(info, dict) and info.get('family_id') is not None
+    ]
+    if family_ids:
+        unique_families, counts = np.unique(family_ids, return_counts=True)
+        family_hist = np.zeros(max(1, int(getattr(cfg, 'PRIMITIVE_FAMILY_ACTION_DIM', 48))), dtype=np.int64)
+        for fid, cnt in zip(unique_families, counts):
+            if 0 <= int(fid) < family_hist.shape[0]:
+                family_hist[int(fid)] = int(cnt)
+        for fid in range(family_hist.shape[0]):
+            writer.add_scalar(f"diag/family_select_count_{fid:02d}", float(family_hist[fid]), episode_idx)
+        # also log entropy proxy: fraction of families selected at least once
+        selected_families = int(np.count_nonzero(family_hist > 0))
+        writer.add_scalar("diag/family_select_unique_count", float(selected_families), episode_idx)
+        writer.add_scalar("diag/family_select_entropy_proxy", float(selected_families) / float(max(1, family_hist.shape[0])), episode_idx)
+    # ---- End diagnostic ----
 
 
 def _maybe_print_episode_heartbeat(
@@ -512,13 +621,14 @@ class SceneChoose:
 
     def __init__(self) -> None:
         self.scene_types = {
-            0: 'Normal',
-            1: 'Complex',
-            2: 'Extrem',
+            0: 'Warmup',
+            1: 'Normal',
+            2: 'Complex',
+            3: 'Extrem',
         }
 
         # target success rates (can be tuned)
-        self.target_success_rate = np.array([0.95, 0.95, 0.90], dtype=np.float64)
+        self.target_success_rate = np.array([0.98, 0.95, 0.95, 0.90], dtype=np.float64)
 
         # success_record indexed by scene_id
         self.success_record = {sid: [] for sid in self.scene_types.keys()}
@@ -579,13 +689,15 @@ class SceneChoose:
         return float(np.mean(recent)) if len(recent) > 0 else 0.0
 
     def _choose_case_success_band(self):
-        extrem_sid = 2
-        complex_sid = 1
+        extrem_sid = next((sid for sid, name in self.scene_types.items() if name == 'Extrem'), None)
+        complex_sid = next((sid for sid, name in self.scene_types.items() if name == 'Complex'), None)
+        if extrem_sid is None:
+            return None
         extrem_sr = self._recent_success_rate(extrem_sid)
         low, high = self.extrem_success_band
 
         if extrem_sr < low:
-            if np.random.random() < self.extrem_bridge_prob:
+            if complex_sid is not None and np.random.random() < self.extrem_bridge_prob:
                 return int(complex_sid)
             return None
 
@@ -604,6 +716,7 @@ if __name__=="__main__":
     parser.add_argument('--eval_episode', type=int, default=100)
     parser.add_argument('--verbose', type=bool, default=True)
     parser.add_argument('--visualize', type=bool, default=False)
+    parser.add_argument('--exp-tag', type=str, default='baseline', help='Experiment tag for log directory naming (A-class diagnostic)')
     args = parser.parse_args()
 
     verbose = args.verbose
@@ -656,16 +769,18 @@ if __name__=="__main__":
 
     current_time = time.localtime()
     timestamp = time.strftime("%Y%m%d_%H%M%S", current_time)
-    save_path = os.path.join(log_exp_dir, 'ppo_%s/' % timestamp)
+    exp_tag = str(getattr(args, 'exp_tag', 'baseline')).replace('/', '_').replace(' ', '_')
+    save_path = os.path.join(log_exp_dir, f'ppo_{exp_tag}_{timestamp}')
 
     if not os.path.exists(save_path):
         os.makedirs(save_path)
     writer = SummaryWriter(save_path)
     # configs log
-    if os.path.exists('./src/configs.py'):
-        copyfile('./src/configs.py', save_path+'configs.txt')
+    config_src = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'configs.py')
+    if os.path.exists(config_src):
+        copyfile(config_src, os.path.join(save_path, 'configs.txt'))
     elif os.path.exists('./configs.py'):
-        copyfile('./configs.py', save_path+'configs.txt')
+        copyfile('./configs.py', os.path.join(save_path, 'configs.txt'))
 
     # More robust tensorboard command for Python 3.8 environments
     print(f"You can track the training process with:\n  python -m tensorboard --logdir {os.path.abspath(save_path)}\nThen open http://localhost:6006 in your browser.")
@@ -1034,7 +1149,10 @@ if __name__=="__main__":
     progress_heartbeat_steps = max(250, int(parking_agent.agent.configs.batch_size) // 4)
 
     for i in range(args.train_episode):
-        scene_chosen = scene_chooser.choose_case()
+        if i < 5000:
+            scene_chosen = "Warmup"
+        else:
+            scene_chosen = scene_chooser.choose_case()
         obs, _ = env.reset(options={'level': scene_chosen})
         parking_agent.reset()
 
@@ -1178,6 +1296,17 @@ if __name__=="__main__":
             )
             _log_motion_primitive_episode_runtime(writer, i, ep_infos_trace)
 
+        # ---- Diagnostic: write episode JSONL record (A-class) ----
+        _write_episode_jsonl(
+            os.path.join(save_path, 'episodes.jsonl'),
+            i,
+            ep_infos_trace if USE_MOTION_PRIMITIVES else [],
+            total_reward,
+            step_num,
+            str(scene_chosen),
+        )
+        # ---- End diagnostic ----
+
         for type_id, scene_name in scene_chooser.scene_types.items():
             rec = scene_chooser.success_record[int(type_id)]
             if len(rec) > 0:
@@ -1262,7 +1391,6 @@ if __name__=="__main__":
         if adaptive_enabled and EpisodeTrace is not None:
             try:
                 success = 1 if (len(ep_infos_trace) > 0 and ep_infos_trace[-1].get('status', None) == Status.ARRIVED) else 0
-                takeover_used = bool(ep_takeover_used)
                 ep_trace = EpisodeTrace(
                     episode_id=int(ap_trace_next_id),
                     scene_type=str(scene_chosen),

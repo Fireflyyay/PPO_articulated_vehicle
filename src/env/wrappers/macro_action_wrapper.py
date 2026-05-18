@@ -303,6 +303,9 @@ class MacroActionWrapper(gym.Wrapper):
         self._soft_mask_terminal_weight_max = float(SOFT_MASK_TERMINAL_WEIGHT_MAX)
         try:
             from configs import (
+                BLOCKED_ACTION_REWARD,
+                MAX_CONSECUTIVE_BLOCKED_ACTIONS,
+                MIN_SAFE_PREFIX_STEPS,
                 PPO_DYNAMIC_PREFIX_CRITICAL_ACTION_COUNT,
                 PPO_DYNAMIC_PREFIX_CRITICAL_MIN_LIDAR,
                 PPO_DYNAMIC_PREFIX_DENSE_OBS_HIGH,
@@ -315,6 +318,9 @@ class MacroActionWrapper(gym.Wrapper):
                 PPO_DYNAMIC_PREFIX_NARROW_STEPS,
             )
         except Exception:
+            MIN_SAFE_PREFIX_STEPS = 1
+            BLOCKED_ACTION_REWARD = -0.1
+            MAX_CONSECUTIVE_BLOCKED_ACTIONS = 20
             PPO_DYNAMIC_PREFIX_ENABLE = True
             PPO_DYNAMIC_PREFIX_MIN_STEPS = 1
             PPO_DYNAMIC_PREFIX_NARROW_STEPS = 2
@@ -335,11 +341,15 @@ class MacroActionWrapper(gym.Wrapper):
         self._ppo_dynamic_prefix_dense_obs_high = float(PPO_DYNAMIC_PREFIX_DENSE_OBS_HIGH)
         self._ppo_dynamic_prefix_low_action_count = max(1, int(PPO_DYNAMIC_PREFIX_LOW_ACTION_COUNT))
         self._ppo_dynamic_prefix_critical_action_count = max(1, int(PPO_DYNAMIC_PREFIX_CRITICAL_ACTION_COUNT))
+        self._min_safe_prefix_steps = max(1, int(MIN_SAFE_PREFIX_STEPS))
+        self._blocked_action_reward = float(BLOCKED_ACTION_REWARD)
+        self._max_consecutive_blocked_actions = max(1, int(MAX_CONSECUTIVE_BLOCKED_ACTIONS))
         self._primitive_refiner = PrimitiveTrajectoryRefiner() if PrimitiveTrajectoryRefiner is not None else None
         self._planned_action_queue = []
         self._planned_primitive_queue = []
         self._planned_phase_debug_queue = []
         self._planned_cache_source = None
+        self._consecutive_blocked_actions = 0
 
     def _ensure_mask_obstacle_cache(self):
         if self._mask_obstacles_prepared is not None and self._mask_obstacles_bounds is not None:
@@ -523,6 +533,12 @@ class MacroActionWrapper(gym.Wrapper):
         debug["soft_mask_max"] = float(np.max(mask)) if mask.size else 0.0
         debug["soft_mask_mean"] = float(np.mean(mask)) if mask.size else 0.0
         debug["effective_action_count"] = int(np.count_nonzero(mask > max(eps, 0.05)))
+        # ---- Diagnostic: per-family mask value distribution (A-class) ----
+        debug["family_mask_zero_count"] = int(np.sum(mask <= eps))
+        debug["family_mask_low_count"] = int(np.sum((mask > eps) & (mask < 0.10)))
+        debug["family_mask_mid_count"] = int(np.sum((mask >= 0.10) & (mask < 0.50)))
+        debug["family_mask_high_count"] = int(np.sum(mask >= 0.50))
+        # ---- End diagnostic ----
         if write_debug:
             self._last_action_mask_debug = debug
         if return_debug:
@@ -938,6 +954,14 @@ class MacroActionWrapper(gym.Wrapper):
             "rear_overlap": float(goal_metrics["rear_overlap"]),
             "mean_overlap": float(goal_metrics["mean_overlap"]),
             "terminal_triggered": bool(near_goal),
+            # ---- Diagnostic: hypothetical approach / extended-terminal conditions (A-class) ----
+            "diag_would_trigger_approach": bool(
+                float(goal_metrics["dist"]) <= 10.0
+                and float(goal_metrics["dist"]) > 4.0
+                and float(goal_metrics["front_overlap"]) < 0.58
+            ),
+            "diag_would_trigger_terminal_extended": bool(float(goal_metrics["dist"]) <= 8.0),
+            # ---- End diagnostic ----
         }
 
     def _goal_repr_from_env_state(self, obs_vec=None) -> dict:
@@ -1047,13 +1071,40 @@ class MacroActionWrapper(gym.Wrapper):
         except Exception:
             return copy.deepcopy(obs)
 
-    def _compute_soft_auto_prefix(self, family_id: int, resolved_debug=None):
-        safe_prefix_steps = self._soft_prefix_family_steps.get(int(family_id), None)
-        if safe_prefix_steps is None:
-            return None, None
+    def _mode_fallback_candidates(self, primary_mode: str):
+        primary_mode = self._mode_name(primary_mode)
+        unique_modes = []
+        for mode in self._primitive_mode_names:
+            name = self._mode_name(mode)
+            if name not in unique_modes:
+                unique_modes.append(name)
+        if primary_mode not in unique_modes:
+            unique_modes.insert(0, primary_mode)
 
-        primitive_mode = self._mode_name((resolved_debug or {}).get('mode', self._last_mode_debug.get('selected_mode', self._current_primitive_mode)))
+        def _mode_score(mode_name: str) -> float:
+            n = str(mode_name).lower()
+            score = 0.0
+            if any(k in n for k in ("fine", "small", "short", "micro")):
+                score += 3.0
+            if any(k in n for k in ("narrow", "escape")):
+                score += 2.8
+            if any(k in n for k in ("terminal", "align")):
+                score += 2.2
+            if any(k in n for k in ("recover", "recovery", "stuck", "articulation", "straighten")):
+                score += 2.6
+            if "normal" in n or "coarse" in n:
+                score -= 0.4
+            return float(score)
+
+        tail = [m for m in unique_modes if m != primary_mode]
+        tail = sorted(tail, key=lambda m: _mode_score(m), reverse=True)
+        return [primary_mode] + tail
+
+    def _compute_effective_safe_prefix_steps(self, safe_prefix_steps: int, resolved_debug=None, primitive_mode=None):
+        primitive_mode = self._mode_name((resolved_debug or {}).get('mode', primitive_mode or self._last_mode_debug.get('selected_mode', self._current_primitive_mode)))
         prefix_steps = max(0, min(int(self.H), int(safe_prefix_steps)))
+        source = None
+
         if self._ppo_dynamic_prefix_max_steps is not None:
             prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_max_steps))
 
@@ -1070,27 +1121,165 @@ class MacroActionWrapper(gym.Wrapper):
             obs_density = float(debug.get('obs_density', 0.0))
             feasible_count = int(debug.get('effective_action_count', debug.get('family_feasible_count', int(self.action_space.n))))
 
+            # ---- Diagnostic: log context when prefix gets reduced ----
+            _was_positive = prefix_steps > 0
+            _old_prefix = prefix_steps
+            # ---- End diagnostic ----
+
             if (
                 min_lidar <= self._ppo_dynamic_prefix_critical_min_lidar
                 or feasible_count <= self._ppo_dynamic_prefix_critical_action_count
                 or obs_density >= self._ppo_dynamic_prefix_dense_obs_high
             ):
                 prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_min_steps))
+                source = 'soft_ray_auto_critical'
             elif (
                 min_lidar <= self._ppo_dynamic_prefix_narrow_min_lidar
                 or feasible_count <= self._ppo_dynamic_prefix_low_action_count
                 or obs_density >= self._ppo_dynamic_prefix_dense_obs_low
             ):
                 prefix_steps = min(prefix_steps, int(self._ppo_dynamic_prefix_narrow_steps))
+                source = 'soft_ray_auto_narrow'
 
-        if prefix_steps > 0:
-            prefix_steps = max(prefix_steps, min_mode_prefix)
+            # ---- Diagnostic: record if prefix was reduced to zero by dynamic logic ----
+            if _was_positive and prefix_steps <= 0:
+                _diag = {
+                    "diag_prefix_reduced_to_zero": 1,
+                    "diag_prefix_old": _old_prefix,
+                    "diag_prefix_min_lidar": min_lidar,
+                    "diag_prefix_obs_density": obs_density,
+                    "diag_prefix_feasible_count": feasible_count,
+                    "diag_prefix_min_mode": min_mode_prefix,
+                    "diag_prefix_source": str(source),
+                    "diag_prefix_primitive_mode": str(primitive_mode),
+                }
+                self._last_diag_prefix_zero = _diag
+            # ---- End diagnostic ----
+
+        if prefix_steps > 0 and prefix_steps < int(min_mode_prefix):
+            prefix_steps = 0
+            source = 'below_mode_min_prefix'
 
         if prefix_steps <= 0:
-            return 0, 'soft_ray_auto_blocked'
+            return 0, 'soft_ray_auto_blocked' if source is None else str(source)
         if prefix_steps < int(self.H):
-            return int(prefix_steps), 'soft_ray_auto'
-        return None, None
+            return int(prefix_steps), 'soft_ray_auto' if source is None else str(source)
+        return int(prefix_steps), source
+
+    def _compute_soft_auto_prefix(self, family_id: int, resolved_debug=None):
+        safe_prefix_steps = self._soft_prefix_family_steps.get(int(family_id), None)
+        if safe_prefix_steps is None:
+            safe_prefix_steps = int(self.H)
+        prefix_steps, source = self._compute_effective_safe_prefix_steps(
+            safe_prefix_steps,
+            resolved_debug=resolved_debug,
+        )
+        return int(prefix_steps), source
+
+    def _family_safe_steps_for_mode(self, family_id: int, base_obs, primitive_mode: str, mode_debug=None):
+        selection_context = self._variant_selection_context(mode_debug)
+        ref = self._resolve_family_ref(
+            int(family_id),
+            obs_vec=base_obs,
+            primitive_mode=primitive_mode,
+            selection_context=selection_context,
+        )
+        resolved_debug = self._resolved_variant_debug(ref)
+
+        safe_prefix_steps = self._soft_prefix_family_steps.get(int(family_id), None)
+        if safe_prefix_steps is None:
+            if self._action_mask_mode == 'soft_ray':
+                safe_prefix_steps = int(self.H)
+            else:
+                safe_prefix_steps = int(self.H) if self._variant_rollout_is_safe(int(ref.flat_index)) else 0
+
+        effective_steps, prefix_source = self._compute_effective_safe_prefix_steps(
+            safe_prefix_steps,
+            resolved_debug=resolved_debug,
+            primitive_mode=primitive_mode,
+        )
+        return int(effective_steps), prefix_source, ref, resolved_debug
+
+    def _build_blocked_transition(self, last_obs, mode_debug: dict, reason: str, selected_info: dict):
+        self._consecutive_blocked_actions += 1
+        is_stuck = bool(self._consecutive_blocked_actions >= self._max_consecutive_blocked_actions)
+        status = Status.STUCK if is_stuck else Status.BLOCKED_ACTION
+
+        # ---- Diagnostic: lidar snapshot at blocked transition ----
+        _diag_lidar_blocked = None
+        if last_obs is not None:
+            try:
+                _obs_arr = np.asarray(last_obs, dtype=np.float64).reshape(-1)
+                _lidar_num = min(120, int(_obs_arr.shape[0]))
+                _lidar_m = np.asarray(_obs_arr[:_lidar_num], dtype=np.float64) * float(getattr(self, '_lidar_range', 30.0))
+                _diag_lidar_blocked = {
+                    "diag_blocked_lidar_min": float(np.min(_lidar_m)) if _lidar_m.size else -1.0,
+                    "diag_blocked_lidar_mean": float(np.mean(_lidar_m)) if _lidar_m.size else -1.0,
+                    "diag_blocked_lidar_lt1m": float(np.mean(_lidar_m < 1.0)) if _lidar_m.size else -1.0,
+                    "diag_blocked_lidar_lt3m": float(np.mean(_lidar_m < 3.0)) if _lidar_m.size else -1.0,
+                }
+            except Exception:
+                _diag_lidar_blocked = None
+        # ---- End diagnostic ----
+
+        # ---- Diagnostic: attach zero-prefix context from previous computation ----
+        _diag_prefix_zero = getattr(self, '_last_diag_prefix_zero', None)
+        # ---- End diagnostic ----
+
+        # ---- Diagnostic: stuck snapshot (A-class, no behaviour change) ----
+        _diag_stuck_snapshot = {}
+        try:
+            _goal = self._goal_alignment_metrics()
+            _clear = self._lidar_clearance_metrics(last_obs)
+            _diag_stuck_snapshot = {
+                "diag_stuck_goal_dist": float(_goal.get("dist", -1.0)),
+                "diag_stuck_phi_abs": float(abs(self._current_articulation())),
+                "diag_stuck_valid_actions": int((self._last_action_mask_debug or {}).get("effective_action_count", -1)),
+                "diag_stuck_mode": str(self._current_primitive_mode),
+                "diag_stuck_front_clearance": float(_clear.get("front_clearance", -1.0)),
+                "diag_stuck_rear_clearance": float(_clear.get("rear_clearance", -1.0)),
+                "diag_stuck_front_overlap": float(_goal.get("front_overlap", -1.0)),
+                "diag_stuck_heading_error_deg": float(np.rad2deg(_goal.get("heading_error", -1.0))),
+                "diag_stuck_consecutive_blocked": int(self._consecutive_blocked_actions),
+            }
+        except Exception:
+            pass
+        # ---- End diagnostic ----
+
+        info = {
+            'status': status,
+            'blocked_action': True,
+            'blocked_reason': str(reason),
+            'soft_ray_blocked': True,
+            'terminal_metrics_valid': False,
+            'planning_zero_prefix_blocked': 1.0,
+            'planning_consecutive_blocked_actions': int(self._consecutive_blocked_actions),
+            'planning_all_modes_invalid': float(bool((self._last_action_mask_debug or {}).get('all_modes_invalid', False))),
+            'planning_fallback_to_finer_mode': float(bool((self._last_action_mask_debug or {}).get('fallback_to_finer_mode', False))),
+            'planning_effective_primitive_mode': str(mode_debug.get('selected_mode', self._current_primitive_mode)),
+            'planning_selected_action_safe_steps': int(selected_info.get('selected_action_safe_steps', 0)),
+            'planning_min_safe_steps': int((self._last_action_mask_debug or {}).get('min_safe_steps', 0)),
+            'planning_max_safe_steps': int((self._last_action_mask_debug or {}).get('max_safe_steps', 0)),
+            'planning_mean_safe_steps': float((self._last_action_mask_debug or {}).get('mean_safe_steps', 0.0)),
+            'mask_valid_action_count_after_fallback': int((self._last_action_mask_debug or {}).get('valid_action_count_after_fallback', 0)),
+            'mask_valid_action_ratio_after_fallback': float((self._last_action_mask_debug or {}).get('valid_action_ratio_after_fallback', 0.0)),
+        }
+        if _diag_lidar_blocked is not None:
+            info.update(_diag_lidar_blocked)
+        if _diag_prefix_zero is not None:
+            info.update(_diag_prefix_zero)
+        if _diag_stuck_snapshot:
+            info.update(_diag_stuck_snapshot)
+        info.update(selected_info)
+
+        returned_obs = self._augment_observation(last_obs, mode_debug=mode_debug)
+        self._last_base_obs = None if last_obs is None else copy.deepcopy(last_obs)
+        self._last_obs = None if returned_obs is None else copy.deepcopy(returned_obs)
+
+        reward = float(self._blocked_action_reward)
+        terminated = False
+        truncated = bool(is_stuck)
+        return returned_obs, reward, terminated, truncated, info
 
     def _mode_preference_weights(self, primitive_mode: str) -> np.ndarray:
         weights = np.ones((int(self.action_space.n),), dtype=np.float32)
@@ -1257,7 +1446,10 @@ class MacroActionWrapper(gym.Wrapper):
         mode_debug = dict(self._pending_mode_debug or self._estimate_mode_state(base_obs_for_mode, update_state=True))
         self._last_mode_debug = dict(mode_debug)
         self._pending_mode_debug = None
-        primitive_mode = str(mode_debug.get('selected_mode', self._current_primitive_mode))
+        mask_debug = dict(self._last_action_mask_debug or {})
+        primitive_mode = str(mask_debug.get('effective_primitive_mode', mode_debug.get('selected_mode', self._current_primitive_mode)))
+        mode_debug['selected_mode'] = str(primitive_mode)
+        self._current_primitive_mode = str(primitive_mode)
         resolved_ref = self._resolve_family_ref(
             family_id,
             obs_vec=base_obs_for_mode,
@@ -1308,6 +1500,69 @@ class MacroActionWrapper(gym.Wrapper):
         terminated = False
         truncated = False
 
+        selected_info = {
+            'family_id': int(family_id),
+            'resolved_family_id': int(getattr(resolved_ref, 'family_id', family_id)),
+            'primitive_id': int(primitive_id),
+            'resolved_variant_id': int(resolved_ref.variant_id),
+            'resolved_gamma_bin_id': int(resolved_ref.gamma_bin_id),
+            'resolved_mode': str(resolved_debug.get('mode', primitive_mode)),
+            'selected_mode': str(primitive_mode),
+            'mode_transitioned': bool(mode_debug.get('mode_transitioned', False)),
+            'mode_transition_count': int(mode_debug.get('mode_transition_count', self._mode_transition_count)),
+            'congestion_score': float(mode_debug.get('congestion_score', 0.0)),
+            'valid_action_ratio': float(mode_debug.get('valid_action_ratio', 0.0)),
+            'mean_soft_mask': float(mode_debug.get('mean_soft_mask', 0.0)),
+            'abs_phi_ratio': float(mode_debug.get('abs_phi_ratio', 0.0)),
+            'front_clearance_m': float(mode_debug.get('front_clearance', 0.0)),
+            'rear_clearance_m': float(mode_debug.get('rear_clearance', 0.0)),
+            'goal_heading_error': float(mode_debug.get('goal_heading_error', 0.0)),
+            'front_overlap_ratio': float(mode_debug.get('front_overlap', 0.0)),
+            'rear_overlap_ratio': float(mode_debug.get('rear_overlap', 0.0)),
+            'all_invalid_fallback_count': int(self._all_invalid_fallback_count),
+            'resolved_is_compound': bool(resolved_debug.get('is_compound', False)),
+            'resolved_switch_index': int(resolved_debug.get('switch_index', -1)),
+            'resolved_family_name': str(resolved_debug.get('family_name', '')),
+            'resolved_family_type': str(resolved_debug.get('family_type', 'normal')),
+            'planning_effective_primitive_mode': str(primitive_mode),
+            'planning_fallback_to_finer_mode': float(bool(mask_debug.get('fallback_to_finer_mode', False))),
+            'planning_all_modes_invalid': float(bool(mask_debug.get('all_modes_invalid', False))),
+            'planning_min_safe_steps': int(mask_debug.get('min_safe_steps', 0)),
+            'planning_max_safe_steps': int(mask_debug.get('max_safe_steps', 0)),
+            'planning_mean_safe_steps': float(mask_debug.get('mean_safe_steps', 0.0)),
+            'mask_valid_action_count_after_fallback': int(mask_debug.get('valid_action_count_after_fallback', 0)),
+            'mask_valid_action_ratio_after_fallback': float(mask_debug.get('valid_action_ratio_after_fallback', 0.0)),
+            'terminal_metrics_valid': False,
+            # ---- Diagnostic: per-step selection details (A-class, no behaviour change) ----
+            'diag_gamma': float(self._current_articulation()),
+            'diag_flat_index': int(primitive_id),
+            'diag_variant_horizon': int(getattr(self.primitive_lib, 'variant_horizons', [self.H])[primitive_id] if primitive_id < len(getattr(self.primitive_lib, 'variant_horizons', [])) else self.H),
+            'diag_step_seconds': float(getattr(self.primitive_lib, 'step_seconds', 0.2)),
+        }
+        try:
+            selected_info['diag_gamma_bin'] = int(self.primitive_lib.gamma_to_bin(selected_info['diag_gamma']))
+        except Exception:
+            selected_info['diag_gamma_bin'] = -1
+        if self._last_family_mask is not None and int(family_id) < len(self._last_family_mask):
+            selected_info['selected_action_mask_value'] = float(self._last_family_mask[int(family_id)])
+
+        if bool(mask_debug.get('all_modes_invalid', False)):
+            selected_info['selected_action_safe_steps'] = 0
+            selected_info['prefix_steps_used'] = 0
+            selected_info['soft_safe_prefix_steps'] = 0
+            selected_info['executed_steps'] = 0
+            selected_info['macro_exec_trace'] = macro_exec_trace
+            selected_info['takeover_active'] = False
+            selected_info['takeover_triggered'] = False
+            selected_info['path_to_dest'] = None
+            selected_info['planning_zero_prefix_blocked'] = 1.0
+            return self._build_blocked_transition(
+                last_obs,
+                mode_debug=mode_debug,
+                reason='all_modes_invalid',
+                selected_info=selected_info,
+            )
+
         max_steps = min(self.H, int(actions.shape[0]))
         used_prefix_steps = None
         used_prefix_source = None
@@ -1324,50 +1579,27 @@ class MacroActionWrapper(gym.Wrapper):
             auto_prefix_steps, auto_prefix_source = self._compute_soft_auto_prefix(family_id, resolved_debug=resolved_debug)
             if auto_prefix_steps is not None:
                 used_prefix_steps = int(auto_prefix_steps)
-                used_prefix_source = str(auto_prefix_source)
+                used_prefix_source = str(auto_prefix_source) if auto_prefix_source is not None else 'safe_prefix'
                 max_steps = min(max_steps, int(auto_prefix_steps))
 
         if max_steps <= 0:
-            info['family_id'] = int(family_id)
-            info['resolved_family_id'] = int(getattr(resolved_ref, 'family_id', family_id))
-            info['primitive_id'] = int(primitive_id)
-            info['resolved_variant_id'] = int(resolved_ref.variant_id)
-            info['resolved_gamma_bin_id'] = int(resolved_ref.gamma_bin_id)
-            info['resolved_mode'] = str(resolved_debug.get('mode', 'normal'))
-            info['selected_mode'] = str(primitive_mode)
-            info['mode_transitioned'] = bool(mode_debug.get('mode_transitioned', False))
-            info['mode_transition_count'] = int(mode_debug.get('mode_transition_count', self._mode_transition_count))
-            info['congestion_score'] = float(mode_debug.get('congestion_score', 0.0))
-            info['valid_action_ratio'] = float(mode_debug.get('valid_action_ratio', 0.0))
-            info['mean_soft_mask'] = float(mode_debug.get('mean_soft_mask', 0.0))
-            info['abs_phi_ratio'] = float(mode_debug.get('abs_phi_ratio', 0.0))
-            info['front_clearance_m'] = float(mode_debug.get('front_clearance', 0.0))
-            info['rear_clearance_m'] = float(mode_debug.get('rear_clearance', 0.0))
-            info['goal_heading_error'] = float(mode_debug.get('goal_heading_error', 0.0))
-            info['front_overlap_ratio'] = float(mode_debug.get('front_overlap', 0.0))
-            info['rear_overlap_ratio'] = float(mode_debug.get('rear_overlap', 0.0))
-            info['all_invalid_fallback_count'] = int(self._all_invalid_fallback_count)
-            if self._last_family_mask is not None and int(family_id) < len(self._last_family_mask):
-                info['selected_action_mask_value'] = float(self._last_family_mask[int(family_id)])
-            info['resolved_is_compound'] = bool(resolved_debug.get('is_compound', False))
-            info['resolved_switch_index'] = int(resolved_debug.get('switch_index', -1))
-            info['resolved_family_name'] = str(resolved_debug.get('family_name', ''))
-            info['resolved_family_type'] = str(resolved_debug.get('family_type', 'normal'))
-            info['executed_steps'] = 0
-            info['prefix_steps_used'] = int(used_prefix_steps) if used_prefix_steps is not None else 0
+            selected_info['selected_action_safe_steps'] = int(used_prefix_steps) if used_prefix_steps is not None else 0
+            selected_info['prefix_steps_used'] = int(used_prefix_steps) if used_prefix_steps is not None else 0
             if used_prefix_source is not None:
-                info['prefix_steps_source'] = str(used_prefix_source)
-            info['soft_safe_prefix_steps'] = int(self._soft_prefix_family_steps.get(int(family_id), self.H)) if len(self._soft_prefix_family_steps) > 0 else int(self.H)
-            info['macro_exec_trace'] = macro_exec_trace
-            info['takeover_active'] = False
-            info['takeover_triggered'] = False
-            info['path_to_dest'] = None
-            info['status'] = Status.OUTTIME
-            info['soft_ray_blocked'] = True
-            returned_obs = self._augment_observation(last_obs, mode_debug=mode_debug)
-            self._last_base_obs = None if last_obs is None else copy.deepcopy(last_obs)
-            self._last_obs = None if returned_obs is None else copy.deepcopy(returned_obs)
-            return returned_obs, 0.0, False, True, info
+                selected_info['prefix_steps_source'] = str(used_prefix_source)
+            selected_info['soft_safe_prefix_steps'] = int(self._soft_prefix_family_steps.get(int(family_id), 0))
+            selected_info['executed_steps'] = 0
+            selected_info['macro_exec_trace'] = macro_exec_trace
+            selected_info['takeover_active'] = False
+            selected_info['takeover_triggered'] = False
+            selected_info['path_to_dest'] = None
+            selected_info['planning_zero_prefix_blocked'] = 1.0
+            return self._build_blocked_transition(
+                last_obs,
+                mode_debug=mode_debug,
+                reason=str(used_prefix_source or 'zero_prefix_blocked'),
+                selected_info=selected_info,
+            )
 
         for t in range(max_steps):
             # Execute one low-level step
@@ -1426,31 +1658,15 @@ class MacroActionWrapper(gym.Wrapper):
             if done:
                 break
 
-        info['family_id'] = int(family_id)
-        info['resolved_family_id'] = int(getattr(resolved_ref, 'family_id', family_id))
-        info['primitive_id'] = int(primitive_id)
-        info['resolved_variant_id'] = int(resolved_ref.variant_id)
-        info['resolved_gamma_bin_id'] = int(resolved_ref.gamma_bin_id)
-        info['resolved_mode'] = str(resolved_debug.get('mode', 'normal'))
-        info['selected_mode'] = str(primitive_mode)
-        info['mode_transitioned'] = bool(mode_debug.get('mode_transitioned', False))
-        info['mode_transition_count'] = int(mode_debug.get('mode_transition_count', self._mode_transition_count))
-        info['congestion_score'] = float(mode_debug.get('congestion_score', 0.0))
-        info['valid_action_ratio'] = float(mode_debug.get('valid_action_ratio', 0.0))
-        info['mean_soft_mask'] = float(mode_debug.get('mean_soft_mask', 0.0))
-        info['abs_phi_ratio'] = float(mode_debug.get('abs_phi_ratio', 0.0))
-        info['front_clearance_m'] = float(mode_debug.get('front_clearance', 0.0))
-        info['rear_clearance_m'] = float(mode_debug.get('rear_clearance', 0.0))
-        info['goal_heading_error'] = float(mode_debug.get('goal_heading_error', 0.0))
-        info['front_overlap_ratio'] = float(mode_debug.get('front_overlap', 0.0))
-        info['rear_overlap_ratio'] = float(mode_debug.get('rear_overlap', 0.0))
-        info['all_invalid_fallback_count'] = int(self._all_invalid_fallback_count)
-        if self._last_family_mask is not None and int(family_id) < len(self._last_family_mask):
-            info['selected_action_mask_value'] = float(self._last_family_mask[int(family_id)])
-        info['resolved_is_compound'] = bool(resolved_debug.get('is_compound', False))
-        info['resolved_switch_index'] = int(resolved_debug.get('switch_index', -1))
-        info['resolved_family_name'] = str(resolved_debug.get('family_name', ''))
-        info['resolved_family_type'] = str(resolved_debug.get('family_type', 'normal'))
+        if steps_executed > 0:
+            self._consecutive_blocked_actions = 0
+
+        info.update(selected_info)
+        info['planning_selected_action_safe_steps'] = int(max_steps)
+        info['planning_consecutive_blocked_actions'] = int(self._consecutive_blocked_actions)
+        info['planning_zero_prefix_blocked'] = 0.0
+        info['terminal_metrics_valid'] = float(bool(done))
+        info['blocked_action'] = False
         info['executed_steps'] = steps_executed
         if cached_plan_debug is not None:
             info['refinement_plan_step'] = True
@@ -1992,9 +2208,9 @@ class MacroActionWrapper(gym.Wrapper):
         """Return a family-level action mask with shape [family_count]."""
         base_obs = self._extract_base_obs(obs_vec)
         mode_debug = self._estimate_mode_state(base_obs, update_state=True)
+        primitive_mode = str(mode_debug.get('selected_mode', self._current_primitive_mode))
         self._last_mode_debug = dict(mode_debug)
         self._pending_mode_debug = dict(mode_debug)
-        primitive_mode = str(mode_debug.get('selected_mode', self._current_primitive_mode))
         requested_mode = getattr(self, "_action_mask_mode", "hybrid")
         soft_ray_available = not (
             requested_mode == "soft_ray"
@@ -2015,21 +2231,78 @@ class MacroActionWrapper(gym.Wrapper):
             self._action_mask_calls_since_update += 1
             return self._action_mask_cached.copy()
 
-        if effective_mode == "soft_ray":
-            safety_mask = self._compute_soft_ray_action_mask(base_obs, primitive_mode=primitive_mode, mode_debug=mode_debug)
-        else:
-            safety_mask = self._compute_hard_action_mask(base_obs, mode_override=effective_mode, primitive_mode=primitive_mode, mode_debug=mode_debug)
-
-        safety_mask = np.asarray(safety_mask, dtype=np.float32).reshape(-1)
-        mode_weights = self._mode_preference_weights(primitive_mode)
-        articulation_weights = self._articulation_preference_weights(primitive_mode, obs_vec=base_obs)
-        mask = np.clip(safety_mask * mode_weights * articulation_weights, float(self._soft_mask_small_value), 1.0).astype(np.float32)
+        n_actions = int(self.action_space.n)
+        mode_candidates = self._mode_fallback_candidates(primitive_mode)
+        selected_mode = str(primitive_mode)
+        selected_safety_mask = np.zeros((n_actions,), dtype=np.float32)
+        selected_mode_weights = np.ones((n_actions,), dtype=np.float32)
+        selected_articulation_weights = np.ones((n_actions,), dtype=np.float32)
+        selected_safe_steps = np.zeros((n_actions,), dtype=np.int64)
+        selected_mask = np.zeros((n_actions,), dtype=np.float32)
+        fallback_to_finer_mode = False
+        all_modes_invalid = True
         fallback_family_id = None
-        if self._all_invalid_fallback_enabled and np.all(mask <= float(self._soft_mask_eps) + 1e-6):
-            fallback_family_id = self._choose_all_invalid_fallback(primitive_mode, safety_mask, mode_weights, articulation_weights, obs_vec=base_obs)
-            mask = np.full_like(mask, float(self._soft_mask_small_value), dtype=np.float32)
-            mask[int(fallback_family_id)] = 1.0
-            self._all_invalid_fallback_count += 1
+
+        for idx, candidate_mode in enumerate(mode_candidates):
+            candidate_mode = str(candidate_mode)
+            candidate_mode_debug = dict(mode_debug)
+            candidate_mode_debug['selected_mode'] = candidate_mode
+
+            if effective_mode == "soft_ray":
+                safety_mask = self._compute_soft_ray_action_mask(base_obs, primitive_mode=candidate_mode, mode_debug=candidate_mode_debug)
+            else:
+                safety_mask = self._compute_hard_action_mask(base_obs, mode_override=effective_mode, primitive_mode=candidate_mode, mode_debug=candidate_mode_debug)
+            safety_mask = np.asarray(safety_mask, dtype=np.float32).reshape(-1)
+
+            mode_weights = self._mode_preference_weights(candidate_mode)
+            articulation_weights = self._articulation_preference_weights(candidate_mode, obs_vec=base_obs)
+            mask = np.clip(safety_mask * mode_weights * articulation_weights, 0.0, 1.0).astype(np.float32)
+
+            safe_steps = np.zeros((n_actions,), dtype=np.int64)
+            for family_id in range(n_actions):
+                steps, _prefix_source, _ref, _resolved_debug = self._family_safe_steps_for_mode(
+                    family_id,
+                    base_obs,
+                    primitive_mode=candidate_mode,
+                    mode_debug=candidate_mode_debug,
+                )
+                safe_steps[int(family_id)] = int(max(0, steps))
+
+            hard_valid = safe_steps >= int(self._min_safe_prefix_steps)
+            mask = np.where(hard_valid, mask, 0.0).astype(np.float32)
+            valid_count = int(np.count_nonzero(hard_valid))
+
+            selected_mode = str(candidate_mode)
+            selected_safety_mask = safety_mask
+            selected_mode_weights = mode_weights
+            selected_articulation_weights = articulation_weights
+            selected_safe_steps = safe_steps
+            selected_mask = mask
+
+            if valid_count > 0:
+                all_modes_invalid = False
+                fallback_to_finer_mode = idx > 0
+                break
+
+        mask = selected_mask
+
+        # Preserve previous all-invalid fallback behavior as a last resort when enabled,
+        # but only among actions that satisfy minimum safe-step execution.
+        if all_modes_invalid and self._all_invalid_fallback_enabled:
+            hard_valid = selected_safe_steps >= int(self._min_safe_prefix_steps)
+            if np.any(hard_valid):
+                fallback_family_id = self._choose_all_invalid_fallback(
+                    selected_mode,
+                    selected_safety_mask,
+                    selected_mode_weights,
+                    selected_articulation_weights,
+                    obs_vec=base_obs,
+                )
+                if int(fallback_family_id) < n_actions and bool(hard_valid[int(fallback_family_id)]):
+                    mask = np.zeros_like(mask, dtype=np.float32)
+                    mask[int(fallback_family_id)] = 1.0
+                    self._all_invalid_fallback_count += 1
+                    all_modes_invalid = False
 
         self._action_mask_cached = mask.copy()
         self._action_mask_calls_since_update = 0
@@ -2040,7 +2313,10 @@ class MacroActionWrapper(gym.Wrapper):
             final_debug["effective_mode"] = effective_mode
         final_debug.update(
             {
-                "selected_mode": str(primitive_mode),
+                "selected_mode": str(selected_mode),
+                "effective_primitive_mode": str(selected_mode),
+                "fallback_to_finer_mode": bool(fallback_to_finer_mode),
+                "all_modes_invalid": bool(all_modes_invalid),
                 "mode_transitioned": bool(mode_debug.get('mode_transitioned', False)),
                 "mode_transition_count": int(mode_debug.get('mode_transition_count', self._mode_transition_count)),
                 "congestion_score": float(mode_debug.get('congestion_score', 0.0)),
@@ -2049,16 +2325,29 @@ class MacroActionWrapper(gym.Wrapper):
                 "abs_phi_ratio": float(mode_debug.get('abs_phi_ratio', 0.0)),
                 "front_clearance_m": float(mode_debug.get('front_clearance', 0.0)),
                 "rear_clearance_m": float(mode_debug.get('rear_clearance', 0.0)),
+                "min_safe_steps": int(np.min(selected_safe_steps)) if selected_safe_steps.size else 0,
+                "max_safe_steps": int(np.max(selected_safe_steps)) if selected_safe_steps.size else 0,
+                "mean_safe_steps": float(np.mean(selected_safe_steps)) if selected_safe_steps.size else 0.0,
+                "valid_action_count_after_fallback": int(np.count_nonzero(selected_safe_steps >= int(self._min_safe_prefix_steps))),
+                "valid_action_ratio_after_fallback": float(np.mean(selected_safe_steps >= int(self._min_safe_prefix_steps))) if selected_safe_steps.size else 0.0,
                 "final_mask_min": float(np.min(mask)) if mask.size else 0.0,
                 "final_mask_max": float(np.max(mask)) if mask.size else 0.0,
                 "final_mask_mean": float(np.mean(mask)) if mask.size else 0.0,
-                "effective_action_count": int(np.count_nonzero(mask > max(float(self._soft_mask_eps), 0.05))),
+                "effective_action_count": int(np.count_nonzero(mask > 0.0)),
                 "all_invalid_fallback": fallback_family_id is not None,
                 "all_invalid_fallback_family_id": int(fallback_family_id) if fallback_family_id is not None else None,
                 "all_invalid_fallback_count": int(self._all_invalid_fallback_count),
             }
         )
         self._last_action_mask_debug = final_debug
+
+        mode_debug_sync = dict(mode_debug)
+        mode_debug_sync['selected_mode'] = str(selected_mode)
+        mode_debug_sync['valid_action_ratio'] = float(final_debug.get('valid_action_ratio_after_fallback', 0.0))
+        self._current_primitive_mode = str(selected_mode)
+        self._last_mode_debug = dict(mode_debug_sync)
+        self._pending_mode_debug = dict(mode_debug_sync)
+
         return mask
 
     def _compute_hard_action_mask(self, obs_vec=None, mode_override=None, primitive_mode=None, mode_debug=None, write_debug: bool = True, return_debug: bool = False):
@@ -2096,6 +2385,7 @@ class MacroActionWrapper(gym.Wrapper):
         self._prefix_steps_queue.clear()
         self._soft_prefix_family_steps = {}
         self._clear_planned_action_cache()
+        self._consecutive_blocked_actions = 0
 
         # Invalidate obstacle cache; it will be rebuilt lazily on first mask query.
         self._mask_obstacles_prepared = None

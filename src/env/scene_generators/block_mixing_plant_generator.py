@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import heapq
 import math
+import os
 from collections import Counter, deque
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -22,12 +23,15 @@ from configs import (
     GUIDANCE_GRID_RESOLUTION,
     GUIDANCE_MAP_MARGIN,
     GUIDANCE_OBS_INFLATION,
+    HITCH_OFFSET,
     LENGTH,
     NAVIGATION_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
     NAVIGATION_MIN_PATH_CLEARANCE_BY_LEVEL,
     NAVIGATION_PATH_RATIO_LIMIT_BY_LEVEL,
     NAVIGATION_TIGHT_TURN_HEADING_DEG_BY_LEVEL,
     NAVIGATION_TIGHT_TURN_MIN_ENDPOINT_CLEARANCE_BY_LEVEL,
+    PRIMITIVE_LIBRARY_PATH,
+    TRAILER_LENGTH,
     WIDTH,
 )
 from env.vehicle import State
@@ -46,6 +50,8 @@ _NEIGHBORS_8 = (
     (1, -1, math.sqrt(2.0)),
     (1, 1, math.sqrt(2.0)),
 )
+_WARMUP_PRIMITIVE_LIBRARY = None
+_WARMUP_PRIMITIVE_FORWARD_POOL = None
 
 
 @dataclass
@@ -184,6 +190,504 @@ def _world_to_grid_cell(config: dict, x: float, y: float) -> Optional[tuple[int,
     if gx < 0 or gx >= int(config["grid_width"]) or gy < 0 or gy >= int(config["grid_height"]):
         return None
     return gx, gy
+
+
+def _resolve_warmup_primitive_library_path() -> str:
+    primary = os.path.abspath(str(PRIMITIVE_LIBRARY_PATH))
+    if os.path.exists(primary):
+        return primary
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    fallback = os.path.join(repo_root, "data", os.path.basename(primary))
+    if os.path.exists(fallback):
+        return fallback
+    raise FileNotFoundError(f"Warmup primitive library not found: {primary}")
+
+
+def _get_warmup_primitive_library():
+    global _WARMUP_PRIMITIVE_LIBRARY
+    if _WARMUP_PRIMITIVE_LIBRARY is None:
+        from primitives.library import load_library
+
+        _WARMUP_PRIMITIVE_LIBRARY = load_library(_resolve_warmup_primitive_library_path(), load_sidecars=False)
+    return _WARMUP_PRIMITIVE_LIBRARY
+
+
+def _get_warmup_forward_primitive_pool() -> np.ndarray:
+    global _WARMUP_PRIMITIVE_FORWARD_POOL
+    if _WARMUP_PRIMITIVE_FORWARD_POOL is not None:
+        return np.asarray(_WARMUP_PRIMITIVE_FORWARD_POOL, dtype=np.int64)
+
+    lib = _get_warmup_primitive_library()
+    max_horizon = int(np.max(np.asarray(lib.variant_horizons, dtype=np.int64)))
+    max_speed_level = int(np.max(np.asarray(lib.variant_flat_to_speed_level, dtype=np.int64)))
+    mode_mask = np.asarray([str(mode) == "normal" for mode in lib.variant_flat_to_mode], dtype=bool)
+    family_type_mask = np.asarray(
+        [str(family_type) in {"normal", "compound"} for family_type in lib.variant_flat_to_family_type],
+        dtype=bool,
+    )
+    speed_mask = np.asarray(lib.speed_signs, dtype=np.int64) > 0
+    horizon_mask = np.asarray(lib.variant_horizons, dtype=np.int64) == max_horizon
+    speed_level_mask = np.asarray(lib.variant_flat_to_speed_level, dtype=np.int64) == max_speed_level
+
+    indices = np.flatnonzero(mode_mask & family_type_mask & speed_mask & horizon_mask & speed_level_mask)
+    if indices.size == 0:
+        indices = np.flatnonzero(mode_mask & speed_mask & horizon_mask)
+    if indices.size == 0:
+        indices = np.flatnonzero(speed_mask)
+    _WARMUP_PRIMITIVE_FORWARD_POOL = np.asarray(indices, dtype=np.int64)
+    return np.asarray(_WARMUP_PRIMITIVE_FORWARD_POOL, dtype=np.int64)
+
+
+def _warmup_primitive_candidates_for_articulation(articulation: float) -> np.ndarray:
+    lib = _get_warmup_primitive_library()
+    base_pool = _get_warmup_forward_primitive_pool()
+    if base_pool.size == 0:
+        return base_pool
+
+    gamma_values = np.asarray(lib.gamma_bin_values, dtype=np.float64)
+    gamma_dist = np.abs(gamma_values - float(articulation))
+    nearest_bins = np.argsort(gamma_dist)[:3]
+    gamma_ids = np.asarray(lib.variant_flat_to_gamma, dtype=np.int64)[base_pool]
+    mask = np.isin(gamma_ids, nearest_bins)
+    narrowed = base_pool[mask]
+    if narrowed.size > 0:
+        return np.asarray(narrowed, dtype=np.int64)
+    return np.asarray(base_pool, dtype=np.int64)
+
+
+def _copy_state(state: State) -> State:
+    return State([
+        float(state.loc.x),
+        float(state.loc.y),
+        float(state.heading),
+        float(state.speed),
+        float(state.steering),
+        float(state.rear_heading),
+    ])
+
+
+def _simulate_warmup_primitive_sequence(initial_state: State, primitive_actions: np.ndarray) -> list[State]:
+    vehicle = State([
+        float(initial_state.loc.x),
+        float(initial_state.loc.y),
+        float(initial_state.heading),
+        float(initial_state.speed),
+        float(initial_state.steering),
+        float(initial_state.rear_heading),
+    ])
+    from env.vehicle import Vehicle
+
+    rollout_vehicle = Vehicle(
+        articulated=True,
+        trailer_length=TRAILER_LENGTH,
+        hitch_offset=HITCH_OFFSET,
+    )
+    rollout_vehicle.reset(vehicle)
+    rollout_states: list[State] = []
+    for action in np.asarray(primitive_actions, dtype=np.float64):
+        rollout_vehicle.step(np.asarray(action, dtype=np.float64))
+        rollout_states.append(_copy_state(rollout_vehicle.state))
+    return rollout_states
+
+
+def _warmup_path_bounds(config: dict, buffer_m: float) -> tuple[float, float, float, float]:
+    origin_x, origin_y = _grid_origin(config)
+    block_size = float(config["block_size"])
+    margin = int(config["boundary_margin"])
+    min_x = origin_x + float(margin) * block_size + float(buffer_m)
+    min_y = origin_y + float(margin) * block_size + float(buffer_m)
+    max_x = origin_x + float(int(config["grid_width"]) - margin) * block_size - float(buffer_m)
+    max_y = origin_y + float(int(config["grid_height"]) - margin) * block_size - float(buffer_m)
+    return min_x, min_y, max_x, max_y
+
+
+def _warmup_states_within_bounds(states: list[State], config: dict, buffer_m: float) -> bool:
+    min_x, min_y, max_x, max_y = _warmup_path_bounds(config, buffer_m)
+    for state in states:
+        for body in state.create_box():
+            geom = body.buffer(float(buffer_m), join_style=2)
+            bx0, by0, bx1, by1 = geom.bounds
+            if bx0 < min_x or by0 < min_y or bx1 > max_x or by1 > max_y:
+                return False
+    return True
+
+
+def _carve_geometry(occupancy: np.ndarray, config: dict, geometry) -> None:
+    if geometry is None or getattr(geometry, "is_empty", True):
+        return
+    minx, miny, maxx, maxy = geometry.bounds
+    origin_x, origin_y = _grid_origin(config)
+    block_size = max(float(config["block_size"]), 1e-6)
+    grid_width = int(config["grid_width"])
+    grid_height = int(config["grid_height"])
+    gx0 = max(0, int(math.floor((float(minx) - origin_x) / block_size)) - 1)
+    gy0 = max(0, int(math.floor((float(miny) - origin_y) / block_size)) - 1)
+    gx1 = min(grid_width - 1, int(math.ceil((float(maxx) - origin_x) / block_size)) + 1)
+    gy1 = min(grid_height - 1, int(math.ceil((float(maxy) - origin_y) / block_size)) + 1)
+    for gy in range(gy0, gy1 + 1):
+        for gx in range(gx0, gx1 + 1):
+            wx0, wy0, wx1, wy1 = _cell_bounds_world(config, gx, gy, gx + 1, gy + 1)
+            if geometry.intersects(box(wx0, wy0, wx1, wy1)):
+                occupancy[gy, gx] = 0
+
+
+def _generate_warmup_parking_bay(
+    occupancy: np.ndarray,
+    config: dict,
+    rng: np.random.Generator,
+) -> tuple[ParkingBay, dict]:
+    grid_width = int(config["grid_width"])
+    grid_height = int(config["grid_height"])
+    boundary_margin = int(config["boundary_margin"])
+    bay_margin = int(config.get("warmup_bay_margin_cells", boundary_margin + 8))
+    length_cells = _range_sample(rng, config["parking_bay_length_range"])
+    depth_cells = _range_sample(rng, config["parking_bay_depth_range"])
+    orientations = ["east", "west", "north", "south"]
+    rng.shuffle(orientations)
+
+    for orientation in orientations:
+        if orientation == "east":
+            x0_low = boundary_margin + bay_margin + 1
+            x0_high = grid_width - boundary_margin - bay_margin - depth_cells
+            y0_low = boundary_margin + bay_margin
+            y0_high = grid_height - boundary_margin - bay_margin - length_cells
+            if x0_low > x0_high or y0_low > y0_high:
+                continue
+            x0 = int(rng.integers(x0_low, x0_high + 1))
+            y0 = int(rng.integers(y0_low, y0_high + 1))
+            x1 = x0 + depth_cells
+            y1 = y0 + length_cells
+            access_cells = [(x0 - 1, gy) for gy in range(y0, y1)]
+            far_wall_rect = (x1, y0, min(grid_width, x1 + 1), y1)
+            heading = 0.0
+        elif orientation == "west":
+            x1_low = boundary_margin + bay_margin + depth_cells
+            x1_high = grid_width - boundary_margin - bay_margin - 1
+            y0_low = boundary_margin + bay_margin
+            y0_high = grid_height - boundary_margin - bay_margin - length_cells
+            if x1_low > x1_high or y0_low > y0_high:
+                continue
+            x1 = int(rng.integers(x1_low, x1_high + 1))
+            y0 = int(rng.integers(y0_low, y0_high + 1))
+            x0 = x1 - depth_cells
+            y1 = y0 + length_cells
+            access_cells = [(x1, gy) for gy in range(y0, y1)]
+            far_wall_rect = (max(0, x0 - 1), y0, x0, y1)
+            heading = math.pi
+        elif orientation == "north":
+            x0_low = boundary_margin + bay_margin
+            x0_high = grid_width - boundary_margin - bay_margin - length_cells
+            y0_low = boundary_margin + bay_margin + 1
+            y0_high = grid_height - boundary_margin - bay_margin - depth_cells
+            if x0_low > x0_high or y0_low > y0_high:
+                continue
+            x0 = int(rng.integers(x0_low, x0_high + 1))
+            y0 = int(rng.integers(y0_low, y0_high + 1))
+            x1 = x0 + length_cells
+            y1 = y0 + depth_cells
+            access_cells = [(gx, y0 - 1) for gx in range(x0, x1)]
+            far_wall_rect = (x0, y1, x1, min(grid_height, y1 + 1))
+            heading = 0.5 * math.pi
+        else:
+            x0_low = boundary_margin + bay_margin
+            x0_high = grid_width - boundary_margin - bay_margin - length_cells
+            y1_low = boundary_margin + bay_margin + depth_cells
+            y1_high = grid_height - boundary_margin - bay_margin - 1
+            if x0_low > x0_high or y1_low > y1_high:
+                continue
+            x0 = int(rng.integers(x0_low, x0_high + 1))
+            y1 = int(rng.integers(y1_low, y1_high + 1))
+            x1 = x0 + length_cells
+            y0 = y1 - depth_cells
+            access_cells = [(gx, y1) for gx in range(x0, x1)]
+            far_wall_rect = (x0, max(0, y0 - 1), x1, y0)
+            heading = -0.5 * math.pi
+
+        if not access_cells:
+            continue
+        carve_rect(occupancy, x0, y0, x1, y1)
+        for ax, ay in access_cells:
+            if 0 <= int(ax) < grid_width and 0 <= int(ay) < grid_height:
+                occupancy[int(ay), int(ax)] = 0
+
+        world_x0, world_y0, world_x1, world_y1 = _cell_bounds_world(config, x0, y0, x1, y1)
+        bay = ParkingBay(
+            center=(0.5 * (world_x0 + world_x1), 0.5 * (world_y0 + world_y1)),
+            heading=float(_wrap_pi(heading)),
+            length=float(length_cells) * float(config["block_size"]),
+            depth=float(depth_cells) * float(config["block_size"]),
+            grid_cells=[(gx, gy) for gy in range(y0, y1) for gx in range(x0, x1)],
+            access_cells=[(int(ax), int(ay)) for ax, ay in access_cells],
+            polygon=box(world_x0, world_y0, world_x1, world_y1),
+        )
+        return bay, {
+            "orientation": str(orientation),
+            "rect": (int(x0), int(y0), int(x1), int(y1)),
+            "far_wall_rect": tuple(int(v) for v in far_wall_rect),
+        }
+
+    raise RuntimeError("Failed to place Warmup parking bay")
+
+
+def _restore_warmup_far_wall(occupancy: np.ndarray, bay_meta: dict) -> None:
+    x0, y0, x1, y1 = (int(v) for v in bay_meta.get("far_wall_rect", (0, 0, 0, 0)))
+    if x0 >= x1 or y0 >= y1:
+        return
+    occupancy[y0:y1, x0:x1] = 1
+
+
+def _warmup_rollout_states(
+    launch_pose: list[float],
+    config: dict,
+    rng: np.random.Generator,
+) -> tuple[list[State], list[int]]:
+    primitive_lib = _get_warmup_primitive_library()
+    current_state = State([
+        float(launch_pose[0]),
+        float(launch_pose[1]),
+        float(launch_pose[2]),
+        0.0,
+        0.0,
+        float(launch_pose[2]),
+    ])
+    states = [_copy_state(current_state)]
+    chosen_indices: list[int] = []
+    target_count = _range_sample(rng, config.get("warmup_motion_primitive_count_range", (32, 64)))
+    candidate_trials = int(config.get("warmup_motion_candidate_trials_per_step", 24))
+    max_stall_steps = int(config.get("warmup_motion_max_stall_steps", 8))
+    path_buffer_m = float(config.get("warmup_path_buffer_m", 1.0))
+    stalled = 0
+
+    while len(chosen_indices) < int(target_count) and stalled < max_stall_steps:
+        articulation = _wrap_pi(float(current_state.heading) - float(current_state.rear_heading))
+        candidates = _warmup_primitive_candidates_for_articulation(float(articulation))
+        if candidates.size == 0:
+            break
+        order = np.asarray(candidates, dtype=np.int64).copy()
+        rng.shuffle(order)
+        order = order[: min(int(candidate_trials), int(order.size))]
+        accepted_states = None
+        accepted_index = None
+        for flat_index in order.tolist():
+            rollout = _simulate_warmup_primitive_sequence(current_state, primitive_lib.get_actions(int(flat_index)))
+            if len(rollout) == 0:
+                continue
+            if not _warmup_states_within_bounds(rollout, config, path_buffer_m):
+                continue
+            accepted_states = rollout
+            accepted_index = int(flat_index)
+            break
+        if accepted_states is None:
+            stalled += 1
+            continue
+        chosen_indices.append(int(accepted_index))
+        states.extend(accepted_states)
+        current_state = _copy_state(accepted_states[-1])
+        stalled = 0
+
+    return states, chosen_indices
+
+
+def _generate_warmup_scene_once(config: dict, difficulty: str, rng: np.random.Generator, attempt_seed: int) -> BlockMixingPlantScene:
+    occupancy = np.ones((int(config["grid_height"]), int(config["grid_width"])), dtype=np.uint8)
+    parking_bay, bay_meta = _generate_warmup_parking_bay(occupancy, config, rng)
+
+    seed_value = None if config.get("seed") is None else int(config["seed"])
+    temp_metadata = {
+        "scene_type": "block_mixing_plant",
+        "difficulty": str(difficulty),
+        "seed": seed_value,
+        "attempt_seed": int(attempt_seed),
+        "world_bounds": (WORLD_MIN, WORLD_MAX, WORLD_MIN, WORLD_MAX),
+        "grid_origin": _grid_origin(config),
+        "grid_width": int(config["grid_width"]),
+        "grid_height": int(config["grid_height"]),
+        "block_size": float(config["block_size"]),
+    }
+    temp_obstacles = _grid_obstacle_polygons(occupancy, config)
+    temp_obstacles.extend(_outer_world_obstacle_polygons(config))
+    temp_scene = BlockMixingPlantScene(
+        occupancy_grid=np.array(occupancy, copy=True),
+        free_grid=np.asarray(occupancy == 0, dtype=bool),
+        obstacle_polygons=list(temp_obstacles),
+        parking_bays=[parking_bay],
+        metadata=dict(temp_metadata),
+    )
+
+    blocking_poly = _blocking_poly(list(temp_scene.obstacle_polygons))
+    parked_candidate = _candidate_pose_from_bay(temp_scene, parking_bay, 0, blocking_poly, reverse=False)
+    if parked_candidate is None:
+        scene = BlockMixingPlantScene(
+            occupancy_grid=np.array(occupancy, copy=True),
+            free_grid=np.asarray(occupancy == 0, dtype=bool),
+            obstacle_polygons=list(temp_obstacles),
+            parking_bays=[parking_bay],
+            metadata=dict(temp_metadata),
+        )
+        scene.metadata["navigation_candidate_pose_count"] = 0
+        scene.metadata["navigation_candidate_pair_count"] = 0
+        return scene
+
+    dest_pose = list(parked_candidate.pose)
+    launch_pose = [
+        float(dest_pose[0]),
+        float(dest_pose[1]),
+        float(_wrap_pi(float(dest_pose[2]) + math.pi)),
+    ]
+    warmup_states, primitive_indices = _warmup_rollout_states(launch_pose, config, rng)
+    path_buffer_m = float(config.get("warmup_path_buffer_m", 1.0))
+    path_geometries = []
+    for state in warmup_states:
+        for body in state.create_box():
+            path_geometries.append(body.buffer(path_buffer_m, join_style=2))
+    if path_geometries:
+        _carve_geometry(occupancy, config, unary_union(path_geometries).buffer(0))
+    _restore_warmup_far_wall(occupancy, bay_meta)
+    carve_rect(occupancy, *bay_meta["rect"])
+    for ax, ay in parking_bay.access_cells or []:
+        occupancy[int(ay), int(ax)] = 0
+
+    removed_islands, component_ratio = _cleanup_free_islands(occupancy)
+    parking_bays = _filter_bays_against_grid([parking_bay], occupancy)
+    free_grid = occupancy == 0
+    keep_mask, component_size, total_free = _largest_component_mask(free_grid)
+    clearance_map_m = _clearance_map_m(occupancy, float(config["block_size"]))
+    obstacle_distance_steps = np.asarray(
+        clearance_map_m / max(float(config["block_size"]), 1e-6),
+        dtype=np.float32,
+    )
+    obstacle_polygons = _grid_obstacle_polygons(occupancy, config)
+    obstacle_polygons.extend(_outer_world_obstacle_polygons(config))
+    static_obstacles = list(obstacle_polygons)
+    dynamic_obstacles = []
+    guidance_payload = _build_guidance_payload_from_obstacles(
+        occupancy,
+        config,
+        difficulty,
+        static_obstacles=static_obstacles,
+        dynamic_obstacles=dynamic_obstacles,
+    )
+
+    metadata = {
+        "scene_type": "block_mixing_plant",
+        "difficulty": str(difficulty),
+        "seed": seed_value,
+        "attempt_seed": int(attempt_seed),
+        "corridor_generation_mode": "motion_primitive_warmup",
+        "scene_variant": "warmup_motion_primitive",
+        "world_bounds": (WORLD_MIN, WORLD_MAX, WORLD_MIN, WORLD_MAX),
+        "grid_origin": _grid_origin(config),
+        "grid_width": int(config["grid_width"]),
+        "grid_height": int(config["grid_height"]),
+        "block_size": float(config["block_size"]),
+        "hub_cell": None,
+        "corridor_segments": [],
+        "corridor_width_mean": 0.0,
+        "corridor_width_min": 0,
+        "corridor_width_max": 0,
+        "main_corridor_count": 0,
+        "branch_count": 0,
+        "loop_count": 0,
+        "dead_end_count": 0,
+        "branch_target_count": 0,
+        "loop_target_count": 0,
+        "dead_end_target_count": 0,
+        "extra_corridor_topups": 0,
+        "parking_bay_count": int(len(parking_bays)),
+        "free_ratio": float(_grid_free_ratio(occupancy)),
+        "largest_component_free_cells": int(component_size),
+        "total_free_cells": int(total_free),
+        "island_cleanup": (int(removed_islands), float(component_ratio)),
+        "_clearance_map_m": np.asarray(clearance_map_m, dtype=np.float32),
+        "_obstacle_distance_steps": obstacle_distance_steps,
+        "guidance_occupancy_payload": guidance_payload,
+        "guidance_static_obstacle_signature": str(guidance_payload["static_obstacle_signature"]),
+        "guidance_dynamic_obstacle_signature": str(guidance_payload["dynamic_obstacle_signature"]),
+        "guidance_static_obstacles": static_obstacles,
+        "guidance_dynamic_obstacles": dynamic_obstacles,
+        "block_rotation_deg_max": float(config["block_rotation_deg_max"]),
+        "block_position_jitter_ratio": float(config["block_position_jitter_ratio"]),
+        "warmup_bay_orientation": str(bay_meta["orientation"]),
+        "warmup_launch_pose": [float(v) for v in launch_pose],
+        "warmup_motion_primitive_indices": [int(v) for v in primitive_indices],
+        "warmup_motion_primitive_count": int(len(primitive_indices)),
+        "warmup_path_buffer_m": float(path_buffer_m),
+    }
+
+    scene = BlockMixingPlantScene(
+        occupancy_grid=occupancy,
+        free_grid=free_grid,
+        obstacle_polygons=obstacle_polygons,
+        parking_bays=parking_bays,
+        metadata=metadata,
+    )
+
+    scene.metadata["navigation_candidate_pose_count"] = 0
+    scene.metadata["navigation_candidate_pair_count"] = 0
+    if len(warmup_states) < 2 or len(scene.parking_bays) == 0:
+        return scene
+
+    final_state = warmup_states[-1]
+    start_pose = [float(final_state.loc.x), float(final_state.loc.y), float(final_state.heading)]
+    blocking_poly = _blocking_poly(list(scene.obstacle_polygons))
+    free_region = box(WORLD_MIN, WORLD_MIN, WORLD_MAX, WORLD_MAX).difference(blocking_poly).buffer(0)
+    clearance_map_m = _scene_clearance_map_m(scene)
+    obstacle_distance_steps = _scene_obstacle_distance_steps(scene)
+    dest_candidate = _candidate_pose_from_bay(scene, scene.parking_bays[0], 0, blocking_poly, reverse=False)
+    if dest_candidate is None:
+        return scene
+    dest_pose = list(dest_candidate.pose)
+    start_cell = _world_to_grid_cell(scene.metadata, start_pose[0], start_pose[1])
+    dest_cell = _world_to_grid_cell(scene.metadata, dest_pose[0], dest_pose[1])
+    if start_cell is None or dest_cell is None:
+        return scene
+
+    metrics = _scene_metrics_for_pair(
+        scene,
+        str(difficulty),
+        blocking_poly,
+        free_region,
+        start_pose,
+        dest_pose,
+        start_cell,
+        dest_cell,
+        obstacle_distance_steps=obstacle_distance_steps,
+        clearance_map_m=clearance_map_m,
+    )
+    if not _scene_metrics_pass(str(difficulty), metrics):
+        return scene
+
+    nav_meta = {
+        "scene_metrics": metrics,
+        "divider_scene_metrics": dict(metrics),
+        "start_bay_index": -1,
+        "dest_bay_index": 0,
+        "start_support_edge": {
+            "poly_label": "motion_primitive_stop",
+            "primitive_count": int(len(primitive_indices)),
+        },
+        "dest_support_edge": {
+            "poly_label": "parking_bay",
+            "bay_index": 0,
+            "heading": float(scene.parking_bays[0].heading),
+            "reverse": False,
+        },
+        "start_divider_wall_count": 0,
+        "dest_divider_wall_count": 1,
+        "divider_wall_count": 1,
+        "parking_bays": list(scene.parking_bays),
+        "free_grid": np.array(scene.free_grid, copy=True),
+        "occupancy_grid": np.array(scene.occupancy_grid, copy=True),
+        "plaza": None,
+        "corridors": [],
+        "free_region_polygon": free_region,
+        "blocking_polygon": blocking_poly,
+        "guidance_path_points": list(metrics.get("path_points_world", [])),
+    }
+    scene.metadata["navigation_candidate_pose_count"] = 2
+    scene.metadata["navigation_candidate_pair_count"] = 1
+    _set_cached_navigation_case(scene, difficulty, attempt_seed, start_pose, dest_pose, nav_meta)
+    return scene
 
 
 def carve_rect(occupancy: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> None:
@@ -866,7 +1370,7 @@ def _validate_scene_data(
     if float(component_ratio) < 0.90:
         reasons.append(f"largest component ratio too small: {component_ratio:.3f}")
 
-    min_bays = max(2, int(config["parking_bay_count_range"][0]))
+    min_bays = int(config.get("min_parking_bay_count", max(2, int(config["parking_bay_count_range"][0]))))
     if len(parking_bays) < min_bays:
         reasons.append(f"insufficient parking bays: {len(parking_bays)} < {min_bays}")
 
@@ -1191,6 +1695,9 @@ def _generate_parking_bays(
 
 
 def _generate_scene_once(config: dict, difficulty: str, rng: np.random.Generator, attempt_seed: int) -> BlockMixingPlantScene:
+    if str(difficulty) == "Warmup":
+        return _generate_warmup_scene_once(config, difficulty, rng, attempt_seed)
+
     occupancy = np.ones((int(config["grid_height"]), int(config["grid_width"])), dtype=np.uint8)
     carved_segments: list[_CorridorSegment] = []
     hub, _endpoints = _generate_main_corridors(occupancy, config, rng, carved_segments)
@@ -1732,6 +2239,13 @@ def _scene_metrics_for_pair(
         "path_block_size": float(block_size),
         "path_endpoint_skip": int(endpoint_skip),
         "path_points_world": [tuple(float(v) for v in pt) for pt in path_points_world.tolist()],
+        # ---- Diagnostic: scene geometry stats (A-class) ----
+        "diag_scene_free_ratio": float(np.mean(scene.free_grid.astype(np.float32))) if scene.free_grid is not None else -1.0,
+        "diag_scene_obstacle_count": int(len(scene.obstacle_polygons)),
+        "diag_scene_parking_bay_count": int(len(scene.parking_bays)),
+        "diag_scene_grid_width": int(scene.occupancy_grid.shape[1]) if scene.occupancy_grid is not None else -1,
+        "diag_scene_grid_height": int(scene.occupancy_grid.shape[0]) if scene.occupancy_grid is not None else -1,
+        # ---- End diagnostic ----
     }
 
 
@@ -1761,6 +2275,24 @@ def _scene_metrics_pass(level: str, metrics: dict) -> bool:
 def _pose_endpoint_clearance(pose_xyz: list[float], blocking_poly) -> float:
     state = State([float(pose_xyz[0]), float(pose_xyz[1]), float(pose_xyz[2]), 0.0, 0.0])
     return float(min(float(body.distance(blocking_poly)) for body in state.create_box()))
+
+
+# ---- Diagnostic: vehicle feasibility check (A-class, offline use only) ----
+def diag_check_vehicle_feasibility(scene_metrics: dict, vehicle_width: float) -> dict:
+    """Simple feasibility check based on bottleneck width vs vehicle width.
+
+    Returns dict with 'feasible' (bool), 'reason' (str), and 'margin' (float).
+    This is a coarse cell-level check - does NOT perform swept collision detection.
+    """
+    bottleneck = float(scene_metrics.get('bottleneck_width', 0.0))
+    path_clearance = float(scene_metrics.get('path_min_clearance', 0.0))
+    if bottleneck <= 0:
+        return {'feasible': False, 'reason': 'no_path_or_zero_bottleneck', 'margin': -1.0}
+    margin = bottleneck - vehicle_width
+    feasible = margin > 0.05  # 5cm minimum safety margin
+    reason = 'ok' if feasible else f'bottleneck_{bottleneck:.2f}m_lt_vehicle_{vehicle_width:.2f}m'
+    return {'feasible': feasible, 'reason': reason, 'margin': float(margin)}
+# ---- End diagnostic ----
 
 
 def _build_pose_candidate_pools(
@@ -1827,6 +2359,33 @@ def _search_navigation_pair(
     dest_fallback_candidates: list[_PoseCandidate],
 ) -> tuple[tuple[list[float], list[float], dict] | None, int]:
     max_attempts = int(BLOCK_MIXING_PLANT_CONFIG[str(difficulty)].get("max_pose_sample_attempts", 240))
+    attempt_seed = scene.metadata.get("attempt_seed", None)
+    rng = np.random.default_rng(int(attempt_seed) if attempt_seed is not None else None)
+
+    band_center_by_level = {
+        "Warmup": 0.25,
+        "Normal": 0.45,
+        "Complex": 0.65,
+        "Extrem": 0.80,
+    }
+    band_width_by_level = {
+        "Warmup": 0.18,
+        "Normal": 0.16,
+        "Complex": 0.14,
+        "Extrem": 0.12,
+    }
+
+    def _difficulty_band_score(distance: float, heading_diff: float) -> float:
+        (dmin, dmax), (amin, amax) = _difficulty_constraints(str(difficulty))
+        if dmax is None or dmax <= dmin + 1e-6:
+            dist_score = 0.0
+        else:
+            dist_score = float(np.clip((float(distance) - float(dmin)) / (float(dmax) - float(dmin)), 0.0, 1.0))
+        if amax <= amin + 1e-6:
+            heading_score = 0.0
+        else:
+            heading_score = float(np.clip((float(heading_diff) - float(amin)) / (float(amax) - float(amin)), 0.0, 1.0))
+        return float(0.65 * dist_score + 0.35 * heading_score)
 
     def _candidate_score(start_candidate: _PoseCandidate, dest_candidate: _PoseCandidate) -> tuple[float, float]:
         distance = float(math.hypot(float(start_candidate.pose[0]) - float(dest_candidate.pose[0]), float(start_candidate.pose[1]) - float(dest_candidate.pose[1])))
@@ -1875,9 +2434,36 @@ def _search_navigation_pair(
                 if not _pair_satisfies_constraints(str(difficulty), start_candidate.pose, dest_candidate.pose):
                     continue
                 distance, heading_diff = _candidate_score(start_candidate, dest_candidate)
-                pair_candidates.append((distance, heading_diff, start_candidate, dest_candidate))
-        pair_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        for _, _, start_candidate, dest_candidate in pair_candidates[:max_attempts]:
+                band_score = _difficulty_band_score(distance, heading_diff)
+                pair_candidates.append((band_score, distance, heading_diff, start_candidate, dest_candidate))
+
+        if not pair_candidates:
+            return None, 0
+
+        band_center = float(band_center_by_level.get(str(difficulty), 0.5))
+        band_width = float(band_width_by_level.get(str(difficulty), 0.15))
+        band_low = max(0.0, band_center - band_width)
+        band_high = min(1.0, band_center + band_width)
+
+        band_candidates = [item for item in pair_candidates if band_low <= float(item[0]) <= band_high]
+        if not band_candidates:
+            band_candidates = sorted(pair_candidates, key=lambda item: abs(float(item[0]) - band_center))
+        else:
+            band_candidates.sort(key=lambda item: abs(float(item[0]) - band_center))
+
+        sample_pool = band_candidates[:max_attempts]
+        if len(sample_pool) > 1:
+            weights = np.asarray([
+                1.0 / (1.0 + abs(float(item[0]) - band_center))
+                for item in sample_pool
+            ], dtype=np.float64)
+            weights = weights / max(float(np.sum(weights)), 1e-9)
+            sampled_indices = rng.choice(len(sample_pool), size=len(sample_pool), replace=False, p=weights)
+            ordered_candidates = [sample_pool[int(idx)] for idx in np.asarray(sampled_indices, dtype=np.int64).tolist()]
+        else:
+            ordered_candidates = sample_pool
+
+        for _, _, _, start_candidate, dest_candidate in ordered_candidates:
             metrics = _scene_metrics_for_pair(
                 scene,
                 str(difficulty),
@@ -1905,6 +2491,8 @@ def _search_navigation_pair(
 
 
 def _prime_navigation_case(scene: BlockMixingPlantScene, difficulty: str, seed: int | None = None) -> bool:
+    if _get_cached_navigation_case(scene, difficulty, seed) is not None:
+        return True
     if len(scene.parking_bays) < 2:
         scene.metadata["navigation_candidate_pose_count"] = 0
         scene.metadata["navigation_candidate_pair_count"] = 0
@@ -1948,12 +2536,12 @@ def sample_navigation_case_from_scene(
     difficulty: str,
     seed: int | None = None,
 ) -> tuple[list[float], list[float], dict]:
-    if len(scene.parking_bays) < 2:
-        raise RuntimeError("Block mixing plant scene has fewer than two parking bays")
-
     cached_case = _get_cached_navigation_case(scene, difficulty, seed)
     if cached_case is not None:
         return cached_case
+
+    if len(scene.parking_bays) < 2:
+        raise RuntimeError("Block mixing plant scene has fewer than two parking bays")
 
     blocking_poly = _blocking_poly(list(scene.obstacle_polygons))
     world_poly = box(WORLD_MIN, WORLD_MIN, WORLD_MAX, WORLD_MAX)
