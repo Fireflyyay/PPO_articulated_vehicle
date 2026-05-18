@@ -37,7 +37,7 @@ class ParkingAgent(object):
         if name.startswith('_'):
             raise AttributeError("attempted to get missing private attribute '{}'".format(name))
         return getattr(self.agent, name)
-    
+
     def reset(self,):
         if self.planner is not None:
             self.planner.reset()
@@ -51,7 +51,7 @@ class ParkingAgent(object):
     def executing_plan(self):
         return not (self.planner is None or not self.planner.executing)
 
-    def choose_action(self, obs, deterministic=False, action_mask=None):
+    def choose_action(self, obs, deterministic=False, action_mask=None, guidance_logits=None, guidance_weight=None):
         '''
         Get the decision from the agent.
 
@@ -63,12 +63,24 @@ class ParkingAgent(object):
             other: the other information, such as the log_prob of the action in case of PPO
         '''
         if not self.executing_plan:
-            return self.agent.choose_action(obs, deterministic=deterministic, action_mask=action_mask)
+            return self.agent.choose_action(
+                obs,
+                deterministic=deterministic,
+                action_mask=action_mask,
+                guidance_logits=guidance_logits,
+                guidance_weight=guidance_weight,
+            )
 
         primitive_id = self.planner.get_action()
-        log_prob = self.agent.get_log_prob(obs, primitive_id, action_mask=action_mask)
+        log_prob = self.agent.get_log_prob(
+            obs,
+            primitive_id,
+            action_mask=action_mask,
+            guidance_logits=guidance_logits,
+            guidance_weight=guidance_weight,
+        )
         return primitive_id, log_prob
-        
+
     def get_action(self, obs):
         '''
         Get the decision from the agent.

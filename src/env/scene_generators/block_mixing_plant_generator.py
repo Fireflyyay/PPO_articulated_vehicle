@@ -488,6 +488,90 @@ def _warmup_rollout_states(
     return states, chosen_indices
 
 
+def _serialize_warmup_reference_states(states: list[State], primitive_indices: list[int], primitive_lib) -> list[dict]:
+    if states is None or len(states) == 0:
+        return []
+
+    primitive_ids = [-1]
+    family_ids = [-1]
+    directions = [0]
+
+    for flat_index in primitive_indices or []:
+        step_count = 0
+        family_id = -1
+        direction = 0
+        try:
+            actions = np.asarray(primitive_lib.get_actions(int(flat_index)), dtype=np.float64)
+            step_count = int(actions.shape[0])
+            if step_count > 0:
+                direction = int(np.sign(float(np.mean(actions[:, 1]))))
+        except Exception:
+            step_count = 0
+        try:
+            family_id = int(np.asarray(getattr(primitive_lib, "variant_flat_to_family", np.asarray([])), dtype=np.int64)[int(flat_index)])
+        except Exception:
+            family_id = -1
+        try:
+            speed_signs = np.asarray(getattr(primitive_lib, "speed_signs", np.asarray([])), dtype=np.int64)
+            if speed_signs.size > int(flat_index):
+                direction = int(np.sign(int(speed_signs[int(flat_index)])))
+        except Exception:
+            pass
+
+        primitive_ids.extend([int(flat_index)] * int(max(0, step_count)))
+        family_ids.extend([int(family_id)] * int(max(0, step_count)))
+        directions.extend([int(direction)] * int(max(0, step_count)))
+
+    if len(primitive_ids) < len(states):
+        pad = int(len(states) - len(primitive_ids))
+        primitive_ids.extend([int(primitive_ids[-1] if len(primitive_ids) > 0 else -1)] * pad)
+        family_ids.extend([int(family_ids[-1] if len(family_ids) > 0 else -1)] * pad)
+        directions.extend([int(directions[-1] if len(directions) > 0 else 0)] * pad)
+    elif len(primitive_ids) > len(states):
+        primitive_ids = primitive_ids[: len(states)]
+        family_ids = family_ids[: len(states)]
+        directions = directions[: len(states)]
+
+    progress = 0.0
+    prev_state = None
+    records: list[dict] = []
+    for idx, state in enumerate(states):
+        if prev_state is not None:
+            progress += float(state.loc.distance(prev_state.loc))
+        gamma = _wrap_pi(float(state.heading) - float(state.rear_heading))
+        records.append(
+            {
+                "x": float(state.loc.x),
+                "y": float(state.loc.y),
+                "theta_front": float(state.heading),
+                "theta_rear": float(state.rear_heading),
+                "gamma": float(gamma),
+                "direction": int(directions[idx]) if idx < len(directions) else 0,
+                "time_index": int(idx),
+                "source_family_id": int(family_ids[idx]) if idx < len(family_ids) else -1,
+                "source_primitive_id": int(primitive_ids[idx]) if idx < len(primitive_ids) else -1,
+                "cumulative_progress": float(progress),
+            }
+        )
+        prev_state = state
+
+    if len(records) <= 1:
+        return records
+
+    reversed_records = list(reversed(records))
+    progress = 0.0
+    prev_xy = None
+    for idx, item in enumerate(reversed_records):
+        xy = (float(item.get("x", 0.0)), float(item.get("y", 0.0)))
+        if prev_xy is not None:
+            progress += float(math.hypot(xy[0] - prev_xy[0], xy[1] - prev_xy[1]))
+        item["time_index"] = int(idx)
+        item["cumulative_progress"] = float(progress)
+        item["direction"] = int(-int(item.get("direction", 0))) if int(item.get("direction", 0)) != 0 else 0
+        prev_xy = xy
+    return reversed_records
+
+
 def _generate_warmup_scene_once(config: dict, difficulty: str, rng: np.random.Generator, attempt_seed: int) -> BlockMixingPlantScene:
     occupancy = np.ones((int(config["grid_height"]), int(config["grid_width"])), dtype=np.uint8)
     parking_bay, bay_meta = _generate_warmup_parking_bay(occupancy, config, rng)
@@ -535,6 +619,7 @@ def _generate_warmup_scene_once(config: dict, difficulty: str, rng: np.random.Ge
         float(_wrap_pi(float(dest_pose[2]) + math.pi)),
     ]
     warmup_states, primitive_indices = _warmup_rollout_states(launch_pose, config, rng)
+    warmup_reference_states = _serialize_warmup_reference_states(warmup_states, primitive_indices, _get_warmup_primitive_library())
     path_buffer_m = float(config.get("warmup_path_buffer_m", 1.0))
     path_geometries = []
     for state in warmup_states:
@@ -611,6 +696,9 @@ def _generate_warmup_scene_once(config: dict, difficulty: str, rng: np.random.Ge
         "warmup_launch_pose": [float(v) for v in launch_pose],
         "warmup_motion_primitive_indices": [int(v) for v in primitive_indices],
         "warmup_motion_primitive_count": int(len(primitive_indices)),
+        "warmup_reference_states": list(warmup_reference_states),
+        "warmup_reference_state_count": int(len(warmup_reference_states)),
+        "reference_state_available": bool(len(warmup_reference_states) > 0),
         "warmup_path_buffer_m": float(path_buffer_m),
     }
 
@@ -683,6 +771,8 @@ def _generate_warmup_scene_once(config: dict, difficulty: str, rng: np.random.Ge
         "free_region_polygon": free_region,
         "blocking_polygon": blocking_poly,
         "guidance_path_points": list(metrics.get("path_points_world", [])),
+        "reference_state_available": bool(len(warmup_reference_states) > 0),
+        "warmup_reference_state_count": int(len(warmup_reference_states)),
     }
     scene.metadata["navigation_candidate_pose_count"] = 2
     scene.metadata["navigation_candidate_pair_count"] = 1

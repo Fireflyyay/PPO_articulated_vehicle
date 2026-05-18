@@ -33,6 +33,10 @@ from configs import *
 if USE_MOTION_PRIMITIVES:
     from primitives.library import load_library
     from env.wrappers.macro_action_wrapper import MacroActionWrapper
+    try:
+        from guidance.hybrid_astar_guidance import HybridAStarGuidance
+    except Exception:
+        HybridAStarGuidance = None
 
 # Adaptive primitive expansion imports (kept optional)
 if USE_MOTION_PRIMITIVES:
@@ -232,6 +236,82 @@ def _log_motion_primitive_episode_runtime(writer, episode_idx: int, ep_infos: li
         writer.add_scalar("diag/family_select_unique_count", float(selected_families), episode_idx)
         writer.add_scalar("diag/family_select_entropy_proxy", float(selected_families) / float(max(1, family_hist.shape[0])), episode_idx)
     # ---- End diagnostic ----
+
+
+def _sanitize_writer_tag(text: str) -> str:
+    value = str(text or "unknown").strip().lower()
+    if not value:
+        return "unknown"
+    sanitized = "".join(ch if (ch.isalnum() or ch in ("_", "-")) else "_" for ch in value)
+    sanitized = sanitized.strip("_")
+    return sanitized or "unknown"
+
+
+def _log_hybrid_guidance_episode_runtime(writer, episode_idx: int, ep_infos: list):
+    if writer is None or ep_infos is None or len(ep_infos) == 0:
+        return
+
+    last_info = ep_infos[-1] if isinstance(ep_infos[-1], dict) else {}
+    planner_success = [1.0 if isinstance(info, dict) and bool(info.get('planner_success', False)) else 0.0 for info in ep_infos]
+    planner_timeout = [1.0 if isinstance(info, dict) and str(info.get('planner_fail_reason', '')) == 'timeout' else 0.0 for info in ep_infos]
+    guidance_valid = [1.0 if isinstance(info, dict) and bool(info.get('guidance_valid', False)) else 0.0 for info in ep_infos]
+    guidance_dropout = [1.0 if isinstance(info, dict) and bool(info.get('guidance_dropout_active', False)) else 0.0 for info in ep_infos]
+    rear_near = [int(info.get('rear_body_near_collision_count', 0)) for info in ep_infos if isinstance(info, dict)]
+    gamma_abs = [abs(float(info.get('diag_gamma', 0.0))) for info in ep_infos if isinstance(info, dict)]
+    jackknife_vals = [float(info.get('jackknife_margin_min', 0.0)) for info in ep_infos if isinstance(info, dict) and info.get('jackknife_margin_min', None) is not None]
+
+    writer.add_scalar("guidance/planner_success_rate", _safe_mean(planner_success), episode_idx)
+    writer.add_scalar("guidance/planner_timeout_rate", _safe_mean(planner_timeout), episode_idx)
+    writer.add_scalar("guidance/planner_avg_plan_time_ms", _safe_mean(_episode_info_scalars(ep_infos, 'planner_plan_time_ms')), episode_idx)
+    writer.add_scalar("guidance/planner_avg_expand_nodes", _safe_mean(_episode_info_scalars(ep_infos, 'planner_expand_nodes')), episode_idx)
+    writer.add_scalar("guidance/planner_avg_path_cost", _safe_mean(_episode_info_scalars(ep_infos, 'planner_path_cost')), episode_idx)
+    writer.add_scalar("guidance/guidance_valid_rate", _safe_mean(guidance_valid), episode_idx)
+    writer.add_scalar("guidance/lambda_guidance_current", _safe_mean(_episode_info_scalars(ep_infos, 'lambda_guidance_current')), episode_idx)
+    writer.add_scalar("guidance/guidance_dropout_active", _safe_mean(guidance_dropout), episode_idx)
+    writer.add_scalar("guidance/raw_policy_teacher_agreement", _safe_mean(_episode_info_scalars(ep_infos, 'raw_policy_teacher_agreement')), episode_idx)
+    writer.add_scalar("guidance/guided_policy_teacher_agreement", _safe_mean(_episode_info_scalars(ep_infos, 'guided_policy_teacher_agreement')), episode_idx)
+    writer.add_scalar("guidance/raw_policy_top1", _to_scalar(last_info.get('raw_policy_top1', -1), -1.0), episode_idx)
+    writer.add_scalar("guidance/guided_policy_top1", _to_scalar(last_info.get('guided_policy_top1', -1), -1.0), episode_idx)
+    writer.add_scalar("guidance/teacher_family", _to_scalar(last_info.get('teacher_family', -1), -1.0), episode_idx)
+    writer.add_scalar("guidance/action_entropy_before_guidance", _safe_mean(_episode_info_scalars(ep_infos, 'action_entropy_before_guidance')), episode_idx)
+    writer.add_scalar("guidance/action_entropy_after_guidance", _safe_mean(_episode_info_scalars(ep_infos, 'action_entropy_after_guidance')), episode_idx)
+    writer.add_scalar("guidance/teacher_action_mask_value", _safe_mean(_episode_info_scalars(ep_infos, 'teacher_action_mask_value')), episode_idx)
+    writer.add_scalar("guidance/reference_state_available", float(max([int(_to_scalar(info.get('reference_state_available', 0.0), 0.0)) for info in ep_infos if isinstance(info, dict)] or [0])), episode_idx)
+    writer.add_scalar("guidance/average_progress_along_reference", _to_scalar(last_info.get('average_progress_along_reference', 0.0), 0.0), episode_idx)
+    writer.add_scalar("guidance/front_overlap_curve", _safe_mean(_episode_info_scalars(ep_infos, 'front_overlap')), episode_idx)
+    writer.add_scalar("guidance/heading_error_curve", _safe_mean(_episode_info_scalars(ep_infos, 'heading_error_deg')), episode_idx)
+    writer.add_scalar("guidance/gamma_abs_max", float(max(gamma_abs) if len(gamma_abs) > 0 else 0.0), episode_idx)
+    writer.add_scalar("guidance/jackknife_margin_min", float(min(jackknife_vals) if len(jackknife_vals) > 0 else 0.0), episode_idx)
+    writer.add_scalar("guidance/rear_body_near_collision_count", float(np.sum(rear_near) if len(rear_near) > 0 else 0.0), episode_idx)
+    writer.add_scalar("guidance/raw_policy_success_eval", float('nan'), episode_idx)
+    writer.add_scalar("guidance/guided_policy_success_eval", float('nan'), episode_idx)
+    writer.add_scalar(
+        "guidance/success_after_guidance_dropout",
+        float(1.0 if last_info.get('status', None) == Status.ARRIVED else 0.0) if any(guidance_dropout) else float('nan'),
+        episode_idx,
+    )
+    writer.add_scalar("guidance/success_guidance_enabled_eval", float('nan'), episode_idx)
+    writer.add_scalar("guidance/success_guidance_disabled_eval", float('nan'), episode_idx)
+    writer.add_scalar("guidance/bc_sample_accept_rate", _safe_mean(_episode_info_scalars(ep_infos, 'bc_sample_accept_rate')), episode_idx)
+
+    fail_reason_counts = {}
+    bc_reject_counts = {}
+    for info in ep_infos:
+        if not isinstance(info, dict):
+            continue
+        fail_reason = str(info.get('planner_fail_reason', '') or '').strip()
+        if fail_reason:
+            key = _sanitize_writer_tag(fail_reason)
+            fail_reason_counts[key] = fail_reason_counts.get(key, 0) + 1
+        reject_reason = str(info.get('bc_sample_reject_reason', '') or '').strip()
+        if reject_reason:
+            key = _sanitize_writer_tag(reject_reason)
+            bc_reject_counts[key] = bc_reject_counts.get(key, 0) + 1
+
+    for key, count in sorted(fail_reason_counts.items()):
+        writer.add_scalar(f"guidance/planner_fail_reason_distribution/{key}", float(count), episode_idx)
+    for key, count in sorted(bc_reject_counts.items()):
+        writer.add_scalar(f"guidance/bc_sample_reject_reason/{key}", float(count), episode_idx)
 
 
 def _maybe_print_episode_heartbeat(
@@ -716,7 +796,7 @@ if __name__=="__main__":
     parser.add_argument('--eval_episode', type=int, default=100)
     parser.add_argument('--verbose', type=bool, default=True)
     parser.add_argument('--visualize', type=bool, default=False)
-    parser.add_argument('--exp-tag', type=str, default='baseline', help='Experiment tag for log directory naming (A-class diagnostic)')
+    parser.add_argument('--exp-tag', type=str, default='', help='Experiment tag for log directory naming (A-class diagnostic)')
     args = parser.parse_args()
 
     verbose = args.verbose
@@ -769,8 +849,11 @@ if __name__=="__main__":
 
     current_time = time.localtime()
     timestamp = time.strftime("%Y%m%d_%H%M%S", current_time)
-    exp_tag = str(getattr(args, 'exp_tag', 'baseline')).replace('/', '_').replace(' ', '_')
-    save_path = os.path.join(log_exp_dir, f'ppo_{exp_tag}_{timestamp}')
+    exp_tag = str(getattr(args, 'exp_tag', '')).replace('/', '_').replace(' ', '_')
+    if exp_tag:
+        save_path = os.path.join(log_exp_dir, f'ppo_{exp_tag}_{timestamp}')
+    else:
+        save_path = os.path.join(log_exp_dir, f'ppo_{timestamp}')
 
     if not os.path.exists(save_path):
         os.makedirs(save_path)
@@ -839,6 +922,7 @@ if __name__=="__main__":
         "imitation_batch_size": int(IMITATION_BATCH_SIZE),
         "imitation_min_buffer": int(IMITATION_MIN_BUFFER),
         "imitation_loss_weight": float(IMITATION_LOSS_WEIGHT),
+        "guidance_logit_default_weight": 0.0,
         "soft_mask_logit_lambda": float(SOFT_MASK_LOGIT_LAMBDA),
         "soft_mask_small_value": float(SOFT_MASK_SMALL_VALUE),
         # Ensure gamma is consistent with macro-action horizon
@@ -852,6 +936,7 @@ if __name__=="__main__":
         print('load pre-trained model!')
 
     parking_agent = ParkingAgent(rl_agent, planner=None)
+    guidance_sidecar = HybridAStarGuidance(cfg) if (USE_MOTION_PRIMITIVES and HybridAStarGuidance is not None) else None
 
     # Adaptive primitive expansion components
     adaptive_enabled = bool(USE_MOTION_PRIMITIVES and USE_ADAPTIVE_PRIMITIVE_EXPANSION)
@@ -1044,6 +1129,8 @@ if __name__=="__main__":
         primitive_lib = new_lib
         primitive_h = getattr(primitive_lib, 'horizon', primitive_h)
         env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
+        if guidance_sidecar is not None:
+            guidance_sidecar.clear_cache()
 
         # Update shaping centroids from discovered segments (use end macro obs)
         if ap_shaping is not None and bool(USE_DISCOVERED_PRIMITIVE_SHAPING):
@@ -1102,6 +1189,8 @@ if __name__=="__main__":
             primitive_lib = ap_lib_mgr.get_active_library()
             primitive_h = getattr(primitive_lib, 'horizon', primitive_h)
             env = MacroActionWrapper(base_env, primitive_lib, H=primitive_h)
+            if guidance_sidecar is not None:
+                guidance_sidecar.clear_cache()
 
             # restore agent params and action dim
             try:
@@ -1155,6 +1244,8 @@ if __name__=="__main__":
             scene_chosen = scene_chooser.choose_case()
         obs, _ = env.reset(options={'level': scene_chosen})
         parking_agent.reset()
+        if guidance_sidecar is not None:
+            guidance_sidecar.reset_episode(env, scene_chosen)
 
         done = False
         total_reward = 0
@@ -1182,9 +1273,73 @@ if __name__=="__main__":
             action_mask = None
             if USE_MOTION_PRIMITIVES and USE_ACTION_MASK and hasattr(env, 'get_action_mask'):
                 action_mask = env.get_action_mask(obs)
-            action, log_prob = parking_agent.choose_action(obs, action_mask=action_mask)
+            guidance_result = None
+            guidance_logits = None
+            guidance_weight = 0.0
+            guidance_valid = False
+            if USE_MOTION_PRIMITIVES and guidance_sidecar is not None:
+                guidance_result = guidance_sidecar.compute_guidance(
+                    env,
+                    obs,
+                    action_mask=action_mask,
+                    scene_level=scene_chosen,
+                    episode_step=int(step_num - 1),
+                )
+                guidance_logits = guidance_result.guidance_logits
+                guidance_weight = float(guidance_result.guidance_weight)
+                guidance_valid = bool(guidance_result.guidance_valid)
+
+            policy_debug = {}
+            if USE_MOTION_PRIMITIVES and hasattr(parking_agent.agent, 'get_policy_debug'):
+                policy_debug = parking_agent.agent.get_policy_debug(
+                    obs,
+                    action_mask=action_mask,
+                    guidance_logits=guidance_logits,
+                    guidance_weight=guidance_weight,
+                )
+
+            action, log_prob = parking_agent.choose_action(
+                obs,
+                action_mask=action_mask,
+                guidance_logits=guidance_logits,
+                guidance_weight=guidance_weight,
+            )
             next_obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
+
+            if isinstance(info, dict):
+                teacher_family = int(guidance_result.teacher_family_id) if guidance_result is not None else -1
+                raw_policy_top1 = int(policy_debug.get('raw_policy_top1', -1)) if isinstance(policy_debug, dict) else -1
+                guided_policy_top1 = int(policy_debug.get('guided_policy_top1', -1)) if isinstance(policy_debug, dict) else -1
+                info.update(
+                    {
+                        'planner_success': bool(guidance_result.planner_success) if guidance_result is not None else False,
+                        'planner_fail_reason': str(guidance_result.fail_reason) if guidance_result is not None else 'disabled',
+                        'planner_plan_time_ms': float(guidance_result.plan_time_ms) if guidance_result is not None else 0.0,
+                        'planner_expand_nodes': int(guidance_result.expand_nodes) if guidance_result is not None else 0,
+                        'planner_path_cost': float(guidance_result.path_cost) if guidance_result is not None else 0.0,
+                        'planner_cache_hit': float(bool(guidance_result.planner_cache_hit)) if guidance_result is not None else 0.0,
+                        'guidance_valid': bool(guidance_valid),
+                        'lambda_guidance_current': float(guidance_weight),
+                        'guidance_dropout_active': bool(guidance_result.guidance_dropout_active) if guidance_result is not None else False,
+                        'raw_policy_top1': int(raw_policy_top1),
+                        'guided_policy_top1': int(guided_policy_top1),
+                        'teacher_family': int(teacher_family),
+                        'raw_policy_teacher_agreement': float(1.0 if (teacher_family >= 0 and raw_policy_top1 == teacher_family) else 0.0),
+                        'guided_policy_teacher_agreement': float(1.0 if (teacher_family >= 0 and guided_policy_top1 == teacher_family) else 0.0),
+                        'action_entropy_before_guidance': float(policy_debug.get('action_entropy_before_guidance', 0.0)) if isinstance(policy_debug, dict) else 0.0,
+                        'action_entropy_after_guidance': float(policy_debug.get('action_entropy_after_guidance', 0.0)) if isinstance(policy_debug, dict) else 0.0,
+                        'teacher_action_mask_value': float(guidance_result.teacher_action_mask_value) if guidance_result is not None else 0.0,
+                        'reference_state_available': float(guidance_result.reference_state_available) if guidance_result is not None else 0.0,
+                        'reference_state_count': int(guidance_result.reference_state_count) if guidance_result is not None else 0,
+                        'subgoal_index': int(guidance_result.subgoal_index) if guidance_result is not None else -1,
+                        'average_progress_along_reference': float(guidance_result.average_progress_along_reference) if guidance_result is not None else 0.0,
+                        'jackknife_margin_min': float(guidance_result.jackknife_margin_min) if guidance_result is not None else 0.0,
+                        'rear_body_near_collision_count': int(guidance_result.rear_body_near_collision_count) if guidance_result is not None else 0,
+                        'bc_sample_accept_rate': 0.0,
+                        'bc_sample_reject_reason': 'disabled',
+                    }
+                )
 
             # weak shaping reward from discovered primitives (optional)
             shaping_r = 0.0
@@ -1235,7 +1390,7 @@ if __name__=="__main__":
             # Store transition in memory
             # obs, action, reward, done, log_prob, next_obs
             if USE_MOTION_PRIMITIVES:
-                parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs, action_mask))
+                parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs, action_mask, guidance_logits, guidance_weight, guidance_valid))
             else:
                 parking_agent.agent.push_memory((obs, action, reward, done, log_prob, next_obs))
 
@@ -1295,16 +1450,17 @@ if __name__=="__main__":
                 ep_refinement_stats,
             )
             _log_motion_primitive_episode_runtime(writer, i, ep_infos_trace)
+            _log_hybrid_guidance_episode_runtime(writer, i, ep_infos_trace)
 
-        # ---- Diagnostic: write episode JSONL record (A-class) ----
-        _write_episode_jsonl(
-            os.path.join(save_path, 'episodes.jsonl'),
-            i,
-            ep_infos_trace if USE_MOTION_PRIMITIVES else [],
-            total_reward,
-            step_num,
-            str(scene_chosen),
-        )
+        ## ---- Diagnostic: write episode JSONL record (A-class) ----
+        #_write_episode_jsonl(
+            #os.path.join(save_path, 'episodes.jsonl'),
+            #i,
+            #ep_infos_trace if USE_MOTION_PRIMITIVES else [],
+            #total_reward,
+            #step_num,
+            #str(scene_chosen),
+        #)
         # ---- End diagnostic ----
 
         for type_id, scene_name in scene_chooser.scene_types.items():
@@ -1365,7 +1521,7 @@ if __name__=="__main__":
             if improved_all:
                 best_success_rate = list(success_rates)
                 parking_agent.agent.save("%s/PPO_best.pt" % (save_path), params_only=True)
-                with open(save_path + 'best.txt', 'w') as f_best_log:
+                with open(os.path.join(save_path, 'best.txt'), 'w') as f_best_log:
                     f_best_log.write('epoch: %s, success rate: %s' % (i + 1, success_rates))
 
         if (i+1) % 2000 == 0:

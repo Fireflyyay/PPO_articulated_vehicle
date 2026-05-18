@@ -54,6 +54,7 @@ class PPOConfig(ConfigBase):
         self.imitation_loss_weight = 0.05
         self.soft_mask_logit_lambda = 1.0
         self.soft_mask_small_value = 1e-8
+        self.guidance_logit_default_weight = 0.0
 
         self.merge_configs(configs)
 
@@ -87,6 +88,9 @@ class PPOAgent(AgentBase):
         extra_items = ["log_prob", "next_obs"]
         if self.discrete:
             extra_items.append("action_mask")
+            extra_items.append("guidance_logits")
+            extra_items.append("guidance_weight")
+            extra_items.append("guidance_valid")
         self.memory = ReplayMemory(self.configs.batch_size, extra_items)
         self.imitation_memory = {
             "state": deque([], maxlen=int(self.configs.imitation_buffer_size)),
@@ -245,52 +249,105 @@ class PPOAgent(AgentBase):
 
         return actor_lr, critic_lr
 
-    def _mask_logits(self, logits: torch.Tensor, action_mask) -> torch.Tensor:
-        if action_mask is None:
-            masked_logits = logits
-        else:
-            mask = torch.as_tensor(action_mask, device=logits.device)
-            if mask.dim() == 1:
-                mask = mask.unsqueeze(0)
-            if mask.shape != logits.shape:
-                # Allow broadcasting a single mask across batch
-                if mask.shape[-1] == logits.shape[-1] and mask.shape[0] == 1 and logits.shape[0] > 1:
-                    mask = mask.expand(logits.shape[0], -1)
-            if mask.shape != logits.shape:
-                masked_logits = logits
-            elif torch.is_floating_point(mask):
+    def _coerce_discrete_condition(self, values, logits: torch.Tensor, dtype=None):
+        if values is None:
+            return None
+        try:
+            tensor = torch.as_tensor(values, device=logits.device)
+        except Exception:
+            return None
+        if dtype is not None:
+            tensor = tensor.to(dtype=dtype)
+        if tensor.dim() == 0:
+            tensor = tensor.view(1, 1)
+        elif tensor.dim() == 1:
+            if tensor.shape[0] == logits.shape[-1]:
+                tensor = tensor.unsqueeze(0)
+            elif tensor.shape[0] == logits.shape[0]:
+                tensor = tensor.view(-1, 1)
+
+        if tensor.shape == (1, 1):
+            tensor = tensor.expand(logits.shape[0], logits.shape[-1])
+        elif tensor.shape == (logits.shape[0], 1):
+            tensor = tensor.expand(-1, logits.shape[-1])
+        elif tensor.shape == (1, logits.shape[-1]) and logits.shape[0] > 1:
+            tensor = tensor.expand(logits.shape[0], -1)
+
+        if tensor.shape != logits.shape:
+            return None
+        return tensor
+
+    def _compose_discrete_logits(
+        self,
+        logits: torch.Tensor,
+        action_mask=None,
+        guidance_logits=None,
+        guidance_weight=None,
+    ) -> dict:
+        raw_logits = logits.to(dtype=torch.float32)
+        mask_bias = torch.zeros_like(raw_logits)
+        guidance_bias = torch.zeros_like(raw_logits)
+        action_logit_bias = torch.zeros_like(raw_logits)
+        invalid = None
+
+        mask = self._coerce_discrete_condition(action_mask, raw_logits)
+        if mask is not None:
+            if torch.is_floating_point(mask):
                 soft_mask = torch.clamp(mask.to(dtype=torch.float32), 0.0, 1.0)
                 lambda_mask = float(getattr(self.configs, "soft_mask_logit_lambda", 1.0))
                 small_value = float(getattr(self.configs, "soft_mask_small_value", 1e-8))
-                masked_logits = logits + lambda_mask * torch.log(torch.clamp(soft_mask, min=small_value))
+                mask_bias = lambda_mask * torch.log(torch.clamp(soft_mask, min=small_value))
                 invalid = soft_mask <= 0.0
-                if torch.any(invalid):
-                    masked_logits = masked_logits.clone()
-                    masked_logits[invalid] = -1e10
             else:
-                mask = mask.to(dtype=torch.bool)
-                masked_logits = logits.clone()
-                masked_logits[~mask] = -1e10
+                invalid = ~mask.to(dtype=torch.bool)
 
-        # apply optional logit bias (cold-start suppression)
+        guidance = self._coerce_discrete_condition(guidance_logits, raw_logits, dtype=torch.float32)
+        weight = self._coerce_discrete_condition(guidance_weight, raw_logits, dtype=torch.float32)
+        if guidance is not None:
+            if weight is None:
+                default_weight = float(getattr(self.configs, "guidance_logit_default_weight", 1.0))
+                weight = torch.full_like(raw_logits, default_weight)
+            guidance_bias = guidance * weight
+
+        final_logits = raw_logits + mask_bias + guidance_bias
+
         if self.action_logit_bias is not None:
             try:
-                bias = self.action_logit_bias.to(device=masked_logits.device, dtype=torch.float32)
+                bias = self.action_logit_bias.to(device=final_logits.device, dtype=torch.float32)
                 if bias.dim() == 1:
                     bias = bias.unsqueeze(0)
-                if bias.shape[-1] == masked_logits.shape[-1] and bias.shape[0] == 1 and masked_logits.shape[0] > 1:
-                    bias = bias.expand(masked_logits.shape[0], -1)
-                if bias.shape == masked_logits.shape:
-                    masked_logits = masked_logits - bias
+                if bias.shape[-1] == final_logits.shape[-1] and bias.shape[0] == 1 and final_logits.shape[0] > 1:
+                    bias = bias.expand(final_logits.shape[0], -1)
+                if bias.shape == final_logits.shape:
+                    action_logit_bias = -bias
+                    final_logits = final_logits + action_logit_bias
             except Exception:
                 pass
 
-        return masked_logits
+        if invalid is not None and torch.any(invalid):
+            final_logits = final_logits.clone()
+            final_logits[invalid] = -1e10
 
-    def _build_dist(self, policy_out: torch.Tensor, action_mask=None) -> torch.distributions.Distribution:
+        return {
+            "raw_logits": raw_logits,
+            "mask_bias": mask_bias,
+            "guidance_bias": guidance_bias,
+            "action_logit_bias": action_logit_bias,
+            "final_logits": final_logits,
+        }
+
+    def _mask_logits(self, logits: torch.Tensor, action_mask) -> torch.Tensor:
+        return self._compose_discrete_logits(logits, action_mask=action_mask)["final_logits"]
+
+    def _build_dist(self, policy_out: torch.Tensor, action_mask=None, guidance_logits=None, guidance_weight=None) -> torch.distributions.Distribution:
         if self.discrete:
-            masked_logits = self._mask_logits(policy_out, action_mask)
-            return Categorical(logits=masked_logits)
+            composed = self._compose_discrete_logits(
+                policy_out,
+                action_mask=action_mask,
+                guidance_logits=guidance_logits,
+                guidance_weight=guidance_weight,
+            )
+            return Categorical(logits=composed["final_logits"])
 
         if self.configs.dist_type == "beta":
             alpha, beta = torch.chunk(policy_out, 2, dim=-1)
@@ -305,7 +362,7 @@ class PPOAgent(AgentBase):
 
         raise NotImplementedError
 
-    def _actor_forward(self, obs, action_mask=None) -> torch.distributions.Distribution: # to be replaced
+    def _actor_forward(self, obs, action_mask=None, guidance_logits=None, guidance_weight=None) -> torch.distributions.Distribution: # to be replaced
         observation = deepcopy(obs)
         if self.configs.state_norm:
             observation = self.state_normalize.state_norm(observation)
@@ -316,7 +373,12 @@ class PPOAgent(AgentBase):
             if len(policy_out.shape) > 1 and policy_out.shape[0] > 1:
                 # raise NotImplementedError # Why was this here?
                 pass
-            dist = self._build_dist(policy_out, action_mask=action_mask)
+            dist = self._build_dist(
+                policy_out,
+                action_mask=action_mask,
+                guidance_logits=guidance_logits,
+                guidance_weight=guidance_weight,
+            )
 
         return dist
 
@@ -345,14 +407,19 @@ class PPOAgent(AgentBase):
         return action, log_prob
 
 
-    def choose_action(self, obs, deterministic: bool = False, action_mask=None):
+    def choose_action(self, obs, deterministic: bool = False, action_mask=None, guidance_logits=None, guidance_weight=None):
 
-        dist = self._actor_forward(obs, action_mask=action_mask)
+        dist = self._actor_forward(
+            obs,
+            action_mask=action_mask,
+            guidance_logits=guidance_logits,
+            guidance_weight=guidance_weight,
+        )
         action, other_info = self._post_process_action(dist, deterministic=deterministic)
 
         return action, other_info
 
-    def get_action(self, obs: np.ndarray, action_mask=None):
+    def get_action(self, obs: np.ndarray, action_mask=None, guidance_logits=None, guidance_weight=None):
         '''Take action based on one observation.
 
         Args:
@@ -363,12 +430,17 @@ class PPOAgent(AgentBase):
                 If the action space is continuous, the action is an (np.ndarray).
             log_prob(np.ndarray): the log probability of taken action.
         '''
-        dist = self._actor_forward(obs, action_mask=action_mask)
+        dist = self._actor_forward(
+            obs,
+            action_mask=action_mask,
+            guidance_logits=guidance_logits,
+            guidance_weight=guidance_weight,
+        )
         action, log_prob = self._post_process_action(dist)
 
         return action, log_prob
 
-    def get_log_prob(self, obs: np.ndarray, action, action_mask=None):
+    def get_log_prob(self, obs: np.ndarray, action, action_mask=None, guidance_logits=None, guidance_weight=None):
         '''get the log probability for given action based on current policy
 
         Args:
@@ -377,7 +449,12 @@ class PPOAgent(AgentBase):
         Returns:
             log_prob(np.ndarray): the log probability of taken action.
         '''
-        dist = self._actor_forward(obs, action_mask=action_mask)
+        dist = self._actor_forward(
+            obs,
+            action_mask=action_mask,
+            guidance_logits=guidance_logits,
+            guidance_weight=guidance_weight,
+        )
 
         if self.discrete:
             action_t = torch.as_tensor(action, dtype=torch.int64, device=self.device)
@@ -391,22 +468,82 @@ class PPOAgent(AgentBase):
         log_prob = log_prob.detach().cpu().numpy().flatten()
         return log_prob
 
+    def get_policy_debug(self, obs, action_mask=None, guidance_logits=None, guidance_weight=None):
+        if not bool(self.discrete):
+            return {}
+
+        observation = deepcopy(obs)
+        if self.configs.state_norm:
+            observation = self.state_normalize.state_norm(observation)
+        observation = self.obs2tensor(observation)
+
+        with torch.no_grad():
+            raw_logits = self.actor_net(observation)
+            composed = self._compose_discrete_logits(
+                raw_logits,
+                action_mask=action_mask,
+                guidance_logits=guidance_logits,
+                guidance_weight=guidance_weight,
+            )
+            raw_dist = Categorical(logits=composed["raw_logits"])
+            guided_dist = Categorical(logits=composed["final_logits"])
+            raw_top1 = torch.argmax(composed["raw_logits"], dim=-1)
+            guided_top1 = torch.argmax(composed["final_logits"], dim=-1)
+
+        return {
+            "raw_policy_top1": int(raw_top1[0].detach().cpu().item()),
+            "guided_policy_top1": int(guided_top1[0].detach().cpu().item()),
+            "action_entropy_before_guidance": float(raw_dist.entropy().mean().detach().cpu().item()),
+            "action_entropy_after_guidance": float(guided_dist.entropy().mean().detach().cpu().item()),
+            "raw_logits": composed["raw_logits"].detach().cpu().numpy(),
+            "final_logits": composed["final_logits"].detach().cpu().numpy(),
+            "mask_bias": composed["mask_bias"].detach().cpu().numpy(),
+            "guidance_bias": composed["guidance_bias"].detach().cpu().numpy(),
+        }
+
     def push_memory(self, observations):
         '''
         Args:
             observations(tuple):
                 continuous: (obs, action, reward, done, log_prob, next_obs)
-                discrete:   (obs, action, reward, done, log_prob, next_obs, action_mask)
+                discrete:   (obs, action, reward, done, log_prob, next_obs, action_mask, guidance_logits, guidance_weight, guidance_valid)
         '''
         obs, action, reward, done, log_prob, next_obs, *rest = deepcopy(observations)
         action_mask = rest[0] if len(rest) > 0 else None
+        guidance_logits = rest[1] if len(rest) > 1 else None
+        guidance_weight = rest[2] if len(rest) > 2 else None
+        guidance_valid = rest[3] if len(rest) > 3 else None
         if self.configs.state_norm:
             obs = self.state_normalize.state_norm(obs)
             next_obs = self.state_normalize.state_norm(next_obs,update=True)
         if self.discrete:
             if action_mask is None:
                 action_mask = np.ones(int(self.configs.action_dim), dtype=np.int8)
-            observations = (obs, action, reward, done, log_prob, next_obs, action_mask)
+            action_mask = np.asarray(action_mask).copy()
+            if guidance_logits is None:
+                guidance_logits = np.zeros((int(self.configs.action_dim),), dtype=np.float32)
+            else:
+                try:
+                    guidance_logits = np.asarray(guidance_logits, dtype=np.float32).reshape(-1)
+                except Exception:
+                    guidance_logits = np.zeros((int(self.configs.action_dim),), dtype=np.float32)
+                if guidance_logits.shape[0] != int(self.configs.action_dim):
+                    guidance_logits = np.zeros((int(self.configs.action_dim),), dtype=np.float32)
+            guidance_weight = float(guidance_weight) if guidance_weight is not None else 0.0
+            if guidance_valid is None:
+                guidance_valid = bool(abs(guidance_weight) > 0.0 and np.any(np.abs(guidance_logits) > 0.0))
+            observations = (
+                obs,
+                action,
+                reward,
+                done,
+                log_prob,
+                next_obs,
+                action_mask,
+                guidance_logits,
+                np.float32(guidance_weight),
+                np.int8(bool(guidance_valid)),
+            )
         else:
             observations = (obs, action, reward, done, log_prob, next_obs)
         self.memory.push(observations)
@@ -501,8 +638,14 @@ class PPOAgent(AgentBase):
             old_log_prob_batch = old_log_prob_batch.view(-1, 1)
         next_state_batch = self.obs2tensor(batches["next_obs"])
         action_mask_batch = None
+        guidance_logits_batch = None
+        guidance_weight_batch = None
         if self.discrete and "action_mask" in batches:
             action_mask_batch = torch.as_tensor(batches["action_mask"], device=self.device)
+        if self.discrete and "guidance_logits" in batches:
+            guidance_logits_batch = torch.as_tensor(np.asarray(batches["guidance_logits"]), dtype=torch.float32, device=self.device)
+        if self.discrete and "guidance_weight" in batches:
+            guidance_weight_batch = torch.as_tensor(np.asarray(batches["guidance_weight"]), dtype=torch.float32, device=self.device)
         self.memory.clear()
         imitation_loss_value = 0.0
 
@@ -544,7 +687,14 @@ class PPOAgent(AgentBase):
                 if self.discrete:
                     logits = self.actor_net(state)
                     mask = action_mask_batch[ri] if action_mask_batch is not None else None
-                    dist = self._build_dist(logits, action_mask=mask)
+                    guidance_logits = guidance_logits_batch[ri] if guidance_logits_batch is not None else None
+                    guidance_weight = guidance_weight_batch[ri] if guidance_weight_batch is not None else None
+                    dist = self._build_dist(
+                        logits,
+                        action_mask=mask,
+                        guidance_logits=guidance_logits,
+                        guidance_weight=guidance_weight,
+                    )
                     dist_entropy = dist.entropy().view(-1, 1)
                     log_prob= dist.log_prob(action_batch[ri].squeeze()).view(-1, 1)
                     old_log_prob = old_log_prob_batch[ri].view(-1,1)
