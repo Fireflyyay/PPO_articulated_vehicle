@@ -383,15 +383,40 @@ GAMMA_BASE = 0.98
 # GAMMA = 0.98
 
 USE_MOTION_PRIMITIVES = True
-PRIMITIVE_H = 4
-PRIMITIVE_STEER_LEVELS = 11
-PRIMITIVE_FAMILY_PRESET = "main"
-PRIMITIVE_GAMMA_BINS = 31
-PRIMITIVE_VARIANTS_PER_FAMILY = 3
+PRIMITIVE_SCENE_PROFILES = {
+    'Normal': {
+        'H': 4,
+        'S': 11,
+        'gamma_bins': 21,
+        'variant_count': 3,
+    },
+    'Complex': {
+        'H': 2,
+        'S': 11,
+        'gamma_bins': 31,
+        'variant_count': 3,
+    },
+    'Extrem': {
+        'H': 2,
+        'S': 11,
+        'gamma_bins': 41,
+        'variant_count': 3,
+    },
+}
+_primitive_scene_profile = PRIMITIVE_SCENE_PROFILES.get(MAP_LEVEL, PRIMITIVE_SCENE_PROFILES['Normal'])
+PRIMITIVE_H = int(_primitive_scene_profile['H'])
+PRIMITIVE_STEER_LEVELS = int(_primitive_scene_profile['S'])
+PRIMITIVE_FAMILY_PRESET = "simple"
+PRIMITIVE_GAMMA_BINS = int(_primitive_scene_profile['gamma_bins'])
+PRIMITIVE_VARIANTS_PER_FAMILY = int(_primitive_scene_profile['variant_count'])
 PRIMITIVE_GAMMA_MAX = float(np.deg2rad(36.0))
-PRIMITIVE_SPEED_LEVEL_COUNT = 3
-PRIMITIVE_FAMILY_ACTION_DIM = 81
-PRIMITIVE_LIBRARY_PATH = "../data/primitives_family_main_G31_V3.npz"
+PRIMITIVE_CONTROL_SPEEDS = (float(max(abs(float(VALID_SPEED[0])), abs(float(VALID_SPEED[1])))),) if PRIMITIVE_H >= 10 else (1.0, float(max(abs(float(VALID_SPEED[0])), abs(float(VALID_SPEED[1])))))
+PRIMITIVE_SPEED_LEVEL_COUNT = 1
+PRIMITIVE_FAMILY_ACTION_DIM = int(PRIMITIVE_STEER_LEVELS * 2 * len(PRIMITIVE_CONTROL_SPEEDS))
+PRIMITIVE_LIBRARY_PATH = (
+    f"../data/primitives_family_simple_{str(MAP_LEVEL).lower()}_"
+    f"H{PRIMITIVE_H}_S{PRIMITIVE_STEER_LEVELS}_G{PRIMITIVE_GAMMA_BINS}_V{PRIMITIVE_VARIANTS_PER_FAMILY}.npz"
+)
 PRIMITIVE_ADAPTIVE_MAX_VARIANTS_PER_FAMILY = 4
 PRIMITIVE_ADAPTIVE_SLOT_POLICY = "replace_low_utility"
 

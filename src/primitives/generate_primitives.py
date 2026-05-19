@@ -67,6 +67,12 @@ def _build_action_sequence(
     control_scale = _variant_control_scale(variant_id=variant_id, variant_count=variant_count)
     actions = np.zeros((int(horizon), 2), dtype=np.float64)
 
+    if spec.family_type == "normal":
+        omega = np.clip(float(spec.gamma_rate_scale) * max_rate * control_scale, VALID_STEER[0], VALID_STEER[1])
+        speed = float(spec.speed_sign) * float(spec.speed_scale) * max_speed
+        actions[:] = np.asarray([omega, speed], dtype=np.float64)
+        return actions, -1
+
     if spec.family_type == "straighten":
         k_gamma = 1.1 * max_rate
         bias = 0.20 * float(spec.gamma_rate_scale) * max_rate
@@ -99,11 +105,6 @@ def _build_action_sequence(
             actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
         return actions, int(switch_index)
 
-    for step_idx in range(int(horizon)):
-        taper = 1.0 - 0.10 * float(step_idx) / float(max(1, horizon - 1))
-        omega = np.clip(float(spec.gamma_rate_scale) * max_rate * taper * control_scale, VALID_STEER[0], VALID_STEER[1])
-        speed = float(spec.speed_sign) * float(spec.speed_scale) * float(spec.speed_level_scale) * max_speed
-        actions[step_idx] = np.asarray([omega, speed], dtype=np.float64)
     return actions, -1
 
 
@@ -158,13 +159,12 @@ def generate_primitives(
     variant_count: int = 3,
     family_preset: str = "main",
 ):
-    del S  # retained for CLI/backward compatibility in experiment scripts
-
     horizon = int(H)
+    steer_levels = int(max(3, S))
     variant_count = int(max(1, variant_count))
     gamma_max = float(max(abs(float(VALID_STEER[0])), abs(float(VALID_STEER[1]))))
     gamma_bin_values = build_gamma_bins(num_bins=int(gamma_bins), gamma_max=gamma_max)
-    family_specs = build_family_catalog(preset=family_preset)
+    family_specs = build_family_catalog(preset=family_preset, steer_levels=steer_levels, horizon=horizon)
     family_count = int(len(family_specs))
 
     flat_actions: List[np.ndarray] = []
@@ -267,6 +267,7 @@ def generate_primitives(
         meta=np.asarray(
             {
                 "H": int(horizon),
+                "S": int(steer_levels),
                 "gamma_bins": int(gamma_bins),
                 "variant_count": int(variant_count),
                 "family_preset": str(family_preset),
@@ -292,11 +293,14 @@ if __name__ == "__main__":
     parser.add_argument("--S", type=int, default=11)
     parser.add_argument("--gamma-bins", type=int, default=31)
     parser.add_argument("--variant-count", type=int, default=3)
-    parser.add_argument("--family-preset", type=str, default="main", choices=("small", "main", "large"))
+    parser.add_argument("--family-preset", type=str, default="simple", choices=("simple", "small", "main", "large"))
     args = parser.parse_args()
 
     root_data_path = os.path.join(os.path.dirname(__file__), "../../data")
-    output_path = os.path.join(root_data_path, f"primitives_family_{args.family_preset}_G{args.gamma_bins}_V{args.variant_count}.npz")
+    output_path = os.path.join(
+        root_data_path,
+        f"primitives_family_{args.family_preset}_H{args.H}_S{args.S}_G{args.gamma_bins}_V{args.variant_count}.npz",
+    )
     generate_primitives(
         H=args.H,
         S=args.S,
