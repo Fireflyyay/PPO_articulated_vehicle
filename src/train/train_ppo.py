@@ -201,6 +201,12 @@ def _apply_learning_rate_scale(parking_agent, base_actor_lr: float, base_critic_
     return parking_agent.agent.set_learning_rates(actor_lr, critic_lr)
 
 
+def _choose_training_scene(scene_chooser, episode_idx: int) -> str:
+    if int(episode_idx) < int(TRAIN_SCENE_WARMUP_EPISODES):
+        return str(TRAIN_SCENE_WARMUP_LEVEL)
+    return str(scene_chooser.choose_case())
+
+
 def _log_learning_rate_state(writer, episode_idx: int, parking_agent, scale: float, restore_progress: float):
     actor_lr, critic_lr = parking_agent.agent.get_learning_rates()
     writer.add_scalar("lr/actor", float(actor_lr), episode_idx)
@@ -979,7 +985,7 @@ if __name__=="__main__":
     progress_heartbeat_steps = max(250, int(parking_agent.agent.configs.batch_size) // 4)
 
     for i in range(args.train_episode):
-        scene_chosen = scene_chooser.choose_case()
+        scene_chosen = _choose_training_scene(scene_chooser, i)
         obs, _ = env.reset(options={'level': scene_chosen})
         parking_agent.reset()
 
@@ -1107,6 +1113,7 @@ if __name__=="__main__":
                     scene_chooser.update_success_record(0)
 
         writer.add_scalar("total_reward", total_reward, i)
+        writer.add_scalar("scene/warmup_phase", float(i < int(TRAIN_SCENE_WARMUP_EPISODES)), i)
         if len(reward_per_state_list) > 0:
             writer.add_scalar("avg_reward", np.mean(reward_per_state_list[-1000:]), i)
 

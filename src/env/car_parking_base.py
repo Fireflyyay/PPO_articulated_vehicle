@@ -43,16 +43,16 @@ class CarParking(gym.Env):
 
     metadata = {
         "render_mode": [
-            "human", 
+            "human",
             "rgb_array",
         ]
     }
 
     def __init__(
-        self, 
+        self,
         render_mode: str = None,
         fps: int = FPS,
-        verbose: bool =True, 
+        verbose: bool =True,
         use_lidar_observation: bool =USE_LIDAR,
         use_img_observation: bool=USE_IMG,
         use_action_mask: bool=USE_ACTION_MASK,
@@ -76,10 +76,10 @@ class CarParking(gym.Env):
         self._map_cache = {}
 
         if bool(NAVIGATION_PRELOAD_ALL_LEVEL_MAPS):
-            for cache_level in ['Normal', 'Complex', 'Extrem']:
+            for cache_level in list(NAVIGATION_DIFFICULTY_LEVELS):
                 self._get_or_create_map(cache_level)
 
-        if self.level in ['Normal', 'Complex', 'Extrem']:
+        if self.level in list(NAVIGATION_DIFFICULTY_LEVELS):
             self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
         #     self.map = ParkingMapDLP()
@@ -103,7 +103,7 @@ class CarParking(gym.Env):
             )
         self.reward = 0.0
         self.accum_arrive_reward = 0.0
-        
+
         # Tracking variables for new penalties
         self.accum_turn_count = 0
         self.accum_turn_degree = 0.0
@@ -113,41 +113,41 @@ class CarParking(gym.Env):
             np.array([VALID_STEER[0], VALID_SPEED[0]]).astype(np.float32),
             np.array([VALID_STEER[1], VALID_SPEED[1]]).astype(np.float32),
         ) # steer, speed
-       
+
         self.observation_space = {}
         # if self.use_action_mask:
         #     self.action_filter = ActionMask()
-        #     self.observation_space['action_mask'] = spaces.Box(low=0, high=1, 
+        #     self.observation_space['action_mask'] = spaces.Box(low=0, high=1,
         #         shape=(N_DISCRETE_ACTION,), dtype=np.float64
         #     )
         # if self.use_img_observation:
         #     self.img_processor = Obs_Processor()
-        #     self.observation_space['img'] = spaces.Box(low=0, high=255, 
-        #         shape=(OBS_W//self.img_processor.downsample_rate, OBS_H//self.img_processor.downsample_rate, 
+        #     self.observation_space['img'] = spaces.Box(low=0, high=255,
+        #         shape=(OBS_W//self.img_processor.downsample_rate, OBS_H//self.img_processor.downsample_rate,
         #         self.img_processor.n_channels), dtype=np.uint8
         #     )
         #     self.raw_img_shape = (OBS_W, OBS_H, 3)
         if self.use_lidar_observation:
             # the observation is composed of lidar points and target representation
             # the target representation is (relative_distance, cos(theta), sin(theta), cos(phi), sin(phi))
-            # where the theta indicates the relative angle of parking lot, and phi means the heading of 
+            # where the theta indicates the relative angle of parking lot, and phi means the heading of
             # parking lot in the polar coordinate of the ego car's view
-            
+
             # Widen input state: Flatten everything into a single vector
             # Lidar + Target + Velocity (+ optional soft global guidance hint)
             self.obs_dim = LIDAR_NUM + self.tgt_repr_size + 2
             if ENABLE_GLOBAL_SOFT_GUIDANCE:
                 self.obs_dim += GUIDANCE_FEATURE_DIM
-            
+
             low_bound = -np.inf * np.ones(self.obs_dim)
             high_bound = np.inf * np.ones(self.obs_dim)
-            
+
             self.observation_space = spaces.Box(
                 low=low_bound, high=high_bound, shape=(self.obs_dim,), dtype=np.float64
             )
-            
+
         self.observation_shape = (self.obs_dim,)
-    
+
     def set_level(self, level:str=None):
         if level is None:
             self.map = self._get_or_create_map('Normal')
@@ -157,7 +157,7 @@ class CarParking(gym.Env):
             self.map = self._map_cache[self.level]
             return
         self.level = level
-        if self.level in ['Normal', 'Complex', 'Extrem',]:
+        if self.level in list(NAVIGATION_DIFFICULTY_LEVELS):
             self.map = self._get_or_create_map(self.level)
         # elif self.level == 'dlp':
         #     self.map = ParkingMapDLP()
@@ -170,7 +170,7 @@ class CarParking(gym.Env):
 
     def reset(self, seed: int = None, options: dict = None) -> tuple:
         super().reset(seed=seed)
-        
+
         case_id = options.get('case_id') if options else None
         data_dir = options.get('data_dir') if options else None
         level = options.get('level') if options else None
@@ -178,7 +178,7 @@ class CarParking(gym.Env):
         self.reward = 0.0
         self.accum_arrive_reward = 0.0
         self.t = 0.0
-        
+
         self.accum_turn_count = 0
         self.accum_turn_degree = 0.0
         self.accum_dist = 0.0
@@ -227,7 +227,7 @@ class CarParking(gym.Env):
                 if last_reset_error is not None:
                     raise RuntimeError("Failed to reset environment with a valid guidance path") from last_reset_error
                 raise RuntimeError("Failed to reset environment with a valid guidance path")
-        
+
         # For reward normalization
         self.initial_dist = float(self.vehicle.state.loc.distance(Point(self.map.dest.loc))) + 1e-6
 
@@ -248,7 +248,7 @@ class CarParking(gym.Env):
         # x_off = -xmin*scale + (win_w - (xmax-xmin)*scale)/2
         # y_off = -ymin*scale + (win_h - (ymax-ymin)*scale)/2
         # return [scale, 0, 0, -scale, x_off, win_h-y_off]
-        
+
         # Fixed scale for navigation
         scale = K * 10 # Adjust scale
         x_off = win_w/2
@@ -262,32 +262,32 @@ class CarParking(gym.Env):
             lidar_obs = self.lidar.get_observation(self.vehicle.state, self.map.obstacles)
             # Normalize lidar
             lidar_obs = lidar_obs / LIDAR_RANGE
-        
+
         # target representation
         # relative_distance, cos(theta), sin(theta), cos(phi), sin(phi)
         # theta: relative angle of parking lot
         # phi: heading of parking lot in the polar coordinate of the ego car's view
-        
+
         # For navigation, dest is a point/box.
         # We use dest center.
         dest_center = np.mean(self.map.dest_box.coords[:-1], axis=0)
         ego_pos = self.vehicle.state.get_pos()
-        
+
         dx = dest_center[0] - ego_pos[0]
         dy = dest_center[1] - ego_pos[1]
         dist = math.sqrt(dx**2 + dy**2)
-        
+
         # Angle to target
         angle_to_target = math.atan2(dy, dx)
         relative_angle = angle_to_target - ego_pos[2]
-        
+
         # Target heading relative to ego
         target_heading = self.map.dest.heading
         relative_heading = target_heading - ego_pos[2]
-        
+
         # Articulation angle
         articulation_angle = ego_pos[2] - self.vehicle.state.rear_heading
-        
+
         target_obs = np.array([
             dist/MAX_DIST_TO_DEST,
             math.cos(relative_angle),
@@ -297,7 +297,7 @@ class CarParking(gym.Env):
             math.cos(articulation_angle),
             math.sin(articulation_angle)
         ])
-        
+
         # Velocity info (normalized roughly)
         # Speed range [-2.5, 2.5], Steer range [-0.6, 0.6]
         vel_obs = np.array([
@@ -318,7 +318,7 @@ class CarParking(gym.Env):
                 )
             except Exception:
                 guidance_obs = np.zeros((GUIDANCE_FEATURE_DIM,), dtype=np.float64)
-        
+
         # Concatenate all
         obs = np.concatenate([lidar_obs, target_obs, vel_obs, guidance_obs])
         return obs
@@ -329,30 +329,30 @@ class CarParking(gym.Env):
             # Scale action from [-1, 1] to [min, max]
             steer_min, steer_max = VALID_STEER
             speed_min, speed_max = VALID_SPEED
-            
+
             scaled_action = np.zeros_like(action)
             scaled_action[0] = 0.5 * (action[0] + 1.0) * (steer_max - steer_min) + steer_min
             scaled_action[1] = 0.5 * (action[1] + 1.0) * (speed_max - speed_min) + speed_min
-            
+
             prev_state = deepcopy(self.vehicle.state)
             self.vehicle.step(scaled_action)
             self.t += 1
 
         obs = self._build_observation()
-        
+
         # calculate reward (HOPE-style shaping)
         reward, done, info = self.get_reward(action, prev_state=prev_state)
         self.reward = reward
-        
+
         terminated = False
         truncated = False
-        
+
         if done:
             if info['status'] == Status.OUTTIME:
                 truncated = True
             else:
                 terminated = True
-        
+
         return obs, reward, terminated, truncated, info
 
     def _wrap_pi(self, a: float) -> float:
@@ -591,25 +591,25 @@ class CarParking(gym.Env):
                 self.screen = pygame.display.set_mode((WIN_W, WIN_H))
             else:
                 self.screen = pygame.Surface((WIN_W, WIN_H))
-        
+
         if self.clock is None:
             self.clock = pygame.time.Clock()
 
         self.screen.fill(BG_COLOR)
-        
+
         # Draw obstacles
         for obst in self.map.obstacles:
             self._draw_polygon(obst.shape, OBSTACLE_COLOR)
-            
+
         # Draw dest
         self._draw_polygon(self.map.dest_box, DEST_COLOR)
-        
+
         # Draw vehicle
         # Front
         self._draw_polygon(self.vehicle.boxes[0], self.vehicle.color)
         # Rear
         self._draw_polygon(self.vehicle.boxes[1], self.vehicle.color)
-        
+
         if mode == "human":
             pygame.event.pump()
             self.clock.tick(self.fps)

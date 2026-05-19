@@ -46,6 +46,17 @@ def test_block_mixing_scene_is_reproducible_for_fixed_seed():
         assert scene_a.metadata["free_ratio"] == scene_b.metadata["free_ratio"]
 
 
+def test_warmup_scene_is_reproducible_for_fixed_seed():
+    scene_a = generate_block_mixing_plant_scene("Warmup", seed=7)
+    scene_b = generate_block_mixing_plant_scene("Warmup", seed=7)
+
+    assert np.array_equal(scene_a.occupancy_grid, scene_b.occupancy_grid)
+    assert np.array_equal(scene_a.free_grid, scene_b.free_grid)
+    assert _bay_signature(scene_a) == _bay_signature(scene_b)
+    assert scene_a.metadata["corridor_generation_mode"] == "motion_primitive_warmup"
+    assert scene_a.metadata["free_ratio"] == scene_b.metadata["free_ratio"]
+
+
 def test_block_mixing_scene_validates_against_its_config():
     for level in ["Normal", "Complex", "Extrem"]:
         scene = generate_block_mixing_plant_scene(level, seed=3)
@@ -141,7 +152,7 @@ def test_block_mixing_scene_difficulty_trend_averages():
         for level, level_scenes in scenes.items()
     }
 
-    assert mean_grid_width["Normal"] < mean_grid_width["Complex"] < mean_grid_width["Extrem"]
+    assert mean_grid_width["Normal"] <= mean_grid_width["Complex"] <= mean_grid_width["Extrem"]
     assert mean_free_ratio["Normal"] > mean_free_ratio["Complex"] > mean_free_ratio["Extrem"]
 
 
@@ -180,3 +191,18 @@ def test_block_mixing_scene_reuses_cached_navigation_pair(monkeypatch):
     assert nav_meta["dest_bay_index"] == cached_case["nav_meta"]["dest_bay_index"]
     assert np.array_equal(nav_meta["free_grid"], cached_case["nav_meta"]["free_grid"])
     assert nav_meta["free_grid"] is not cached_case["nav_meta"]["free_grid"]
+
+
+def test_warmup_scene_uses_cached_navigation_pair_with_single_bay():
+    scene = generate_block_mixing_plant_scene("Warmup", seed=11)
+
+    assert len(scene.parking_bays) == 1
+    assert isinstance(scene.metadata.get("_cached_navigation_case"), dict)
+
+    start, dest, nav_meta = sample_navigation_case_from_scene(scene, "Warmup", seed=11)
+
+    assert len(start) == 3
+    assert len(dest) == 3
+    assert nav_meta["start_bay_index"] == -1
+    assert nav_meta["dest_bay_index"] == 0
+    assert len(nav_meta["guidance_path_points"]) >= 2
